@@ -51,7 +51,7 @@ arcodash-core = { path = ".", features = ["test-support"] }
 # Test-only: generating throwaway RSA keys in the BigQuery/Snowflake JWT unit tests (sign +
 # verify round trip). 0.8 matches the `rand_core` 0.6 line the `rsa` crate itself depends on
 # (already in the tree transitively) — not a workspace dep since nothing else needs it.
-rand = "0.8"
+rand = "0.10"
 tracing-subscriber = { workspace = true }
 # Test-only: stands in for Athena's HTTP API in the connector's poll-loop/deadline tests —
 # community LocalStack doesn't implement Athena at all (see connectors.rs's `mod athena`), so
