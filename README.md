@@ -12,12 +12,12 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE.md"><img alt="License: AGPL-3.0" src=".github/assets/badges/license.svg"></a>
+  <a href="LICENSE.md"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-7e14ff"></a>
   <a href="https://github.com/arcodash/arcodash/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/arcodash/arcodash/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/arcodash/arcodash/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/arcodash/arcodash?include_prereleases"></a>
-  <a href="CONTRIBUTING.md"><img alt="PRs welcome" src=".github/assets/badges/prs-welcome.svg"></a>
-  <img alt="Built with Rust" src=".github/assets/badges/rust.svg">
-  <img alt="React" src=".github/assets/badges/react.svg">
+  <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-47bfff"></a>
+  <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-orange?logo=rust&logoColor=white">
+  <img alt="React" src="https://img.shields.io/badge/UI-React-149eca?logo=react&logoColor=white">
 </p>
 
 <p align="center">
