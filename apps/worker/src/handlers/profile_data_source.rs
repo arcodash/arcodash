@@ -819,6 +819,8 @@ mod tests {
 
         let upload_id = uuid::Uuid::new_v4();
         let object_key = format!("orgs/{}/uploads/csv/{upload_id}/data.csv", org.id);
+        // A fresh `-backend memory` emulator (CI) has no buckets.
+        ctx.store.ensure_bucket().await.unwrap();
         ctx.store
             .put(
                 &object_key,

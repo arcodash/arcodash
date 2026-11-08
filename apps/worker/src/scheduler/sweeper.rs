@@ -2822,6 +2822,8 @@ mod tests {
     ) -> (uuid::Uuid, String) {
         let id = uuid::Uuid::new_v4();
         let object_key = format!("orgs/{org_id}/uploads/csv/{id}/data.csv");
+        // A fresh `-backend memory` emulator (CI) has no buckets.
+        store.ensure_bucket().await.expect("ensure test bucket");
         store
             .put(
                 &object_key,
