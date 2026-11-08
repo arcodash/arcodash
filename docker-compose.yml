@@ -1,0 +1,108 @@
+# Local stack: `docker compose up --build`. Infra only (for scripts/*.sh): scripts/infra.sh.
+# Sample data source: `docker compose --profile demo up -d demo-db`.
+name: arcodash
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: arcodash
+      POSTGRES_PASSWORD: arcodash
+      POSTGRES_DB: arcodash
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ${ARCODASH_DATA_DIR:-./.data}/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arcodash"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    command: valkey-server --save 60 1 --dir /data
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - ${ARCODASH_DATA_DIR:-./.data}/valkey:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Object store for CSV/SQLite uploads (GCS-compatible API).
+  gcs:
+    image: fsouza/fake-gcs-server:1.54.0
+    command: ["-scheme", "http", "-public-host", "gcs:4443", "-backend", "filesystem", "-data", "/data"]
+    ports:
+      - "127.0.0.1:4443:4443"
+    volumes:
+      - ${ARCODASH_DATA_DIR:-./.data}/gcs:/data
+
+  mailpit:
+    image: axllent/mailpit:v1.32
+    ports:
+      - "127.0.0.1:8025:8025" # web UI
+      - "127.0.0.1:1025:1025" # SMTP
+
+  demo-db:
+    profiles: [demo]
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo1234
+      POSTGRES_DB: demo
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - ${ARCODASH_DATA_DIR:-./.data}/demo-postgres:/var/lib/postgresql
+      - ./docker/demo-db.sql:/docker-entrypoint-initdb.d/demo.sql:ro
+
+  migrate:
+    build: { context: ., dockerfile: docker/rust.Dockerfile, target: migrate }
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build: { context: ., dockerfile: docker/rust.Dockerfile, target: backend }
+    env_file: .env
+    environment:
+      STORAGE_EMULATOR_HOST: http://gcs:4443
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+      gcs:
+        condition: service_started
+
+  worker:
+    build: { context: ., dockerfile: docker/rust.Dockerfile, target: worker }
+    env_file: .env
+    # Leave HOSTNAME unset: Docker gives each replica a unique one, which becomes the worker id.
+    environment:
+      STORAGE_EMULATOR_HOST: http://gcs:4443
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+      gcs:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8080
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - backend

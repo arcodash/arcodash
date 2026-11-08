@@ -1,0 +1,109 @@
+# Production self-host stack. See docs/self-hosting.md.
+#   cp .env.selfhost.example .env   # fill in every CHANGE-ME
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Data lives in named volumes; Postgres, Valkey and the object store are not published to the host.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-arcodash}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-arcodash}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arcodash}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: valkey-server --save 60 1 --dir /data
+    volumes:
+      - valkeydata:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Bundled object store for CSV/SQLite uploads (GCS-compatible API, files kept on a volume).
+  objectstore:
+    image: fsouza/fake-gcs-server:1.54.0
+    restart: unless-stopped
+    command: ["-scheme", "http", "-public-host", "objectstore:4443", "-backend", "filesystem", "-data", "/data"]
+    volumes:
+      - objectdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4443/storage/v1/b"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: { context: ., dockerfile: docker/rust.Dockerfile, target: migrate }
+    env_file: .env
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build: { context: ., dockerfile: docker/rust.Dockerfile, target: backend }
+    env_file: .env
+    environment:
+      STORAGE_EMULATOR_HOST: ${STORAGE_EMULATOR_HOST:-http://objectstore:4443}
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      objectstore:
+        condition: service_healthy
+
+  worker:
+    build: { context: ., dockerfile: docker/rust.Dockerfile, target: worker }
+    env_file: .env
+    environment:
+      STORAGE_EMULATOR_HOST: ${STORAGE_EMULATOR_HOST:-http://objectstore:4443}
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      objectstore:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      args:
+        VITE_API_BASE_URL: ${API_BASE_URL:-http://localhost:8080}
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  valkeydata:
+  objectdata:

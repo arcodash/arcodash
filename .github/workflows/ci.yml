@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xmlsec/libxml2 dev headers (samael)
+        run: sudo apt-get update && sudo apt-get install -y libxmlsec1-dev libxml2-dev pkg-config libclang-dev
+
+      - name: Install Rust toolchain
+        # Version and components come from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "rust"
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  integration:
+    name: Rust integration tests
+    runs-on: ubuntu-latest
+    env:
+      # Debug test binaries each statically link the workspace; without this the target dir can
+      # exhaust runner disk and ld dies with SIGBUS.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+
+      - name: Install xmlsec/libxml2 dev headers (samael)
+        run: sudo apt-get update && sudo apt-get install -y libxmlsec1-dev libxml2-dev pkg-config libclang-dev
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "debug-nodebuginfo"
+
+      - name: Start test stack
+        run: docker compose -f docker-compose.testing.yml up -d --wait postgres valkey mailpit gcs target-postgres
+
+      - name: Apply target-db seed data
+        run: |
+          docker compose -f docker-compose.testing.yml exec -T target-postgres \
+            psql -v ON_ERROR_STOP=1 -U target -d target_db -f /dev/stdin < tests/e2e/seed/target-db.sql
+
+      - name: Run migrations
+        run: |
+          DATABASE_URL="postgres://arcodash:arcodash@localhost:5433/arcodash_test" \
+            cargo run --package arcodash-migration -- up
+
+      - name: cargo test (unit, --test-threads=1)
+        env:
+          TEST_DATABASE_URL: postgres://arcodash:arcodash@localhost:5433/arcodash_test
+          TEST_REDIS_URL: redis://localhost:6380
+          TEST_TARGET_DATABASE_URL: postgres://target:target@localhost:5434/target_db
+          STORAGE_EMULATOR_HOST: http://localhost:4444
+          MAILPIT_SMTP_PORT: "1026"
+          MAILPIT_API_BASE: http://localhost:8026
+        # DB-backed unit tests share one database, so they must not run in parallel.
+        run: cargo test --workspace --lib -- --test-threads=1
+
+      - name: cargo test (integration, --test-threads=1)
+        env:
+          TEST_DATABASE_URL: postgres://arcodash:arcodash@localhost:5433/arcodash_test
+          TEST_REDIS_URL: redis://localhost:6380
+          TEST_TARGET_DATABASE_URL: postgres://target:target@localhost:5434/target_db
+          STORAGE_EMULATOR_HOST: http://localhost:4444
+          MAILPIT_SMTP_PORT: "1026"
+          MAILPIT_API_BASE: http://localhost:8026
+        # Tests share one database and truncate between runs, so they must not run in parallel.
+        run: cargo test --workspace --test '*' -- --test-threads=1
+
+  frontend:
+    name: Frontend (typecheck, lint, test, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Lint
+        run: pnpm -r lint
+
+      - name: Unit tests
+        run: pnpm --filter @arcodash/frontend test
+
+      - name: Build
+        run: pnpm -r build
+
+  e2e:
+    name: E2E (Playwright ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install xmlsec/libxml2 dev headers (samael)
+        run: sudo apt-get update && sudo apt-get install -y libxmlsec1-dev libxml2-dev pkg-config libclang-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "debug-nodebuginfo"
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('pnpm-lock.yaml') }}
+
+      # System libraries live outside the cached dir, so install deps on every run.
+      - name: Install Playwright browsers
+        run: pnpm --filter @arcodash/e2e exec playwright install --with-deps chromium
+
+      - name: Start test stack
+        run: docker compose -f docker-compose.testing.yml up -d --wait postgres valkey mailpit gcs target-postgres
+
+      - name: Run migrations
+        run: |
+          DATABASE_URL="postgres://arcodash:arcodash@localhost:5433/arcodash_test" \
+            cargo run --package arcodash-migration -- up
+
+      - name: Apply E2E seed data
+        run: |
+          docker compose -f docker-compose.testing.yml exec -T target-postgres \
+            psql -v ON_ERROR_STOP=1 -U target -d target_db -f /dev/stdin < tests/e2e/seed/target-db.sql
+
+      - name: Build backend and worker
+        run: cargo build --package arcodash-backend --package arcodash-worker
+
+      # playwright.config.ts starts the backend, worker, and frontend itself.
+      - name: Run Playwright E2E tests
+        run: pnpm test:e2e --shard=${{ matrix.shard }}/3

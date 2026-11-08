@@ -1,0 +1,9 @@
+{
+  "name": "@arcodash/e2e",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "../../apps/frontend/node_modules/.bin/tsc -p tsconfig.json"
+  }
+}

@@ -1,0 +1,105 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/backend",
+    "apps/worker",
+    "crates/shared",
+    "crates/migration",
+    "crates/conveyor",
+]
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.54", features = ["full"] }
+# orm / db
+sea-orm = { version = "2.0.4", features = [
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+    "with-json",
+    "with-uuid",
+] }
+sea-orm-migration = { version = "2.0.4", features = [
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+] }
+# Raw sqlx (not sea-orm) for connecting to arbitrary user-supplied target databases (Postgres
+# connector, crates/shared/src/connectors/postgres.rs): dynamic, untyped column decoding.
+# `mysql-rsa` keeps MySQL 8 `caching_sha2_password` working over non-TLS; `sqlite-bundled` avoids the
+# load-extension surface of plain `sqlite`. `rust_decimal` gives lossless NUMERIC decoding.
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "mysql", "mysql-rsa", "sqlite-bundled", "json", "chrono", "uuid", "rust_decimal"] }
+mongodb = { version = "3.10" }
+redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
+# serialization
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.29", features = ["v4", "serde"] }
+bytes = "1.12"
+# error handling
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+# logging
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+# config
+dotenvy = "0.15"
+async-trait = "0.1.92"
+# crypto / storage
+aes-gcm = { version = "0.11.1", features = ["getrandom"] }
+sha2 = "0.11.1"
+base64 = "0.23.1"
+# OS randomness for nonces and salts; same major as the aes-gcm/argon2 getrandom feature.
+getrandom = "0.4"
+# text
+regex = "1.13"
+# backend extras
+axum = { version = "0.8.9", features = ["macros", "json", "multipart"] }
+axum-extra = { version = "0.12", features = ["cookie"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["cors", "trace", "compression-full", "fs", "catch-panic"] }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+argon2 = { version = "0.6.0", features = ["getrandom"] }
+governor = "0.10"
+# worker extras
+tokio-cron-scheduler = "0.15.1"
+lettre = { version = "0.11.23", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+reqwest = { version = "0.13.5", features = ["json", "rustls", "form", "query"] }
+csv = "1.4"
+rust_xlsxwriter = "0.102"
+# Capped by sqlx-sqlite's `libsqlite3-sys <0.38`: rusqlite 0.40+ conflicts.
+rusqlite = { version = "0.39", features = ["bundled"] }
+# SQL Server: tiberius is the only mature pure-Rust TDS driver. It uses rustls (not the default
+# "vendored-openssl"/native-tls) to match the rest of the workspace's TLS stack; tokio-util's
+# "compat" feature bridges tiberius's futures-io style AsyncRead/Write onto a tokio TcpStream.
+tiberius = { version = "0.13", default-features = false, features = ["rustls", "chrono", "tds73"] }
+tokio-util = { version = "0.7.20", features = ["compat"] }
+# Cloud warehouse connectors: BigQuery/Snowflake auth and queries go over REST via `reqwest` (keeps
+# the dependency tree light), so no BigQuery/Snowflake SDK crate is used. `rsa` is already pulled
+# in by jsonwebtoken's `rust_crypto` feature (same 0.9 line); it is used directly for Snowflake
+# key-pair auth, which needs the DER-encoded public key (to SHA256-fingerprint) that jsonwebtoken
+# does not expose.
+rsa = "0.9"
+# Athena uses the official SDK: the StartQueryExecution / GetQueryExecution / GetQueryResults
+# orchestration is fiddly to hand-roll over raw REST + SigV4. Static creds + region come from
+# `aws_sdk_athena::config` directly, so `aws-config` is not needed.
+aws-sdk-athena = "1.127"
+
+# Enterprise auth: SAML SP + LDAP/AD bind+search. `samael`'s default "xmlsec" feature links
+# libxmlsec1/libxml2 (native, via bindgen), which real signature verification of IdP responses
+# needs (the no-xmlsec fallback always fails verification closed). Requires
+# `pkg-config libxml2-dev libxmlsec1-dev clang` at build time (see docker/rust.Dockerfile).
+samael = "0.0.22"
+# `tls-rustls-ring` keeps the whole stack on rustls (matching sea-orm/reqwest/lettre) instead of
+# pulling in native-tls/OpenSSL just for LDAPS.
+ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-ring"] }
+
+[workspace.package]
+edition = "2021"
+publish = false
+license = "AGPL-3.0-only"
+
+# Line tables keep backtraces readable; full DWARF only bloats link time and target/.
+[profile.dev]
+debug = "line-tables-only"

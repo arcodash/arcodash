@@ -1,0 +1,164 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Self-hosted Inter (latin subset only). Named "Inter" rather than the package's default
+ * "Inter Variable" so the font stack below can reference it directly. The OFL-1.1 license
+ * notice ships at /fonts/inter-OFL.txt (public/fonts/), as required alongside the
+ * redistributed binary. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* Editorial serif for chart/widget titles and counter values (license: /fonts/source-serif-4-OFL.txt). */
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url("@fontsource-variable/source-serif-4/files/source-serif-4-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@theme {
+  --font-serif: "Source Serif 4", ui-serif, Georgia, serif;
+  --color-background: #ffffff;
+  --color-foreground: #0a0a0a;
+  --color-primary: #171717;
+  --color-primary-foreground: #fafafa;
+  --color-secondary: #f5f5f5;
+  --color-secondary-foreground: #171717;
+  --color-muted: #f5f5f5;
+  --color-muted-foreground: #737373;
+  --color-accent: #fafafa;
+  --color-accent-foreground: #171717;
+  --color-card: #ffffff;
+  --color-card-foreground: #0a0a0a;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #0a0a0a;
+  --color-border: #e5e5e5;
+  --color-input: #e5e5e5;
+  --color-ring: #0a0a0a;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #fafafa;
+  --color-warning: #f59e0b;
+  --color-warning-foreground: #171717;
+  --color-success: #22c55e;
+  --color-success-foreground: #fafafa;
+
+  --color-sidebar: #fafafa;
+  --color-sidebar-foreground: #171717;
+  --color-sidebar-border: #e5e5e5;
+  --color-sidebar-accent: #f5f5f5;
+  --color-sidebar-accent-foreground: #171717;
+
+  --animate-sheet-in-left: sheet-in-left 0.25s ease-out;
+  --animate-sheet-out-left: sheet-out-left 0.2s ease-in;
+  --animate-sheet-in-right: sheet-in-right 0.25s ease-out;
+  --animate-sheet-out-right: sheet-out-right 0.2s ease-in;
+}
+
+@keyframes sheet-in-left {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
+}
+@keyframes sheet-out-left {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-100%); }
+}
+@keyframes sheet-in-right {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+@keyframes sheet-out-right {
+  from { transform: translateX(0); }
+  to   { transform: translateX(100%); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.35s ease-out both;
+}
+
+/* ---- Loader keyframes ---- */
+@keyframes ld-rock   { 0%,100% { transform: rotate(-14deg); } 50% { transform: rotate(14deg); } }
+@keyframes ld-pulse  { 0%,100% { transform: scale(.85); }    50% { transform: scale(1.1); } }
+@keyframes ld-flip   { 0% { transform: rotateY(0); } 50% { transform: rotateY(180deg); } 100% { transform: rotateY(360deg); } }
+@keyframes ld-ping   { 0% { transform: scale(.3); opacity:.9; } 80%,100% { transform: scale(2.4); opacity:0; } }
+@keyframes ld-bounce { 0% { transform: translateY(0); } 100% { transform: translateY(-13px); } }
+@keyframes ld-shadow { 0% { transform: scaleX(1); opacity:.35; } 100% { transform: scaleX(.5); opacity:.12; } }
+@keyframes ld-run    { to { stroke-dashoffset: -51; } }
+
+.ld-arc-rock  { animation: ld-rock 1.6s ease-in-out infinite;  transform-origin: 24px 38px; }
+.ld-dot-pulse { animation: ld-pulse 1.6s ease-in-out infinite; transform-origin: 24px 35px; }
+.ld-flip      { animation: ld-flip 1.4s cubic-bezier(.5,.1,.4,.9) infinite; }
+.ld-ring      { animation: ld-ping 1.4s cubic-bezier(0,.5,.4,1) infinite; transform-origin: 24px 35px; }
+.ld-dot-bounce{ animation: ld-bounce .7s cubic-bezier(.3,0,.7,1) infinite alternate; }
+.ld-shadow    { animation: ld-shadow .7s cubic-bezier(.3,0,.7,1) infinite alternate; transform-origin: 24px 40px; }
+.ld-comet     { stroke-dasharray: 12 39; animation: ld-run 1.2s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ld-arc-rock, .ld-dot-pulse, .ld-flip, .ld-ring, .ld-dot-bounce, .ld-shadow, .ld-comet { animation: none; }
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font: 16px/1.5 "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Thin scrollbar for overflow containers. */
+  .custom-scroll::-webkit-scrollbar { width: 8px; }
+  .custom-scroll::-webkit-scrollbar-track { background: transparent; }
+  .custom-scroll::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.35);
+    border-radius: 9999px;
+  }
+
+  /* Ensure all clickable/interactive items have cursor: pointer on hover */
+  a,
+  button,
+  select,
+  summary,
+  label,
+  [role="button"],
+  input[type="submit"],
+  input[type="button"],
+  input[type="reset"],
+  input[type="checkbox"],
+  input[type="radio"],
+  input[type="file"] {
+    cursor: pointer;
+  }
+}
+
+.react-grid-layout .react-grid-item.react-grid-placeholder {
+  background: color-mix(in srgb, var(--color-primary) 5%, transparent);
+  border: 2px dashed color-mix(in srgb, var(--color-primary) 25%, transparent);
+  border-radius: 0.375rem;
+  opacity: 1;
+}
+.react-grid-layout .react-grid-item.react-draggable-dragging > * {
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+}
+.react-grid-layout .react-grid-item.react-draggable-dragging {
+  opacity: 0.95;
+  cursor: grabbing;
+}

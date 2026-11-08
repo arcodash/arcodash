@@ -1,0 +1,59 @@
+[package]
+name = "arcodash-core"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+arcodash-conveyor = { path = "../conveyor" }
+tokio = { workspace = true }
+sea-orm = { workspace = true }
+sqlx = { workspace = true }
+redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+uuid = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+aes-gcm = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+# "hooks" — sqlite_connector's ATTACH/VACUUM-INTO authorizer (`sqlite3_set_authorizer`).
+# "column_decltype" — same connector's query-result column typing.
+rusqlite = { workspace = true, features = ["hooks", "column_decltype"] }
+reqwest = { workspace = true, features = ["stream"] }
+csv = { workspace = true }
+mongodb = { workspace = true }
+tiberius = { workspace = true }
+tokio-util = { workspace = true }
+# tiberius's `QueryStream` only implements `futures_core::Stream`; polling it directly (rather
+# than via `into_results()`, see mssql.rs::run_query) needs a `StreamExt` impl in scope.
+# Already resolves transitively (pinned via Cargo.lock), so this is only a version pin.
+tokio-stream = { version = "0.1.19", default-features = false }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+rsa = { workspace = true }
+aws-sdk-athena = { workspace = true }
+lettre = { workspace = true }
+
+[dev-dependencies]
+# Integration tests need `test_support`, which is gated on this feature outside `cfg(test)`.
+arcodash-core = { path = ".", features = ["test-support"] }
+# Test-only: generating throwaway RSA keys in the BigQuery/Snowflake JWT unit tests (sign +
+# verify round trip). 0.8 matches the `rand_core` 0.6 line the `rsa` crate itself depends on
+# (already in the tree transitively) — not a workspace dep since nothing else needs it.
+rand = "0.8"
+tracing-subscriber = { workspace = true }
+# Test-only: stands in for Athena's HTTP API in the connector's poll-loop/deadline tests —
+# community LocalStack doesn't implement Athena at all (see connectors.rs's `mod athena`), so
+# there's no other way to exercise the real aws-sdk-athena HTTP client against a live server.
+wiremock = "0.6"

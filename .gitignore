@@ -1,0 +1,41 @@
+# Build output
+target/
+/target-*/
+node_modules/
+dist/
+
+# Local runtime data (docker-compose bind mounts, demo/connector scratch)
+.data/
+
+# Env files: only the committed templates are tracked
+.env
+.env.*
+!.env.example
+!.env.selfhost.example
+*.local
+
+# Keys, certificates and credentials
+*.pem
+!apps/backend/tests/fixtures/*.pem
+*.p8
+*.p12
+*.pfx
+*.key
+*.crt
+*.der
+*.jks
+*.tokens
+*secret*
+!**/*secret*.rs
+!**/*secret*.ts
+!**/*secret*.tsx
+!**/*secret*.md
+*credentials*.json
+*adminsdk*.json
+serviceAccountKey*.json
+
+# Test and tool artifacts
+playwright-report/
+test-results/
+.playwright-mcp/
+.DS_Store

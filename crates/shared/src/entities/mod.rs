@@ -1,0 +1,34 @@
+//! `SeaORM` entities, one module per table.
+
+pub mod access_permission;
+pub mod ai_usage;
+pub mod api_key;
+pub mod change;
+pub mod dashboard;
+pub mod dashboard_narrative;
+pub mod data_source;
+pub mod data_source_group;
+pub mod data_source_upload;
+pub mod embed;
+pub mod escalation_step;
+pub mod event;
+pub mod favorite;
+pub mod group;
+pub mod group_role;
+pub mod mail_delivery;
+pub mod monitor;
+pub mod monitor_observation;
+pub mod monitor_subscription;
+pub mod notification_delivery;
+pub mod notification_destination;
+pub mod org_embed_settings;
+pub mod organization;
+pub mod query;
+pub mod query_result;
+pub mod query_snippet;
+pub mod role;
+pub mod run;
+pub mod schedule;
+pub mod user;
+pub mod visualization;
+pub mod widget;

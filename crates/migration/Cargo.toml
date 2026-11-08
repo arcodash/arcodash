@@ -1,0 +1,28 @@
+[package]
+name = "arcodash-migration"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "arcodash_migration"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcodash-migration"
+path = "src/main.rs"
+
+[dependencies]
+arcodash-core = { path = "../shared" }
+arcodash-conveyor = { path = "../conveyor" }
+sea-orm-migration = { workspace = true }
+tokio = { workspace = true }
+dotenvy = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+arcodash-core = { path = "../shared", features = ["test-support"] }

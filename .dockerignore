@@ -1,0 +1,27 @@
+# Build output and dependencies
+target/
+.data/
+**/dist/
+**/node_modules/
+
+# VCS, editor and OS files
+.git/
+.vscode/
+.idea/
+**/.DS_Store
+*.log
+
+# Secrets must never enter a build layer
+**/.env
+**/.env.*
+*.pem
+*.key
+*.p8
+*.tokens
+*credentials*.json
+*adminsdk*.json
+serviceAccountKey*.json
+
+# Test artifacts
+playwright-report/
+test-results/

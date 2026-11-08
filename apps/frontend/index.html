@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+
+    <!-- Starts /api/session before the entry chunk downloads/executes, saving a full serial
+         round trip on cold load. api.ts's getSession() consumes this in-flight request once,
+         falling back to a normal fetch if it's missing, rejected, or already consumed. -->
+    <script>
+      (function () {
+        var apiBase = "%VITE_API_BASE_URL%";
+        if (apiBase.charAt(0) === "%") apiBase = ""; // unresolved token — build didn't substitute it
+        if (typeof fetch === "function") {
+          var preload = fetch(apiBase + "/api/session", {
+            credentials: "include",
+            headers: { Accept: "application/json" },
+          });
+          preload.catch(function () {}); // avoid a console "unhandled rejection" before getSession() attaches its own handler
+          window.__SESSION_PRELOAD__ = preload;
+        }
+      })();
+    </script>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>arcodash</title>
+    <meta
+      name="description"
+      content="Open-source, self-hosted dashboards, SQL queries and monitors, with AI that helps write SQL and explains alerts."
+    />
+
+    <!-- Icons -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/icon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icons/icon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="theme-color" content="#7e14ff" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

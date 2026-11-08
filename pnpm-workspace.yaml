@@ -1,0 +1,8 @@
+packages:
+  - apps/*
+  - tests/e2e
+allowBuilds:
+  core-js: true
+  esbuild: true
+  msw: true
+  protobufjs: false

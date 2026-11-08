@@ -1,0 +1,15 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test-only fixtures, not real credentials"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+  '''(^|/)dist/''',
+]
+regexes = [
+  '''0123456789abcdef0123456789abcdef''',
+  '''R0123456789abcdef1a2b''',
+  '''anthropic-secret-key-1234567890''',
+]

@@ -1,0 +1,208 @@
+# Test infrastructure for scripts/test.sh, scripts/test-connectors.sh and CI. See docs/guide/testing.md.
+#   docker compose -f docker-compose.testing.yml up -d --wait postgres valkey mailpit gcs target-postgres
+name: arcodash-testing
+services:
+  # ── App test stack (scripts/test.sh, tests/e2e) ───────────────────────────────
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: arcodash
+      POSTGRES_PASSWORD: arcodash
+      POSTGRES_DB: arcodash_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - type: tmpfs
+        target: /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arcodash"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    command: valkey-server --save ""
+    ports:
+      - "6380:6379"
+    volumes:
+      - type: tmpfs
+        target: /data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:v1.32
+    ports:
+      - "1026:1025"  # SMTP
+      - "8026:8025"  # HTTP API / UI
+
+  gcs:
+    image: fsouza/fake-gcs-server:1.54.0
+    command: ["-scheme", "http", "-public-host", "localhost:4444", "-backend", "memory"]
+    ports:
+      - "4444:4443"
+
+  # "User data source" Postgres: what the pg connector connects to in the backend integration
+  # tests (TEST_TARGET_DATABASE_URL) and the connector tests (TEST_PG_URL).
+  target-postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: target
+      POSTGRES_PASSWORD: target
+      POSTGRES_DB: target_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - type: tmpfs
+        target: /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U target"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Connector DBs (scripts/test-connectors.sh) ────────────────────────────────
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: test
+      MYSQL_PASSWORD: test
+    ports:
+      - "5500:3306"
+    volumes:
+      - type: tmpfs
+        target: /var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: test
+      MYSQL_PASSWORD: test
+    ports:
+      - "5501:3306"
+    volumes:
+      - type: tmpfs
+        target: /var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h127.0.0.1 -utest -ptest || mysqladmin ping -h127.0.0.1 -utest -ptest"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: testdb
+      CLICKHOUSE_USER: test
+      CLICKHOUSE_PASSWORD: test
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "5502:8123"
+    volumes:
+      - type: tmpfs
+        target: /var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: root
+      MONGO_INITDB_DATABASE: testdb
+    ports:
+      - "5503:27017"
+    volumes:
+      - type: tmpfs
+        target: /data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --eval \"db.adminCommand('ping')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  elasticsearch:
+    image: elasticsearch:8.15.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "5504:9200"
+    volumes:
+      - type: tmpfs
+        target: /usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://127.0.0.1:9200/_cluster/health | grep -v red"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  influxdb:
+    image: influxdb:1.8
+    environment:
+      INFLUXDB_DB: testdb
+    ports:
+      - "5505:8086"
+    volumes:
+      - type: tmpfs
+        target: /var/lib/influxdb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://127.0.0.1:8086/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Arcodash1Test!"
+      MSSQL_PID: "Developer"
+    ports:
+      - "5507:1433"
+    # amd64-only image, emulated on Apple Silicon. A tmpfs data dir makes SQL Server fail to create
+    # its "/.system" marker at startup, so this service uses the container filesystem instead of
+    # tmpfs. Seccomp under emulation blocks a syscall SQL Server needs, hence `unconfined` (this
+    # test container only).
+    security_opt:
+      - seccomp=unconfined
+    healthcheck:
+      # tools18's sqlcmd needs -C (trust the self-signed server cert) and 127.0.0.1 rather than
+      # localhost (same container-network DNS quirk as the ClickHouse image above).
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1 -U sa -P 'Arcodash1Test!' -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # ── Warehouse emulators ────────────────────────────────────────────────────────
+  bigquery:
+    image: ghcr.io/goccy/bigquery-emulator:latest
+    command: ["--project=test", "--dataset=testdb"]
+    ports:
+      - "9050:9050"
+    healthcheck:
+      # The emulator image has neither curl nor wget; a bare TCP connect via bash's /dev/tcp is
+      # enough, since it listens as soon as it is ready.
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/9050' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

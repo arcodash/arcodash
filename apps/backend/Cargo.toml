@@ -1,0 +1,65 @@
+[package]
+name = "arcodash-backend"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+# Extra bins under src/bin/ (`rotate_encryption_key`) make `cargo run --package
+# arcodash-backend` ambiguous without this — CI and Playwright's webServer both invoke it
+# without --bin.
+default-run = "arcodash-backend"
+
+[dependencies]
+arcodash-core = { path = "../../crates/shared" }
+tokio = { workspace = true }
+sea-orm = { workspace = true }
+redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+governor = { workspace = true }
+regex = { workspace = true }
+time = "0.3.55"
+csv = { workspace = true }
+rust_xlsxwriter = { workspace = true }
+lettre = { workspace = true }
+# "stream" — `ai::read_capped` reads AI provider response bodies as a `bytes_stream()` instead of
+# `resp.text()`'s unbounded buffer, so a capped read can bail before the whole body arrives.
+reqwest = { workspace = true, features = ["stream"] }
+samael = { workspace = true }
+ldap3 = { workspace = true }
+base64 = { workspace = true }
+# Provides the `StreamExt` impl needed to poll `reqwest::Response::bytes_stream()` (an opaque
+# `futures_core::Stream`).
+tokio-stream = { version = "0.1.19", default-features = false }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+arcodash-core = { path = "../../crates/shared", features = ["test-support"] }
+arcodash-migration = { path = "../../crates/migration" }
+sqlx = { workspace = true }
+# Integration test harness — tests spin up the Axum app in-process via the lib target (src/lib.rs)
+# on a random port and drive it over HTTP. Requires TEST_DATABASE_URL + TEST_REDIS_URL (set by
+# docker-compose.testing.yml); tests skip gracefully when those env vars are absent.
+tokio = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["cookies", "multipart"] }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+argon2 = { workspace = true }
+uuid = { workspace = true }
+tower-http = { workspace = true }

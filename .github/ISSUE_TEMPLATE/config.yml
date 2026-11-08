@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://www.arcodash.com/docs
+    about: Guides and reference for arcodash.
+  - name: Security vulnerability
+    url: https://github.com/arcodash/arcodash/security/policy
+    about: Please report security issues privately, not as a public issue.
+  - name: Questions
+    url: https://github.com/arcodash/arcodash/discussions
+    about: Ask questions and share ideas.
