@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://www.arcodash.com">
-    <img src=".github/assets/banner.svg" alt="arcodash: BI with data observability built in. Count on your data. Count on the dashboard." width="100%">
+    <img src=".github/assets/banner.svg" alt="arcodash: BI with data observability built in. Trust your data. Trust the dashboard." width="100%">
   </a>
 </p>
 
@@ -37,7 +37,7 @@ arcodash is open-source BI with data observability built in. Connect a database 
 
 The backend and worker are Rust (Axum), the web app is React and Vite, Postgres holds all state and Valkey runs the job queue. It is licensed under AGPL-3.0 and runs with one `docker compose up`.
 
-> **Count on your data. Count on the dashboard.**
+> **Trust your data. Trust the dashboard.**
 
 ## ✨ Features
 
