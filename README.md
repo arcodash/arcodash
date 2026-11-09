@@ -2,12 +2,12 @@
 
 <p align="center">
   <a href="https://www.arcodash.com">
-    <img src=".github/assets/banner.svg" alt="arcodash: Full-Scale BI and Data Observability. Count on your data. Count on the dashboard." width="100%">
+    <img src=".github/assets/banner.svg" alt="arcodash: BI with data observability built in. Count on your data. Count on the dashboard." width="100%">
   </a>
 </p>
 
 <p align="center">
-  <strong>AI sprinkled Open-source BI with data observability built in.</strong><br>
+  <strong>Open-source BI with data observability built in.</strong><br>
   Dashboards that tell you when they're wrong.
 </p>
 
