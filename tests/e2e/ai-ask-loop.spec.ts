@@ -472,6 +472,7 @@ test("profile_refreshing: waits for the schema, asks again exactly once, shows t
     const timeline = page.getByTestId("ask-timeline");
     await expect(page.getByTestId("ask-step-refreshing")).toBeVisible({ timeout: 10_000 });
     await expect(timeline).toContainText("Updating the schema…");
+    expect(bodies).toHaveLength(1);
     refreshing = false;
     const summary = page.getByRole("button", { name: "Solved in 1 attempt · 3 rows · Gemini" });
     await expect(summary).toBeVisible({ timeout: 15_000 });
