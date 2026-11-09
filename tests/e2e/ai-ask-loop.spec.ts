@@ -457,11 +457,11 @@ test("profile_refreshing: waits for the schema, asks again exactly once, shows t
               ]),
       });
     });
-    let polls = 0;
-    await page.route(`**/api/data_sources/${ds.id}/schema*`, (route) =>
-      route.fulfill({
-        json: { schema: { tables: [] }, refreshing: ++polls === 1, refresh_error: null },
-      }),
+    // Any data source: the page may default to one left over from another spec.
+    // Refreshing until the test has seen the waiting state, so it can't finish before the assert.
+    let refreshing = true;
+    await page.route("**/api/data_sources/*/schema*", (route) =>
+      route.fulfill({ json: { schema: { tables: [] }, refreshing, refresh_error: null } }),
     );
 
     await page.goto("/queries/new");
@@ -472,6 +472,7 @@ test("profile_refreshing: waits for the schema, asks again exactly once, shows t
     const timeline = page.getByTestId("ask-timeline");
     await expect(page.getByTestId("ask-step-refreshing")).toBeVisible({ timeout: 10_000 });
     await expect(timeline).toContainText("Updating the schema…");
+    refreshing = false;
     const summary = page.getByRole("button", { name: "Solved in 1 attempt · 3 rows · Gemini" });
     await expect(summary).toBeVisible({ timeout: 15_000 });
     await summary.click();
@@ -499,7 +500,8 @@ test("profile_refreshing again on the retry: normal failure, no third request", 
         ]),
       });
     });
-    await page.route(`**/api/data_sources/${ds.id}/schema*`, (route) =>
+    // Any data source: the page may default to one left over from another spec.
+    await page.route("**/api/data_sources/*/schema*", (route) =>
       route.fulfill({ json: { schema: { tables: [] }, refreshing: false, refresh_error: null } }),
     );
 
