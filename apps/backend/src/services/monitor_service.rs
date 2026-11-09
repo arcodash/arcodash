@@ -367,10 +367,15 @@ struct TileRow {
     row0: Option<Value>,
     run_status: Option<String>,
     run_error: Option<String>,
+    obs_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    obs_value: Option<f64>,
+    use_obs: Option<bool>,
 }
 
 /// Enrichment for the monitor-tile widget in one round trip: state, condition, and the first-row
-/// cell from the newest terminal run's result. No authz; callers gate visibility first.
+/// cell from the newest evidence: the latest observation's result when it outranks the last
+/// terminal run (runs that failed or produced a result win ties and older observations), else the
+/// run's. No authz; callers gate visibility first.
 pub async fn tile_data(
     db: &impl ConnectionTrait,
     monitors: &[monitor::Model],
@@ -389,7 +394,10 @@ pub async fn tile_data(
             lr.finished_at AS finished_at,
             qr.data->'rows'->0 AS row0,
             lr.status AS run_status,
-            lr.error AS run_error
+            lr.error AS run_error,
+            lo.observed_at AS obs_at,
+            lo.value AS obs_value,
+            f.use_obs AS use_obs
         FROM monitors m
         LEFT JOIN LATERAL (
             SELECT r.finished_at, r.query_result_id, r.status, r.error
@@ -400,7 +408,23 @@ pub async fn tile_data(
             ORDER BY r.id DESC
             LIMIT 1
         ) lr ON TRUE
-        LEFT JOIN query_results qr ON qr.id = lr.query_result_id
+        LEFT JOIN LATERAL (
+            SELECT o.observed_at, o.value, o.query_result_id
+            FROM monitor_observations o
+            WHERE o.monitor_id = m.id
+            ORDER BY o.observed_at DESC, o.id DESC
+            LIMIT 1
+        ) lo ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT lo.observed_at IS NOT NULL AND (
+                lr.status IS NULL
+                OR NOT (lr.status IN ('failed', 'timed_out') OR lr.query_result_id IS NOT NULL)
+                OR lr.finished_at IS NULL
+                OR lo.observed_at > lr.finished_at
+            ) AS use_obs
+        ) f ON TRUE
+        LEFT JOIN query_results qr
+            ON qr.id = CASE WHEN f.use_obs THEN lo.query_result_id ELSE lr.query_result_id END
         WHERE m.id = ANY($1)
         ",
         [ids.clone().into()],
@@ -415,12 +439,23 @@ pub async fn tile_data(
         let op = m.options["op"].as_str().map(String::from);
         let value = m.options["value"].as_f64();
         let row = by_id.get(&m.id);
-        let observed = column
-            .as_deref()
-            .zip(row.and_then(|r| r.row0.as_ref()))
-            .and_then(|(col, row0)| row0.get(col).cloned());
-        let last_checked_at = row
-            .and_then(|r| r.finished_at)
+        // The SQL decides whether the newest observation outranks the last run (`use_obs`); row0
+        // is then that observation's result, else the run's.
+        // A successful check writes its observation after the run finalizes.
+        let fresh_obs = row
+            .filter(|r| r.use_obs == Some(true))
+            .and_then(|r| r.obs_at);
+        // The stored f64 is a fallback for when there is no result row to read the cell from.
+        let observed = match row.and_then(|r| r.row0.as_ref()) {
+            Some(row0) => column.as_deref().and_then(|col| row0.get(col).cloned()),
+            None => fresh_obs.and_then(|_| {
+                row.and_then(|r| r.obs_value)
+                    .and_then(serde_json::Number::from_f64)
+                    .map(Value::Number)
+            }),
+        };
+        let last_checked_at = fresh_obs
+            .or(row.and_then(|r| r.finished_at))
             .map(|t| t.with_timezone(&Utc));
         let muted =
             arcodash_core::models::parse_monitor_options(m.id, &m.options).is_silenced(Utc::now());
@@ -431,9 +466,10 @@ pub async fn tile_data(
             .flatten()
             .and_then(|e| e.lines().next())
             .map(String::from);
-        let check_failed = row
-            .and_then(|r| r.run_status.as_deref())
-            .is_some_and(|s| matches!(s, "failed" | "timed_out"));
+        let check_failed = fresh_obs.is_none()
+            && row
+                .and_then(|r| r.run_status.as_deref())
+                .is_some_and(|s| matches!(s, "failed" | "timed_out"));
         let last_check_error = check_failed
             .then(|| row.and_then(|r| r.run_error.clone()))
             .flatten();
@@ -1950,6 +1986,407 @@ mod tests {
         assert_eq!(tile.column.as_deref(), Some("value"));
         assert!(tile.observed.is_none());
         assert!(tile.last_checked_at.is_none());
+    }
+
+    /// `monitor_observations` row with the given numeric value and state, optionally linked to the
+    /// run and query result it was evaluated from.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_observation(
+        db: &sea_orm::DatabaseConnection,
+        org_id: i64,
+        monitor_id: i64,
+        observed_at: DateTime<Utc>,
+        value: Option<f64>,
+        run_id: Option<i64>,
+        query_result_id: Option<i64>,
+        state: &str,
+    ) {
+        arcodash_core::entities::monitor_observation::ActiveModel {
+            id: NotSet,
+            org_id: Set(org_id),
+            monitor_id: Set(monitor_id),
+            observed_at: Set(observed_at.into()),
+            value: Set(value),
+            state: Set(state.to_string()),
+            run_id: Set(run_id),
+            query_result_id: Set(query_result_id),
+            explanation: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn value_monitor(db: &sea_orm::DatabaseConnection) -> (i64, i64, i64, monitor::Model) {
+        let (org, admin, query) = seed(db).await;
+        let monitor = insert_monitor(
+            db,
+            org.id,
+            query.id,
+            admin.id,
+            json!({ "column": "value", "op": ">", "value": 5.0 }),
+            "ok",
+        )
+        .await;
+        (org.id, query.data_source_id, query.id, monitor)
+    }
+
+    /// Production order: the run finishes at `t`, its observation lands 1ms later.
+    #[tokio::test]
+    async fn tile_data_serves_the_raw_cell_of_a_run_backed_observation() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, ds_id, _, monitor) = value_monitor(&db).await;
+        let qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "value": "10813421.70" }] })),
+        )
+        .await;
+        let t = Utc::now();
+        let run = insert_run(&db, org_id, monitor.id, "success", t, Some(qr.id)).await;
+        let obs_at = t + chrono::Duration::milliseconds(1);
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            obs_at,
+            Some(10813421.7),
+            Some(run.id),
+            Some(qr.id),
+            "ok",
+        )
+        .await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.observed, Some(json!("10813421.70")));
+        assert!(tile
+            .last_checked_at
+            .is_some_and(|x| (x - obs_at).num_milliseconds().abs() < 2));
+    }
+
+    #[tokio::test]
+    async fn tile_data_serves_a_non_numeric_cell_of_an_unevaluable_observation() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, ds_id, _, monitor) = value_monitor(&db).await;
+        let qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "value": "n/a" }] })),
+        )
+        .await;
+        let t = Utc::now();
+        let run = insert_run(&db, org_id, monitor.id, "success", t, Some(qr.id)).await;
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t + chrono::Duration::milliseconds(1),
+            None,
+            Some(run.id),
+            Some(qr.id),
+            "unevaluable",
+        )
+        .await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.observed, Some(json!("n/a")));
+    }
+
+    #[tokio::test]
+    async fn tile_data_falls_back_to_the_stored_value_when_the_query_result_is_gone() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            Utc::now(),
+            Some(7.5),
+            None,
+            Some(i64::MAX),
+            "ok",
+        )
+        .await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.observed, Some(json!(7.5)));
+    }
+
+    #[tokio::test]
+    async fn tile_data_failed_run_newer_than_an_observation_reports_check_failed() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, ds_id, _, monitor) = value_monitor(&db).await;
+        let qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "value": 3 }] })),
+        )
+        .await;
+        let t = Utc::now();
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(5),
+            Some(3.0),
+            None,
+            Some(qr.id),
+            "ok",
+        )
+        .await;
+        insert_run(&db, org_id, monitor.id, "failed", t, None).await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert!(tile.check_failed);
+        assert_eq!(
+            tile.last_check_error.as_deref(),
+            Some("connection refused: db.internal:5432")
+        );
+    }
+
+    #[tokio::test]
+    async fn tile_data_skipped_run_without_a_result_keeps_the_observation() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, ds_id, _, monitor) = value_monitor(&db).await;
+        let qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "value": "42.50" }] })),
+        )
+        .await;
+        let t = Utc::now() - chrono::Duration::minutes(5);
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t,
+            Some(42.5),
+            None,
+            Some(qr.id),
+            "ok",
+        )
+        .await;
+        insert_run(&db, org_id, monitor.id, "skipped", Utc::now(), None).await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.observed, Some(json!("42.50")));
+        assert!(tile
+            .last_checked_at
+            .is_some_and(|x| (x - t).num_milliseconds().abs() < 2));
+        assert!(!tile.check_failed);
+    }
+
+    #[tokio::test]
+    async fn tile_data_uses_a_run_less_observation() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        let at = Utc::now();
+        insert_observation(&db, org_id, monitor.id, at, Some(1.0), None, None, "ok").await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.observed.as_ref().and_then(Value::as_f64), Some(1.0));
+        assert!(tile
+            .last_checked_at
+            .is_some_and(|t| (t - at).num_seconds().abs() < 5));
+        assert!(!tile.check_failed);
+    }
+
+    #[tokio::test]
+    async fn tile_data_observation_newer_than_a_failed_run_clears_check_failed() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        let run_at = Utc::now() - chrono::Duration::minutes(5);
+        insert_run(&db, org_id, monitor.id, "failed", run_at, None).await;
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            Utc::now(),
+            Some(7.5),
+            None,
+            None,
+            "ok",
+        )
+        .await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert!(!tile.check_failed);
+        assert_eq!(tile.last_check_error, None);
+        assert_eq!(tile.observed, Some(json!(7.5)));
+    }
+
+    #[tokio::test]
+    async fn tile_data_null_valued_newer_observation_yields_no_observed() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        insert_observation(&db, org_id, monitor.id, Utc::now(), None, None, None, "ok").await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert!(tile.observed.is_none());
+        assert!(tile.last_checked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn tile_data_result_without_the_column_ignores_the_observed_value() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, ds_id, _, monitor) = value_monitor(&db).await;
+        let qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "other": 1 }] })),
+        )
+        .await;
+        let t = Utc::now();
+        let run = insert_run(&db, org_id, monitor.id, "success", t, Some(qr.id)).await;
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t + chrono::Duration::milliseconds(1),
+            Some(9.0),
+            Some(run.id),
+            Some(qr.id),
+            "ok",
+        )
+        .await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert!(tile.observed.is_none());
+    }
+
+    #[tokio::test]
+    async fn tile_data_run_with_a_result_newer_than_an_observation_for_another_result_wins() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, ds_id, _, monitor) = value_monitor(&db).await;
+        let old_qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "value": "1" }] })),
+        )
+        .await;
+        let new_qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "value": "2" }] })),
+        )
+        .await;
+        let t = Utc::now();
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(5),
+            Some(1.0),
+            None,
+            Some(old_qr.id),
+            "ok",
+        )
+        .await;
+        insert_run(&db, org_id, monitor.id, "success", t, Some(new_qr.id)).await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.observed, Some(json!("2")));
+        assert!(tile
+            .last_checked_at
+            .is_some_and(|x| (x - t).num_milliseconds().abs() < 2));
+    }
+
+    #[tokio::test]
+    async fn tile_data_older_run_beside_a_resultless_observation_falls_back_to_its_value() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, ds_id, _, monitor) = value_monitor(&db).await;
+        let qr = insert_query_result(
+            &db,
+            org_id,
+            ds_id,
+            Some(json!({ "rows": [{ "value": "3" }] })),
+        )
+        .await;
+        let t = Utc::now();
+        insert_run(
+            &db,
+            org_id,
+            monitor.id,
+            "success",
+            t - chrono::Duration::minutes(5),
+            Some(qr.id),
+        )
+        .await;
+        insert_observation(&db, org_id, monitor.id, t, Some(8.0), None, None, "ok").await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.observed, Some(json!(8.0)));
+        assert!(tile
+            .last_checked_at
+            .is_some_and(|x| (x - t).num_milliseconds().abs() < 2));
+    }
+
+    #[tokio::test]
+    async fn tile_data_resultless_success_run_newer_than_an_observation_keeps_the_observation() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, mut monitor) = value_monitor(&db).await;
+        monitor.state = "unknown".to_string();
+        let t = Utc::now();
+        insert_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(5),
+            Some(4.0),
+            None,
+            None,
+            "ok",
+        )
+        .await;
+        insert_run(&db, org_id, monitor.id, "success", t, None).await;
+
+        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        let tile = tiles.get(&monitor.id).unwrap();
+        assert_eq!(tile.state, "unknown");
+        assert_eq!(tile.observed, Some(json!(4.0)));
+        assert!(!tile.check_failed);
     }
 
     #[tokio::test]

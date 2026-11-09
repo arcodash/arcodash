@@ -2370,6 +2370,69 @@ async fn public_embed_omits_a_widget_whose_query_is_not_public() {
 }
 
 #[tokio::test]
+async fn public_embed_serves_monitor_tile_from_a_run_less_observation() {
+    use arcodash_core::entities::{monitor_observation, organization};
+
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+
+    let ds_id = create_ds(&client, &app.address).await;
+    let query_id = create_query(&client, &app.address, ds_id).await;
+    let monitor_id = create_monitor(&client, &app.address, query_id).await;
+    let (dashboard_id, slug) = create_dashboard(&client, &app.address).await;
+    create_monitor_widget(&client, &app.address, dashboard_id, &[monitor_id]).await;
+    publish_dashboard(&client, &app.address, &slug).await;
+
+    let org = organization::Entity::find()
+        .filter(organization::Column::Slug.eq("default"))
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    monitor_observation::ActiveModel {
+        id: NotSet,
+        org_id: Set(org.id),
+        monitor_id: Set(monitor_id),
+        observed_at: Set(chrono::Utc::now().into()),
+        value: Set(Some(42.0)),
+        state: Set("ok".to_string()),
+        run_id: Set(None),
+        query_result_id: Set(None),
+        explanation: Set(None),
+    }
+    .insert(&app.db)
+    .await
+    .expect("observation insert failed");
+
+    let embed = ok_json(
+        client
+            .post(format!("{}/api/embeds", app.address))
+            .json(&serde_json::json!({
+                "object_type": "dashboard", "object_id": dashboard_id, "anonymous": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        "create embed",
+    )
+    .await;
+    let token = embed["token"].as_str().unwrap();
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/embed/{token}", app.address))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tile = &body["widgets"][0]["monitors"][0];
+    assert_eq!(tile["observed"].as_f64(), Some(42.0), "{body}");
+    assert!(tile["last_checked_at"].is_string(), "{body}");
+    assert_eq!(tile["check_failed"], serde_json::json!(false));
+}
+
+#[tokio::test]
 async fn public_embed_serves_monitor_tiles_with_state_and_observed_value() {
     use arcodash_core::entities::organization;
 
