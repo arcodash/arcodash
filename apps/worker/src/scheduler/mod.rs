@@ -779,6 +779,7 @@ pub(crate) mod test_support {
             data_size_bytes: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set(retrieved_at.into()),
+            last_used_at: Set(retrieved_at.into()),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()

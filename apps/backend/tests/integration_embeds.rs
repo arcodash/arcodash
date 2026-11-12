@@ -149,6 +149,7 @@ async fn seed_query_result(app: &TestApp, org_id: i64, ds_id: i64, query_id: i64
         data_size_bytes: Set(None),
         runtime: Set(Some(0.01)),
         retrieved_at: Set(now),
+        last_used_at: Set(now),
         created_at: Set(now),
         updated_at: Set(now),
     }

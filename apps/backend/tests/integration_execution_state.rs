@@ -104,6 +104,7 @@ async fn seed_result_at(
         data_size_bytes: Set(None),
         runtime: Set(Some(0.01)),
         retrieved_at: Set(retrieved_at),
+        last_used_at: Set(retrieved_at),
         created_at: Set(now),
         updated_at: Set(now),
     };

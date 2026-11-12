@@ -1109,6 +1109,7 @@ async fn events_resolve_query_result_to_owning_query() {
         data_size_bytes: Set(None),
         runtime: Set(Some(0.01)),
         retrieved_at: Set(now),
+        last_used_at: Set(now),
         created_at: Set(now),
         updated_at: Set(now),
     }

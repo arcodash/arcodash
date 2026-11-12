@@ -360,7 +360,7 @@ pub async fn previous_digest(
         .all(db)
         .await?;
     for row in rows {
-        let Ok(mut prev) = serde_json::from_value::<Digest>(row.digest) else {
+        let Ok(mut prev) = serde_json::from_value::<Digest>(row.digest.unwrap_or_default()) else {
             continue;
         };
         prev.widgets.retain(|w| readable.contains(&w.query_id));
@@ -844,10 +844,12 @@ pub async fn store(
         user_id: Set(user_id),
         created_at: Set(Utc::now().into()),
         source: Set(source.to_string()),
-        summary: Set(n.summary.clone()),
-        highlights: Set(serde_json::to_value(&n.highlights).unwrap_or(json!([]))),
+        summary: Set(Some(n.summary.clone())),
+        highlights: Set(Some(
+            serde_json::to_value(&n.highlights).unwrap_or(json!([])),
+        )),
         body: Set(n.body.clone()),
-        digest: Set(serde_json::to_value(digest).unwrap_or(json!({}))),
+        digest: Set(Some(serde_json::to_value(digest).unwrap_or(json!({})))),
         confidence: Set(n.confidence.clone()),
         model: Set(model.to_string()),
         ..Default::default()
@@ -1467,6 +1469,7 @@ mod tests {
                         json!({"columns": [{"name": "v"}], "rows": [{"v": v}]}),
                     )),
                     retrieved_at: Set(now),
+                    last_used_at: Set(now),
                     created_at: Set(now),
                     updated_at: Set(now),
                     ..Default::default()
@@ -1760,7 +1763,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(latest.summary, "n31");
+        assert_eq!(latest.summary.as_deref(), Some("n31"));
         assert_eq!(latest.body.as_deref(), Some("body of n31"));
         assert!(latest_for_user(&db, f.dash.id, f.user_id + 1_000_000)
             .await

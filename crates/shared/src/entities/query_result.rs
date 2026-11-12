@@ -14,6 +14,7 @@ pub struct Model {
     pub data_size_bytes: Option<i64>,
     pub runtime: Option<f64>,
     pub retrieved_at: DateTimeWithTimeZone,
+    pub last_used_at: DateTimeWithTimeZone,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

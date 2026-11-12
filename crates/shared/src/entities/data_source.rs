@@ -27,6 +27,7 @@ pub struct Model {
     pub health_checked_at: Option<DateTimeWithTimeZone>,
     /// Sampled-data digest for AI prompts; typed as `DataSourceAiProfile`. Never part of `schema`.
     pub ai_profile: Option<Json>,
+    pub ai_profile_values_location: Option<String>,
     pub ai_profile_built_at: Option<DateTimeWithTimeZone>,
     /// Whole-job failure of the last profile run; `None` after a clean run.
     pub ai_profile_last_error: Option<String>,
@@ -125,6 +126,7 @@ mod tests {
             ai_profile: None,
             ai_profile_built_at: None,
             ai_profile_last_error: None,
+            ai_profile_values_location: None,
             created_at: now,
             updated_at: now,
         }

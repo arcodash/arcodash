@@ -310,6 +310,7 @@ async fn seed_query_result(db: &sea_orm::DatabaseConnection, org_id: i64, ds_id:
         data_size_bytes: Set(None),
         runtime: Set(Some(0.01)),
         retrieved_at: Set(now.into()),
+        last_used_at: Set(now.into()),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),
     }

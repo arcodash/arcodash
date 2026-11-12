@@ -118,6 +118,7 @@ async fn add_widget(
             json!({"columns": [{"name": "v"}], "rows": [{"v": value}]}),
         )),
         retrieved_at: Set(chrono::Utc::now().into()),
+        last_used_at: Set(chrono::Utc::now().into()),
         created_at: Set(chrono::Utc::now().into()),
         updated_at: Set(chrono::Utc::now().into()),
         ..Default::default()

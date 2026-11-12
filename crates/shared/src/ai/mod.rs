@@ -402,6 +402,7 @@ mod tests {
             ai_profile: None,
             ai_profile_built_at: None,
             ai_profile_last_error: None,
+            ai_profile_values_location: None,
             created_at: now,
             updated_at: now,
         }

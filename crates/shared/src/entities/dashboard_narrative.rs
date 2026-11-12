@@ -13,11 +13,13 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     /// `manual` or `digest`.
     pub source: String,
-    pub summary: String,
-    pub highlights: Json,
+    pub summary: Option<String>,
+    pub highlights: Option<Json>,
     /// Markdown; absent on rows written before it existed.
     pub body: Option<String>,
-    pub digest: Json,
+    pub digest: Option<Json>,
+    /// Object-storage pointer when the content columns are empty.
+    pub data_location: Option<String>,
     /// `low`, `medium` or `high`.
     pub confidence: String,
     pub model: String,

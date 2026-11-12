@@ -34,6 +34,7 @@ mod m20261005_000001_data_source_ai_profile_last_error;
 mod m20261009_000001_ai_usage_cost;
 mod m20261009_000002_dashboard_narratives;
 mod m20261013_000001_dashboard_narrative_body;
+mod m20261112_000001_external_customer_data;
 pub mod track;
 
 pub async fn assert_track(db: &DatabaseConnection) -> Result<(), String> {
@@ -115,6 +116,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000001_ai_usage_cost::Migration),
             Box::new(m20261009_000002_dashboard_narratives::Migration),
             Box::new(m20261013_000001_dashboard_narrative_body::Migration),
+            Box::new(m20261112_000001_external_customer_data::Migration),
         ]
     }
 }

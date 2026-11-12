@@ -1603,6 +1603,7 @@ async fn paused_data_source_refuses_new_executions_but_not_cached_reads() {
         data_size_bytes: Set(None),
         runtime: Set(None),
         retrieved_at: Set(chrono::Utc::now().into()),
+        last_used_at: Set(chrono::Utc::now().into()),
         created_at: NotSet,
         updated_at: NotSet,
     }

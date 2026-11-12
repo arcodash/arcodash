@@ -1972,6 +1972,7 @@ async fn downloading_a_query_result_records_an_audit_event() {
         data_size_bytes: Set(None),
         runtime: Set(Some(0.01)),
         retrieved_at: Set(now.into()),
+        last_used_at: Set(now.into()),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),
     }
@@ -2442,6 +2443,7 @@ async fn downloading_a_run_result_records_an_audit_event() {
         data_size_bytes: Set(None),
         runtime: Set(Some(0.01)),
         retrieved_at: Set(now.into()),
+        last_used_at: Set(now.into()),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),
     }
@@ -2533,6 +2535,7 @@ async fn seed_result(
         data_size_bytes: Set(None),
         runtime: Set(Some(0.01)),
         retrieved_at: Set(now.into()),
+        last_used_at: Set(now.into()),
         created_at: Set(now.into()),
         updated_at: Set(now.into()),
     }

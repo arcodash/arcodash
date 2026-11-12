@@ -265,6 +265,7 @@ async fn seed_published_result(app: &TestApp, query_id: i64) {
             "truncated": false
         }))),
         retrieved_at: Set(now),
+        last_used_at: Set(now),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()

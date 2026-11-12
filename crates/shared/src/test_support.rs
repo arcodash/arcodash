@@ -91,6 +91,7 @@ pub fn new_data_source(org_id: i64) -> data_source::ActiveModel {
         ai_profile: NotSet,
         ai_profile_built_at: NotSet,
         ai_profile_last_error: NotSet,
+        ai_profile_values_location: NotSet,
         created_at: NotSet,
         updated_at: NotSet,
     }

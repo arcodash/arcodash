@@ -20,6 +20,7 @@ pub struct Model {
     pub to_email: Option<String>,
     pub subject: Option<String>,
     pub body_html: Option<String>,
+    pub body_location: Option<String>,
     pub status: String,
     pub error: Option<String>,
     pub worker_id: Option<String>,

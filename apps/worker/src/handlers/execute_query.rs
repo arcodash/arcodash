@@ -614,6 +614,7 @@ async fn run_query(
                 data_size_bytes: Set(None),
                 runtime: Set(Some(result.runtime_seconds)),
                 retrieved_at: Set(retrieved_at.into()),
+                last_used_at: Set(retrieved_at.into()),
                 ..Default::default()
             };
             active.insert(&txn).await?
@@ -2911,6 +2912,7 @@ mod write_guard_tests {
             data_size_bytes: Set(None),
             runtime: Set(Some(0.0)),
             retrieved_at: Set(future_retrieved_at),
+            last_used_at: Set(future_retrieved_at),
             ..Default::default()
         }
         .insert(&db)

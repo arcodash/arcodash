@@ -1883,6 +1883,7 @@ mod tests {
             data_size_bytes: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set(now.into()),
+            last_used_at: Set(now.into()),
             ..Default::default()
         }
         .insert(&db)
@@ -1898,6 +1899,7 @@ mod tests {
             data_size_bytes: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set((now - chrono::Duration::seconds(30)).into()),
+            last_used_at: Set((now - chrono::Duration::seconds(30)).into()),
             ..Default::default()
         }
         .insert(&db)
@@ -1963,6 +1965,7 @@ mod tests {
             data_size_bytes: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set(now.into()),
+            last_used_at: Set(now.into()),
             ..Default::default()
         }
         .insert(&db)
