@@ -63,6 +63,8 @@ pub struct AppExtensions {
     pub reserved_org_settings_keys: Vec<&'static str>,
     /// Replaces the built-in login system; `None` keeps it.
     pub external_auth: Option<ExternalAuth>,
+    /// Resolves each organization's object storage; `None` keeps the shared-bucket default.
+    pub storage_resolver: Option<Arc<dyn arcodash_core::org_storage::OrgStorageResolver>>,
 }
 
 /// `GET /api/session` is the one org-optional path every binary needs; shared so embedders don't
@@ -79,6 +81,7 @@ impl Default for AppExtensions {
             entitlements: None,
             reserved_org_settings_keys: Vec::new(),
             external_auth: None,
+            storage_resolver: None,
         }
     }
 }
@@ -87,6 +90,9 @@ impl Default for AppExtensions {
 pub fn build_app(mut state: AppState, cors: CorsLayer, ext: AppExtensions) -> Router {
     if let Some(entitlements) = ext.entitlements {
         state.entitlements = entitlements;
+    }
+    if let Some(resolver) = ext.storage_resolver {
+        state.storage = resolver;
     }
     state.reserved_org_settings_keys = Arc::new(ext.reserved_org_settings_keys);
     if let Some(ext_auth) = &ext.external_auth {

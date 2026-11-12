@@ -379,11 +379,12 @@ pub(crate) mod test_support {
         db: DatabaseConnection,
         redis: redis::aio::ConnectionManager,
     ) -> ExecuteQueryContext {
+        let store = test_store();
         ExecuteQueryContext {
             db,
             redis: redis.clone(),
             connectors: Arc::new(ConnectorRegistry::default()),
-            store: test_store(),
+            store: store.clone(),
             encryption_key: [0u8; 32],
             queue: Arc::new(ValkeyQueue::new(redis)),
             mailer: None,
@@ -394,6 +395,9 @@ pub(crate) mod test_support {
             conveyor: std::sync::OnceLock::new(),
             ai: None,
             entitlements: std::sync::Arc::new(arcodash_core::entitlements::Unrestricted),
+            storage: std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+                store,
+            )),
         }
     }
 

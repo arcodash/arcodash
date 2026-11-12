@@ -101,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
         entitlements: Arc::new(Unrestricted),
         reserved_org_settings_keys: Arc::new(Vec::new()),
         external_auth: None,
+        storage: Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            store.clone(),
+        )),
         db: db.clone(),
         // OSS binary: one pool, same connection as `db`.
         conveyor_db: db,

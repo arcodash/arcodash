@@ -79,6 +79,8 @@ pub struct AppState {
     /// The embedding deployment's login system, if it replaces the built-in one. Filled from
     /// `AppExtensions::external_auth`.
     pub external_auth: Option<Arc<crate::ExternalAuth>>,
+    /// Resolves an organization's object storage; filled from `AppExtensions::storage_resolver`.
+    pub storage: Arc<dyn arcodash_core::org_storage::OrgStorageResolver>,
 }
 
 impl FromRef<AppState> for Config {

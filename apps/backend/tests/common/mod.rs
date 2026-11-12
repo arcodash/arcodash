@@ -283,6 +283,9 @@ async fn build_test_state(
             conveyor_db: db.clone(),
             redis,
             config,
+            storage: Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+                store.clone(),
+            )),
             connectors,
             store,
             queue,

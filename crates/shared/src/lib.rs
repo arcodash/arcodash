@@ -22,6 +22,7 @@ pub mod net_guard;
 pub mod notify;
 pub mod org_seed;
 pub mod org_settings;
+pub mod org_storage;
 pub mod permissions_catalog;
 pub mod query_exec;
 pub mod queue;

@@ -67,12 +67,15 @@ async fn assert_table_rls_bypass_role(
 /// Deployment-supplied behavior the worker consults while processing work.
 pub struct WorkerExtensions {
     pub entitlements: Arc<dyn OrgEntitlements>,
+    /// Resolves each organization's object storage; `None` keeps the shared-bucket default.
+    pub storage_resolver: Option<Arc<dyn arcodash_core::org_storage::OrgStorageResolver>>,
 }
 
 impl Default for WorkerExtensions {
     fn default() -> Self {
         Self {
             entitlements: Arc::new(Unrestricted),
+            storage_resolver: None,
         }
     }
 }
@@ -122,6 +125,11 @@ pub async fn run(ext: WorkerExtensions) -> anyhow::Result<()> {
             .await
             .context("failed to ensure upload bucket exists against the storage emulator")?;
     }
+    let storage = ext.storage_resolver.unwrap_or_else(|| {
+        Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            store.clone(),
+        ))
+    });
     let ctx = Arc::new(ExecuteQueryContext {
         connectors: Arc::new(ConnectorRegistry::with_db(db.clone(), store.clone())),
         queue: Arc::new(ValkeyQueue::new(redis.clone())),
@@ -132,6 +140,7 @@ pub async fn run(ext: WorkerExtensions) -> anyhow::Result<()> {
         mailer: build_mailer(&config),
         mail_from: config.mail_from.clone(),
         entitlements: ext.entitlements,
+        storage,
         base_url: config.base_url.clone(),
         query_timeout_secs: config.query_timeout_secs,
         max_query_rows: config.max_query_rows,

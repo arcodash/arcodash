@@ -37,6 +37,41 @@ pub struct ObjectStore {
     token_cache: RwLock<Option<(String, Instant)>>,
 }
 
+#[async_trait::async_trait]
+impl crate::org_storage::BlobStore for ObjectStore {
+    async fn put(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        content_type: &str,
+    ) -> Result<(), crate::org_storage::StorageError> {
+        Self::put(self, key, bytes, content_type).await?;
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> Result<Bytes, crate::org_storage::StorageError> {
+        self.get_opt(key)
+            .await?
+            .ok_or(crate::org_storage::StorageError::NotFound)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), crate::org_storage::StorageError> {
+        Self::delete(self, key).await?;
+        Ok(())
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, u64)>, crate::org_storage::StorageError> {
+        Ok(Self::list_prefix(self, prefix)
+            .await?
+            .into_iter()
+            .map(|o| (o.name, o.size))
+            .collect())
+    }
+}
+
 /// One object returned by `ObjectStore::list_prefix`.
 pub struct StoredObject {
     pub name: String,
@@ -115,17 +150,23 @@ impl ObjectStore {
             _ => StorageBase::Gcp,
         };
         Ok(Arc::new(Self {
-            // 60s total timeout covers `put` too (the 25MB upload cap needs ~440KB/s). No
-            // redirects: GCS's API doesn't 30x normally.
-            http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(60))
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("arcodash/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .context("failed to build object-store HTTP client")?,
+            http: build_http_client()?,
             base,
             bucket,
+            token_cache: RwLock::new(None),
+        }))
+    }
+
+    /// Emulator-mode store for an explicit host and bucket, without reading the environment.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the HTTP client cannot be built.
+    pub fn for_emulator(host: &str, bucket: &str) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            http: build_http_client()?,
+            base: StorageBase::Emulator(host.trim_end_matches('/').to_string()),
+            bucket: bucket.to_string(),
             token_cache: RwLock::new(None),
         }))
     }
@@ -233,6 +274,13 @@ impl ObjectStore {
     }
 
     pub async fn get(&self, key: &str) -> Result<Bytes> {
+        self.get_opt(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("GCS object download returned status 404 Not Found"))
+    }
+
+    /// `None` when the object does not exist.
+    async fn get_opt(&self, key: &str) -> Result<Option<Bytes>> {
         tracing::debug!(object_key = key, "storage get");
         let url = format!("{}?alt=media", self.object_url(key));
         let resp = self
@@ -240,7 +288,11 @@ impl ObjectStore {
             .await?
             .send()
             .await
-            .context("GCS object download request failed")?
+            .context("GCS object download request failed")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp
             .error_for_status()
             .context("GCS object download returned an error status")?;
         let bytes = resp
@@ -252,7 +304,7 @@ impl ObjectStore {
             bytes = bytes.len(),
             "storage get complete"
         );
-        Ok(bytes)
+        Ok(Some(bytes))
     }
 
     /// A 404 counts as success: the object is already gone.
@@ -383,6 +435,18 @@ pub fn object_key(org_id: i64, connector_type: &str, upload_id: Uuid, filename: 
         "orgs/{org_id}/uploads/{connector_type}/{upload_id}/{}",
         sanitize_filename(filename)
     )
+}
+
+/// 60s total timeout covers `put` too (the 25MB upload cap needs ~440KB/s). No redirects: GCS's
+/// API doesn't 30x normally.
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("arcodash/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to build object-store HTTP client")
 }
 
 #[cfg(test)]

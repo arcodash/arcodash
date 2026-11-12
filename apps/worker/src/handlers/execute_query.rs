@@ -60,6 +60,9 @@ pub struct ExecuteQueryContext {
     pub ai: Option<Arc<crate::ai_sink::AiRuntime>>,
     /// Per-org gating of background work and AI features.
     pub entitlements: Arc<dyn arcodash_core::entitlements::OrgEntitlements>,
+    /// Resolves an organization's object storage.
+    #[expect(dead_code, reason = "read by the result write path")]
+    pub storage: Arc<dyn arcodash_core::org_storage::OrgStorageResolver>,
 }
 
 /// Run the `execute_query` flow end to end, writing job status to Redis at each step. Errors returned

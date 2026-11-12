@@ -507,3 +507,208 @@ mod tests {
         assert_eq!(snippet.user_id, ActiveValue::Set(3));
     }
 }
+
+/// In-memory and failing `BlobStore`s plus a fixed `OrgStorageResolver`, for tests of code that
+/// goes through the storage seam.
+pub mod blob {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use sea_orm::DatabaseConnection;
+
+    use crate::org_storage::{
+        BlobStore, OrgStorage, OrgStorageResolver, StorageError, StorageMode,
+    };
+
+    #[derive(Default)]
+    pub struct MemoryBlobStore {
+        objects: Mutex<BTreeMap<String, (Bytes, String)>>,
+        puts: AtomicUsize,
+        gets: AtomicUsize,
+        deletes: AtomicUsize,
+    }
+
+    impl MemoryBlobStore {
+        /// Sorted full keys currently stored.
+        /// # Panics
+        ///
+        /// If the internal mutex is poisoned.
+        pub fn keys(&self) -> Vec<String> {
+            self.objects.lock().unwrap().keys().cloned().collect()
+        }
+
+        /// # Panics
+        ///
+        /// If the internal mutex is poisoned.
+        pub fn content_type(&self, key: &str) -> Option<String> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|(_, ct)| ct.clone())
+        }
+
+        pub fn puts(&self) -> usize {
+            self.puts.load(Ordering::SeqCst)
+        }
+
+        pub fn gets(&self) -> usize {
+            self.gets.load(Ordering::SeqCst)
+        }
+
+        pub fn deletes(&self) -> usize {
+            self.deletes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobStore for MemoryBlobStore {
+        async fn put(
+            &self,
+            key: &str,
+            bytes: Bytes,
+            content_type: &str,
+        ) -> Result<(), StorageError> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (bytes, content_type.to_string()));
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Bytes, StorageError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|(b, _)| b.clone())
+                .ok_or(StorageError::NotFound)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>, StorageError> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, (b, _))| (k.clone(), b.len() as u64))
+                .collect())
+        }
+    }
+
+    /// Fails every call with `Unreachable { detail }`.
+    pub struct FailingBlobStore {
+        detail: String,
+        puts: AtomicUsize,
+    }
+
+    impl FailingBlobStore {
+        pub fn new(detail: &str) -> Self {
+            Self {
+                detail: detail.to_string(),
+                puts: AtomicUsize::new(0),
+            }
+        }
+
+        pub fn puts(&self) -> usize {
+            self.puts.load(Ordering::SeqCst)
+        }
+
+        fn err(&self) -> StorageError {
+            StorageError::Unreachable {
+                detail: self.detail.clone(),
+            }
+        }
+    }
+
+    impl Default for FailingBlobStore {
+        fn default() -> Self {
+            Self::new("AccessDenied")
+        }
+    }
+
+    #[async_trait]
+    impl BlobStore for FailingBlobStore {
+        async fn put(&self, _: &str, _: Bytes, _: &str) -> Result<(), StorageError> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            Err(self.err())
+        }
+
+        async fn get(&self, _: &str) -> Result<Bytes, StorageError> {
+            Err(self.err())
+        }
+
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Err(self.err())
+        }
+
+        async fn list_prefix(&self, _: &str) -> Result<Vec<(String, u64)>, StorageError> {
+            Err(self.err())
+        }
+    }
+
+    /// Resolves every organization to the same store. The returned storage keeps the template's
+    /// mode, root and pause flag but carries the requested `org_id`.
+    pub struct StaticResolver {
+        storage: OrgStorage,
+        failures: AtomicUsize,
+        missing: AtomicUsize,
+    }
+
+    impl StaticResolver {
+        #[must_use]
+        pub const fn new(storage: OrgStorage) -> Self {
+            Self {
+                storage,
+                failures: AtomicUsize::new(0),
+                missing: AtomicUsize::new(0),
+            }
+        }
+
+        pub fn with_store(mode: StorageMode, store: Arc<dyn BlobStore>, root: &str) -> Self {
+            Self::new(OrgStorage::new(0, mode, store, root))
+        }
+
+        pub fn failures(&self) -> usize {
+            self.failures.load(Ordering::SeqCst)
+        }
+
+        pub fn missing(&self) -> usize {
+            self.missing.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrgStorageResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            _db: &DatabaseConnection,
+            org_id: i64,
+        ) -> Result<OrgStorage, StorageError> {
+            let mut storage = self.storage.clone();
+            storage.org_id = org_id;
+            Ok(storage)
+        }
+
+        async fn report_failure(&self, _: &DatabaseConnection, _: i64, _: &StorageError) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn report_missing(&self, _: &DatabaseConnection, _: i64) {
+            self.missing.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
