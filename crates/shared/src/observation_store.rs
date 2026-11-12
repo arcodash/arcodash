@@ -9,7 +9,7 @@ use chrono::{DateTime, Datelike, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 
-use crate::org_storage::{OrgStorage, StorageArea, StorageError};
+use crate::org_storage::{OrgStorage, OrgStorageResolver, StorageArea, StorageError};
 
 const CONTENT_TYPE: &str = "application/x-ndjson";
 
@@ -234,6 +234,56 @@ pub async fn load_for_rows(
             tracing::warn!(monitor_id, error = %e, "observation_store: load failed");
             HashMap::new()
         })
+}
+
+/// Newest explanation of the monitor's current incident: observations after the last
+/// non-triggered one, newest first, the first carrying an inline (legacy) or stored explanation.
+/// Best-effort: any failure yields `None`.
+pub async fn latest_incident_explanation(
+    db: &DatabaseConnection,
+    resolver: &dyn OrgStorageResolver,
+    org_id: i64,
+    monitor_id: i64,
+) -> Option<String> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, observed_at, explanation FROM monitor_observations \
+             WHERE monitor_id = $1 \
+               AND observed_at > COALESCE((SELECT max(observed_at) FROM monitor_observations \
+                                           WHERE monitor_id = $1 AND state <> 'triggered'), \
+                                          '-infinity'::timestamptz) \
+             ORDER BY observed_at DESC, id DESC",
+            [monitor_id.into()],
+        ))
+        .await
+        .map_err(|e| tracing::warn!(monitor_id, error = %e, "incident explanation: lookup failed"))
+        .ok()?;
+    let rows: Vec<(i64, DateTime<Utc>, Option<String>)> = rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.try_get("", "id").ok()?,
+                r.try_get("", "observed_at").ok()?,
+                r.try_get("", "explanation").ok()?,
+            ))
+        })
+        .collect();
+    let stored = if rows.iter().any(|r| r.2.is_none()) {
+        let storage = resolver
+            .resolve(db, org_id)
+            .await
+            .map_err(
+                |e| tracing::warn!(monitor_id, error = %e, "incident explanation: storage unavailable"),
+            )
+            .ok()?;
+        let keys: Vec<_> = rows.iter().map(|r| (r.0, r.1)).collect();
+        load_for_rows(&storage, monitor_id, &keys).await
+    } else {
+        HashMap::new()
+    };
+    rows.into_iter()
+        .find_map(|(id, _, legacy)| merged_explanation(legacy, stored.get(&id)))
 }
 
 #[cfg(test)]

@@ -587,7 +587,7 @@ pub async fn requeue_stale_pending_notifications(ctx: &ExecuteQueryContext) -> u
         };
 
         let explanation = if state == "triggered" {
-            crate::handlers::explain_alert::latest_explanation(
+            arcodash_core::observation_store::latest_incident_explanation(
                 &ctx.db,
                 ctx.storage.as_ref(),
                 org_id,

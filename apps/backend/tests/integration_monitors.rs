@@ -3292,3 +3292,143 @@ async fn tile_incident_summary_first_line() {
         .unwrap();
     assert_eq!(tile.incident_summary.as_deref(), Some("Spike to 9"));
 }
+
+/// Inserts an observation row (inline `value`/`explanation` as given) and returns its id.
+async fn insert_observation_row(
+    app: &TestApp,
+    monitor_id: i64,
+    at: chrono::DateTime<chrono::Utc>,
+    inline: (Option<f64>, Option<&str>),
+) -> (i64, i64) {
+    use arcodash_core::entities::{monitor, monitor_observation};
+    use sea_orm::{ActiveModelTrait, ActiveValue::NotSet, ActiveValue::Set, EntityTrait};
+    let org_id = monitor::Entity::find_by_id(monitor_id)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap()
+        .org_id;
+    let row = monitor_observation::ActiveModel {
+        id: NotSet,
+        org_id: Set(org_id),
+        monitor_id: Set(monitor_id),
+        observed_at: Set(at.into()),
+        value: Set(inline.0),
+        state: Set("triggered".into()),
+        run_id: Set(None),
+        query_result_id: Set(None),
+        explanation: Set(inline.1.map(String::from)),
+    }
+    .insert(&app.db)
+    .await
+    .unwrap();
+    (row.id, org_id)
+}
+
+async fn store_values(
+    app: &TestApp,
+    org_id: i64,
+    monitor_id: i64,
+    v: arcodash_core::observation_store::ObservationValues,
+) {
+    let storage = app.state.storage.resolve(&app.db, org_id).await.unwrap();
+    arcodash_core::observation_store::append_observation(&app.db, &storage, monitor_id, &v, None)
+        .await
+        .unwrap();
+}
+
+async fn monitor_for_observations(app: &TestApp, client: &reqwest::Client) -> i64 {
+    let ds_id = create_ds(client, &app.address).await;
+    let query_id = create_query(client, &app.address, ds_id).await;
+    use sea_orm::EntityTrait;
+    let monitor_id = create_monitor(client, &app.address, query_id, "observed").await["id"]
+        .as_i64()
+        .unwrap();
+    // Ids restart after cleanup but bucket objects persist; drop files left by earlier runs.
+    let org_id = arcodash_core::entities::monitor::Entity::find_by_id(monitor_id)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap()
+        .org_id;
+    let storage = app.state.storage.resolve(&app.db, org_id).await.unwrap();
+    storage
+        .delete_prefix(
+            arcodash_core::org_storage::StorageArea::Monitors,
+            &format!("{monitor_id}/"),
+        )
+        .await
+        .unwrap();
+    monitor_id
+}
+
+async fn get_observations(
+    client: &reqwest::Client,
+    app: &TestApp,
+    monitor_id: i64,
+) -> Vec<serde_json::Value> {
+    let body = ok_json(
+        client
+            .get(format!(
+                "{}/api/monitors/{monitor_id}/observations",
+                app.address
+            ))
+            .send()
+            .await
+            .unwrap(),
+        "list observations",
+    )
+    .await;
+    body.as_array().unwrap().clone()
+}
+
+#[tokio::test]
+async fn list_observations_reads_values_from_storage() {
+    use arcodash_core::observation_store::ObservationValues;
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let monitor_id = monitor_for_observations(&app, &client).await;
+    let t = chrono::Utc::now();
+    let (stored_id, org_id) = insert_observation_row(
+        &app,
+        monitor_id,
+        t - chrono::Duration::minutes(2),
+        (None, None),
+    )
+    .await;
+    store_values(
+        &app,
+        org_id,
+        monitor_id,
+        ObservationValues {
+            id: stored_id,
+            observed_at: t - chrono::Duration::minutes(2),
+            value: Some(7.5),
+            explanation: Some("why it fired".into()),
+        },
+    )
+    .await;
+    insert_observation_row(&app, monitor_id, t, (Some(3.0), Some("legacy text"))).await;
+
+    let rows = get_observations(&client, &app, monitor_id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["value"], 7.5);
+    assert_eq!(rows[0]["explanation"], "why it fired");
+    assert_eq!(rows[1]["value"], 3.0);
+    assert_eq!(rows[1]["explanation"], "legacy text");
+}
+
+#[tokio::test]
+async fn list_observations_missing_month_is_a_gap() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let monitor_id = monitor_for_observations(&app, &client).await;
+    insert_observation_row(&app, monitor_id, chrono::Utc::now(), (None, None)).await;
+
+    let rows = get_observations(&client, &app, monitor_id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["value"].is_null());
+    assert!(rows[0]["explanation"].is_null());
+}

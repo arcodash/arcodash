@@ -41,49 +41,6 @@ const HISTORY_FOR_PROMPT: usize = 30;
 #[cfg(test)]
 static SLICES_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Newest persisted explanation of the monitor's current incident: observations after the last
-/// non-triggered one. Any error yields `None`.
-pub async fn latest_explanation(
-    db: &sea_orm::DatabaseConnection,
-    resolver: &dyn OrgStorageResolver,
-    org_id: i64,
-    monitor_id: i64,
-) -> Option<String> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT id, observed_at, explanation FROM monitor_observations \
-             WHERE monitor_id = $1 \
-               AND observed_at > COALESCE((SELECT max(observed_at) FROM monitor_observations \
-                                           WHERE monitor_id = $1 AND state <> 'triggered'), \
-                                          '-infinity'::timestamptz) \
-             ORDER BY observed_at DESC, id DESC",
-            [monitor_id.into()],
-        ))
-        .await
-        .map_err(|e| tracing::warn!(monitor_id, error = %e, "latest_explanation: lookup failed"))
-        .ok()?;
-    let rows: Vec<(i64, DateTime<Utc>, Option<String>)> = rows
-        .iter()
-        .filter_map(|r| {
-            Some((
-                r.try_get("", "id").ok()?,
-                r.try_get("", "observed_at").ok()?,
-                r.try_get("", "explanation").ok()?,
-            ))
-        })
-        .collect();
-    let stored = if rows.iter().any(|r| r.2.is_none()) {
-        let storage = resolver.resolve(db, org_id).await.ok()?;
-        let keys: Vec<_> = rows.iter().map(|r| (r.0, r.1)).collect();
-        observation_store::load_for_rows(&storage, monitor_id, &keys).await
-    } else {
-        HashMap::new()
-    };
-    rows.into_iter()
-        .find_map(|(id, _, legacy)| observation_store::merged_explanation(legacy, stored.get(&id)))
-}
-
 /// Newest-first `(observed_at, value)` of up to `limit` recent observations that carry a value,
 /// read from the row (legacy) or the stored values. `exclude_id` skips one observation.
 pub async fn recent_values(
@@ -666,16 +623,27 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            latest_explanation(&f.ctx.db, f.ctx.storage.as_ref(), f.org.id, f.monitor.id).await,
+            observation_store::latest_incident_explanation(
+                &f.ctx.db,
+                f.ctx.storage.as_ref(),
+                f.org.id,
+                f.monitor.id
+            )
+            .await,
             None
         );
         observation_store::set_explanation(&f.ctx.db, &storage, f.monitor.id, id, at, "stored why")
             .await
             .unwrap();
         assert_eq!(
-            latest_explanation(&f.ctx.db, f.ctx.storage.as_ref(), f.org.id, f.monitor.id)
-                .await
-                .as_deref(),
+            observation_store::latest_incident_explanation(
+                &f.ctx.db,
+                f.ctx.storage.as_ref(),
+                f.org.id,
+                f.monitor.id
+            )
+            .await
+            .as_deref(),
             Some("stored why")
         );
     }

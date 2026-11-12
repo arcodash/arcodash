@@ -189,9 +189,13 @@ pub async fn run_due_escalations(
         summary.escalated += 1;
         crate::health::ESCALATIONS_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let explanation =
-            crate::handlers::explain_alert::latest_explanation(db, storage, m.org_id, m.monitor_id)
-                .await;
+        let explanation = arcodash_core::observation_store::latest_incident_explanation(
+            db,
+            storage,
+            m.org_id,
+            m.monitor_id,
+        )
+        .await;
         if let Err(e) = enqueue_send_notification(
             queue,
             conveyor,

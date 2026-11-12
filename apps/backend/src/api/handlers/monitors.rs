@@ -617,6 +617,7 @@ pub struct ObservationResponse {
 /// `GET /api/monitors/:id/observations?limit=` — newest `limit` (default 100, 1..=500),
 /// oldest-first.
 pub async fn list_observations(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
@@ -632,14 +633,49 @@ pub async fn list_observations(
         .all(&db)
         .await?;
     rows.reverse();
+    let range = rows.first().zip(rows.last()).map(|(first, last)| {
+        (
+            first.observed_at.with_timezone(&Utc),
+            last.observed_at.with_timezone(&Utc),
+        )
+    });
+    let stored = match range {
+        Some((from, to)) => {
+            let storage = state.storage.resolve(&state.db, user.org_id).await?;
+            match arcodash_core::observation_store::load_observations(&storage, a.id, from, to)
+                .await
+            {
+                Ok(stored) => stored,
+                Err(e) => {
+                    if matches!(
+                        e,
+                        arcodash_core::org_storage::StorageError::Unreachable { .. }
+                    ) {
+                        state
+                            .storage
+                            .report_failure(&state.db, user.org_id, &e)
+                            .await;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        None => std::collections::HashMap::new(),
+    };
     Ok(Json(
         rows.into_iter()
-            .map(|o| ObservationResponse {
-                observed_at: o.observed_at.with_timezone(&Utc),
-                value: o.value,
-                state: o.state,
-                explanation: o.explanation,
-                run_id: o.run_id,
+            .map(|o| {
+                let values = stored.get(&o.id);
+                ObservationResponse {
+                    observed_at: o.observed_at.with_timezone(&Utc),
+                    value: arcodash_core::observation_store::merged_value(o.value, values),
+                    state: o.state,
+                    explanation: arcodash_core::observation_store::merged_explanation(
+                        o.explanation,
+                        values,
+                    ),
+                    run_id: o.run_id,
+                }
             })
             .collect::<Vec<_>>(),
     ))

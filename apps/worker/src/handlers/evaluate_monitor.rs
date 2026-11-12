@@ -387,6 +387,7 @@ async fn oldest_observation(
         [monitor_id.into()],
     ))
     .await
+    .inspect_err(|e| tracing::warn!(monitor_id, error = %e, "oldest_observation: query failed"))
     .ok()
     .flatten()
     .and_then(|r| {
@@ -441,9 +442,14 @@ async fn backfill_incident_explanation(
     observation_id: Option<i64>,
 ) {
     let Some(id) = observation_id else { return };
-    if explain_alert::latest_explanation(&ctx.db, ctx.storage.as_ref(), monitor.org_id, monitor.id)
-        .await
-        .is_some()
+    if arcodash_core::observation_store::latest_incident_explanation(
+        &ctx.db,
+        ctx.storage.as_ref(),
+        monitor.org_id,
+        monitor.id,
+    )
+    .await
+    .is_some()
     {
         return;
     }
@@ -834,6 +840,7 @@ async fn evaluate_state(
         };
         (if triggered { "triggered" } else { "ok" }, observed)
     };
+    // `ok`/`triggered` always carry the numeric cell; `unevaluable` never does.
     Ok(Evaluation::new(
         state,
         None,
@@ -2672,11 +2679,33 @@ mod freshness_protocol_tests {
         exec_sql(
             &db,
             "INSERT INTO monitor_observations (org_id, monitor_id, observed_at, value, state) \
-             SELECT $1, $2, now() - (g || ' seconds')::interval, g, 'ok' \
+             SELECT $1, $2, now() - (g || ' seconds')::interval, NULL, 'ok' \
              FROM generate_series(1, 505) g",
             [org_id.into(), mon.id.into()],
         )
         .await;
+        let storage = ctx.storage.resolve(&ctx.db, org_id).await.unwrap();
+        let seeded = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id, observed_at FROM monitor_observations WHERE monitor_id = $1",
+                [mon.id.into()],
+            ))
+            .await
+            .unwrap();
+        for r in seeded {
+            let values = observation_store::ObservationValues {
+                id: r.try_get("", "id").unwrap(),
+                observed_at: r
+                    .try_get::<chrono::DateTime<Utc>>("", "observed_at")
+                    .unwrap(),
+                value: Some(1.0),
+                explanation: None,
+            };
+            observation_store::append_observation(&db, &storage, mon.id, &values, None)
+                .await
+                .unwrap();
+        }
         let eval = Evaluation::new("triggered", None, None, Some(0.5), None);
         record_observation(&ctx, org_id, mon.id, None, &eval)
             .await
@@ -2684,21 +2713,16 @@ mod freshness_protocol_tests {
         let rows = observation_rows(&db, mon.id).await;
         assert_eq!(rows.len(), 500);
         assert!(rows.iter().any(|r| r.0.is_none() && r.1 == "triggered"));
-        assert!(!rows.iter().any(|r| r.0 == Some(505.0)));
-        assert!(rows.iter().any(|r| r.0 == Some(1.0)));
-        let storage = ctx.storage.resolve(&ctx.db, org_id).await.unwrap();
-        let rel = observation_store::observation_rel_key(mon.id, Utc::now());
-        let bytes = storage
-            .get(arcodash_core::org_storage::StorageArea::Monitors, &rel)
-            .await
-            .unwrap();
-        assert!(
-            bytes
-                .split(|b| *b == b'\n')
-                .filter(|l| !l.is_empty())
-                .count()
-                <= 500
-        );
+        let now = Utc::now();
+        let stored = observation_store::load_observations(
+            &storage,
+            mon.id,
+            now - chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 500);
     }
 }
 

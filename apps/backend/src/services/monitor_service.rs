@@ -283,14 +283,13 @@ pub struct Learning {
 struct ObservationSummaryRow {
     monitor_id: i64,
     have: i64,
-    newest_explanation: Option<String>,
 }
 
 /// Per-monitor observation summary, one batched query for the whole list.
 #[derive(Debug, Default, Clone)]
 pub struct ObservationSummary {
+    /// Evaluable checks recorded (capped at the baseline need); metadata only.
     pub have: u32,
-    pub newest_explanation: Option<String>,
 }
 
 #[allow(
@@ -310,8 +309,7 @@ pub async fn observation_summaries(
         DatabaseBackend::Postgres,
         r"
         SELECT monitor_id,
-               COUNT(*) FILTER (WHERE value IS NOT NULL) AS have,
-               (ARRAY_AGG(explanation ORDER BY observed_at DESC, id DESC) FILTER (WHERE explanation IS NOT NULL))[1] AS newest_explanation
+               COUNT(*) FILTER (WHERE value IS NOT NULL OR state IN ('ok', 'triggered')) AS have
         FROM monitor_observations
         WHERE monitor_id = ANY($1)
         GROUP BY monitor_id
@@ -327,7 +325,6 @@ pub async fn observation_summaries(
                 r.monitor_id,
                 ObservationSummary {
                     have: r.have.clamp(0, BASELINE_NEED as i64) as u32,
-                    newest_explanation: r.newest_explanation,
                 },
             )
         })
@@ -367,6 +364,7 @@ struct TileRow {
     result_id: Option<i64>,
     run_status: Option<String>,
     run_error: Option<String>,
+    obs_id: Option<i64>,
     obs_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
     obs_value: Option<f64>,
     use_obs: Option<bool>,
@@ -396,6 +394,7 @@ pub async fn tile_data(
             qr.id AS result_id,
             lr.status AS run_status,
             lr.error AS run_error,
+            lo.id AS obs_id,
             lo.observed_at AS obs_at,
             lo.value AS obs_value,
             f.use_obs AS use_obs
@@ -410,7 +409,7 @@ pub async fn tile_data(
             LIMIT 1
         ) lr ON TRUE
         LEFT JOIN LATERAL (
-            SELECT o.observed_at, o.value, o.query_result_id
+            SELECT o.id, o.observed_at, o.value, o.query_result_id
             FROM monitor_observations o
             WHERE o.monitor_id = m.id
             ORDER BY o.observed_at DESC, o.id DESC
@@ -448,6 +447,7 @@ pub async fn tile_data(
         .collect();
     let by_id: HashMap<i64, TileRow> = rows.into_iter().map(|r| (r.monitor_id, r)).collect();
     let summaries = observation_summaries(db, &ids).await?;
+    let mut storages: HashMap<i64, Option<arcodash_core::org_storage::OrgStorage>> = HashMap::new();
 
     for m in monitors {
         let column = m.options["column"].as_str().map(String::from);
@@ -466,11 +466,44 @@ pub async fn tile_data(
             .and_then(|id| first_rows.get(&id))
         {
             Some(row0) => column.as_deref().and_then(|col| row0.get(col).cloned()),
-            None => fresh_obs.and_then(|_| {
-                row.and_then(|r| r.obs_value)
+            None => {
+                let stored_value = match (fresh_obs, row.and_then(|r| r.obs_id)) {
+                    (Some(at), Some(id)) if row.is_some_and(|r| r.obs_value.is_none()) => {
+                        let storage = match storages.entry(m.org_id) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(e) => e.insert(
+                                results
+                                    .resolver
+                                    .resolve(results.pool, m.org_id)
+                                    .await
+                                    .map_err(|e| {
+                                        tracing::warn!(monitor_id = m.id, error = %e, "tile: storage unavailable");
+                                    })
+                                    .ok(),
+                            ),
+                        };
+                        match storage {
+                            Some(storage) => arcodash_core::observation_store::load_for_rows(
+                                storage,
+                                m.id,
+                                &[(id, at.with_timezone(&Utc))],
+                            )
+                            .await
+                            .remove(&id),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                fresh_obs.and_then(|_| {
+                    arcodash_core::observation_store::merged_value(
+                        row.and_then(|r| r.obs_value),
+                        stored_value.as_ref(),
+                    )
                     .and_then(serde_json::Number::from_f64)
                     .map(Value::Number)
-            }),
+                })
+            }
         };
         let last_checked_at = fresh_obs
             .or(row.and_then(|r| r.finished_at))
@@ -479,11 +512,18 @@ pub async fn tile_data(
             arcodash_core::models::parse_monitor_options(m.id, &m.options).is_silenced(Utc::now());
         let summary = summaries.get(&m.id);
         let (kind, learning) = kind_and_learning(&m.options, m.id, summary);
-        let incident_summary = (m.state == "triggered")
-            .then(|| summary.and_then(|s| s.newest_explanation.as_deref()))
-            .flatten()
-            .and_then(|e| e.lines().next())
-            .map(String::from);
+        let incident_summary = if m.state == "triggered" {
+            arcodash_core::observation_store::latest_incident_explanation(
+                results.pool,
+                results.resolver,
+                m.org_id,
+                m.id,
+            )
+            .await
+            .and_then(|e| e.lines().next().map(String::from))
+        } else {
+            None
+        };
         let check_failed = fresh_obs.is_none()
             && row
                 .and_then(|r| r.run_status.as_deref())
@@ -1767,7 +1807,7 @@ mod tests {
         options: Value,
         state: &str,
     ) -> monitor::Model {
-        monitor::ActiveModel {
+        let monitor = monitor::ActiveModel {
             org_id: Set(org_id),
             user_id: Set(user_id),
             query_id: Set(query_id),
@@ -1780,7 +1820,18 @@ mod tests {
         }
         .insert(db)
         .await
-        .unwrap()
+        .unwrap();
+        // Ids restart per test while the in-memory store is shared; drop stale observation files.
+        use arcodash_core::org_storage::OrgStorageResolver as _;
+        let storage = test_blobs().0.resolve(db, org_id).await.unwrap();
+        storage
+            .delete_prefix(
+                arcodash_core::org_storage::StorageArea::Monitors,
+                &format!("{}/", monitor.id),
+            )
+            .await
+            .unwrap();
+        monitor
     }
 
     async fn insert_query_result(
@@ -2108,6 +2159,217 @@ mod tests {
         )
         .await;
         (org.id, query.data_source_id, query.id, monitor)
+    }
+
+    /// Observation row with NULL value/explanation plus its stored line; returns the row id.
+    async fn insert_stored_observation(
+        db: &sea_orm::DatabaseConnection,
+        org_id: i64,
+        monitor_id: i64,
+        at: DateTime<Utc>,
+        state: &str,
+        stored: (Option<f64>, Option<&str>),
+    ) -> i64 {
+        let row = arcodash_core::entities::monitor_observation::ActiveModel {
+            id: NotSet,
+            org_id: Set(org_id),
+            monitor_id: Set(monitor_id),
+            observed_at: Set(at.into()),
+            value: Set(None),
+            state: Set(state.to_string()),
+            run_id: Set(None),
+            query_result_id: Set(None),
+            explanation: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        use arcodash_core::org_storage::OrgStorageResolver as _;
+        let storage = test_blobs().0.resolve(db, org_id).await.unwrap();
+        let values = arcodash_core::observation_store::ObservationValues {
+            id: row.id,
+            observed_at: at,
+            value: stored.0,
+            explanation: stored.1.map(String::from),
+        };
+        arcodash_core::observation_store::append_observation(
+            db, &storage, monitor_id, &values, None,
+        )
+        .await
+        .unwrap();
+        row.id
+    }
+
+    /// Ids restart per test but the in-memory store is shared; drop files left by earlier tests.
+    async fn clear_stored_observations(
+        db: &sea_orm::DatabaseConnection,
+        org_id: i64,
+        monitor_id: i64,
+    ) {
+        use arcodash_core::org_storage::OrgStorageResolver as _;
+        let storage = test_blobs().0.resolve(db, org_id).await.unwrap();
+        storage
+            .delete_prefix(
+                arcodash_core::org_storage::StorageArea::Monitors,
+                &format!("{monitor_id}/"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_summaries_count_evaluable_checks() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        clear_stored_observations(&db, org_id, monitor.id).await;
+        let t = Utc::now();
+        for i in 0..3 {
+            insert_stored_observation(
+                &db,
+                org_id,
+                monitor.id,
+                t - chrono::Duration::minutes(10 - i),
+                "ok",
+                (Some(1.0), None),
+            )
+            .await;
+        }
+        insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(5),
+            "triggered",
+            (Some(9.0), Some("older incident")),
+        )
+        .await;
+        insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t,
+            "triggered",
+            (Some(9.5), Some("newest incident\nmore")),
+        )
+        .await;
+        insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(1),
+            "unevaluable",
+            (None, None),
+        )
+        .await;
+
+        let sums = observation_summaries(&db, &[monitor.id]).await.unwrap();
+        assert_eq!(sums.get(&monitor.id).unwrap().have, 5);
+    }
+
+    fn triggered(monitor: monitor::Model) -> monitor::Model {
+        monitor::Model {
+            state: "triggered".into(),
+            ..monitor
+        }
+    }
+
+    #[tokio::test]
+    async fn tile_incident_summary_uses_incident_start_explanation() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        clear_stored_observations(&db, org_id, monitor.id).await;
+        let t = Utc::now();
+        insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(5),
+            "triggered",
+            (Some(9.0), Some("Spike to 9\n(z=4.1)")),
+        )
+        .await;
+        insert_stored_observation(&db, org_id, monitor.id, t, "triggered", (Some(9.5), None)).await;
+
+        let monitor = triggered(monitor);
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        assert_eq!(
+            tiles.get(&monitor.id).unwrap().incident_summary.as_deref(),
+            Some("Spike to 9")
+        );
+    }
+
+    #[tokio::test]
+    async fn tile_incident_summary_prefers_current_incident_over_legacy() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        clear_stored_observations(&db, org_id, monitor.id).await;
+        let t = Utc::now();
+        let legacy = insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(10),
+            "triggered",
+            (None, None),
+        )
+        .await;
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE monitor_observations SET explanation = 'previous incident' WHERE id = $1",
+            [legacy.into()],
+        ))
+        .await
+        .unwrap();
+        insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t - chrono::Duration::minutes(5),
+            "ok",
+            (Some(1.0), None),
+        )
+        .await;
+        insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            t,
+            "triggered",
+            (Some(9.0), Some("current incident")),
+        )
+        .await;
+
+        let monitor = triggered(monitor);
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        assert_eq!(
+            tiles.get(&monitor.id).unwrap().incident_summary.as_deref(),
+            Some("current incident")
+        );
+    }
+
+    #[tokio::test]
+    async fn tile_data_reads_observation_value_from_storage() {
+        let Some(db) = test_db().await else { return };
+        let (org_id, _, _, monitor) = value_monitor(&db).await;
+        clear_stored_observations(&db, org_id, monitor.id).await;
+        insert_stored_observation(
+            &db,
+            org_id,
+            monitor.id,
+            Utc::now(),
+            "ok",
+            (Some(42.0), None),
+        )
+        .await;
+
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        assert_eq!(tiles.get(&monitor.id).unwrap().observed, Some(json!(42.0)));
     }
 
     /// Production order: the run finishes at `t`, its observation lands 1ms later.
