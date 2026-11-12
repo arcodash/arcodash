@@ -176,6 +176,8 @@ Uploaded CSV and SQLite files live in an object store that speaks the Google Clo
 | `UPLOAD_CACHE_DIR` | `<system temp dir>/arcodash-uploads` | no | backend, worker | Local directory caching downloaded uploads for SQLite and CSV queries. |
 | `UPLOAD_CACHE_MAX_AGE_SECS` | `604800` (7 days) | no | backend, worker | Age after which a cached upload is pruned on the next cache miss. There is no size cap; age is the only eviction. |
 | `UPLOAD_SWEEP_SECS` | `3600` | no | worker | Interval of the orphaned-upload sweep. Floored at 60. |
+| `RESULT_RETENTION_DAYS` | `7` | no | worker | Days a stored query result may go unread and unrefreshed before the retention sweep deletes it. Every read or refresh resets the clock. Floored at 1. |
+| `RESULT_SWEEP_SECS` | `3600` | no | worker | Interval of the expired-result sweep. Floored at 60. |
 | `DATA_SOURCE_UPLOAD_RATE_LIMIT_PER_MIN` | `10` | no | backend | Per-user cap on `POST /data_sources/uploads`. See [Rate limits](#rate-limits). |
 
 ## AI (bring your own key)

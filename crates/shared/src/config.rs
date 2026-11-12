@@ -119,6 +119,9 @@ pub struct Config {
     /// Row cap auto-appended as a `LIMIT` to unbounded `SELECT`/`WITH` queries for connectors that
     /// support it (`QueryRunner::supports_auto_limit`).
     pub max_query_rows: u32,
+    /// Days a stored query result may go unread and unrefreshed before the retention sweep
+    /// deletes it. Floored at 1.
+    pub result_retention_days: i64,
     /// Trusted reverse-proxy hops in front of this process. `0` (default) means the TCP peer is the
     /// real client and `X-Forwarded-For` is ignored; a positive value tells the per-IP rate limiter
     /// how many trailing entries proxies appended. Validated eagerly because a silently-ignored
@@ -180,6 +183,7 @@ impl std::fmt::Debug for Config {
             .field("anthropic_model", &self.anthropic_model)
             .field("query_timeout_secs", &self.query_timeout_secs)
             .field("max_query_rows", &self.max_query_rows)
+            .field("result_retention_days", &self.result_retention_days)
             .field("trusted_proxy_hops", &self.trusted_proxy_hops)
             .finish()
     }
@@ -305,6 +309,7 @@ impl Config {
             anthropic_model: env_or("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
             query_timeout_secs: env_parsed("QUERY_TIMEOUT_SECS", 300),
             max_query_rows: env_parsed("MAX_QUERY_ROWS", 10_000),
+            result_retention_days: result_retention_days(),
             trusted_proxy_hops,
         })
     }
@@ -368,6 +373,12 @@ static REPORTED_INVALID: std::sync::LazyLock<std::sync::Mutex<std::collections::
 /// Whether this is the first time `name` has been reported invalid in this process.
 fn first_time_reporting_invalid(name: &str) -> bool {
     REPORTED_INVALID.lock().unwrap().insert(name.to_string())
+}
+
+/// `RESULT_RETENTION_DAYS` (default 7), floored at 1 so a zero or negative value cannot expire
+/// results immediately.
+pub fn result_retention_days() -> i64 {
+    env_parsed("RESULT_RETENTION_DAYS", 7_i64).max(1)
 }
 
 /// Parse an operator knob read outside `Config::from_env` (a hot-path lookup). A malformed value
@@ -493,6 +504,19 @@ mod tests {
         assert!(parse_worker_queues(Some("".into())).is_err());
         assert!(parse_worker_queues(Some(" , ".into())).is_err());
         assert!(parse_worker_queues(Some("nope".into())).is_err());
+    }
+
+    #[test]
+    fn result_retention_days_defaults_overrides_and_floors() {
+        unset("RESULT_RETENTION_DAYS");
+        assert_eq!(result_retention_days(), 7);
+        set("RESULT_RETENTION_DAYS", "30");
+        assert_eq!(result_retention_days(), 30);
+        set("RESULT_RETENTION_DAYS", "0");
+        assert_eq!(result_retention_days(), 1);
+        set("RESULT_RETENTION_DAYS", "-5");
+        assert_eq!(result_retention_days(), 1);
+        unset("RESULT_RETENTION_DAYS");
     }
 
     #[test]
@@ -712,6 +736,7 @@ mod tests {
             anthropic_model: "claude-sonnet-5-5".to_string(),
             query_timeout_secs: 300,
             max_query_rows: 10_000,
+            result_retention_days: 7,
             trusted_proxy_hops: 0,
         }
     }

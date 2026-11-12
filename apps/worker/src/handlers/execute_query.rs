@@ -54,6 +54,8 @@ pub struct ExecuteQueryContext {
     pub query_timeout_secs: u64,
     /// `MAX_QUERY_ROWS` — auto-`LIMIT` cap applied to unbounded `SELECT`/`WITH` queries.
     pub max_query_rows: u32,
+    /// `RESULT_RETENTION_DAYS` — unused results older than this are swept.
+    pub result_retention_days: i64,
     /// Re-enqueues notification retries via the conveyor when active; `OnceLock` because the
     /// conveyor's handler holds this same ctx, so it can only be set afterwards.
     pub conveyor: std::sync::OnceLock<Arc<arcodash_conveyor::Conveyor>>,

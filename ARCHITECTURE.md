@@ -22,7 +22,7 @@ arcodash runs as three long-running processes and a one-shot job:
 - **migrate**: applies database migrations and exits.
 
 State lives in **Postgres** (everything durable), **Valkey** (job queues, short-lived job status,
-locks, pub/sub; Redis protocol) and an **object store** (uploaded CSV and SQLite files only).
+locks, pub/sub; Redis protocol) and an **object store** (uploaded CSV and SQLite files and query results).
 
 ```mermaid
 flowchart LR
@@ -33,7 +33,7 @@ flowchart LR
     MIG["migrate<br/>one-shot job"]
     PG[("Postgres")]
     VK[("Valkey<br/>queues, locks, job status")]
-    OBJ[("Object store<br/>uploads")]
+    OBJ[("Object store<br/>uploads, results")]
     SMTP["SMTP server"]
     DS["Your data sources"]
     AI["AI provider<br/>your key"]
@@ -97,8 +97,11 @@ holds a database connection, so raise `DB_MAX_CONNECTIONS` with the concurrency.
 `HOSTNAME` (Docker sets a unique one per container), else a random suffix. Never set the same value
 on two replicas.
 
-**Object store.** Only uploaded CSV and SQLite files live there (`crates/shared/src/storage.rs`);
-query results are stored in Postgres. The client speaks the Google Cloud Storage JSON API. The
+**Object store.** Uploaded CSV and SQLite files and query results live there
+(`crates/shared/src/storage.rs`). Results are gzip JSON objects under `orgs/<org_id>/results/`;
+their metadata stays in Postgres. A result unused for `RESULT_RETENTION_DAYS` (default 7) is
+deleted by the worker's retention sweep; every read or refresh resets the clock, and a missing
+object is a cache miss. The client speaks the Google Cloud Storage JSON API. The
 compose files run a bundled store and set `STORAGE_EMULATOR_HOST`; without it the client calls
 Google Cloud Storage with credentials from the GCP metadata server.
 
@@ -225,8 +228,11 @@ sequenceDiagram
 ```
 
 - **Cache.** Results are cached per query text and parameter values (`max_age` defaults to 24 h;
-  `max_age=0` forces a run). Results are stored as JSONB in Postgres, one row per distinct query
-  and parameter combination.
+  `max_age=0` forces a run). Results are stored as gzip JSON objects in the object store, one per
+  distinct query and parameter combination, and deleted after `RESULT_RETENTION_DAYS` (default 7)
+  without use; every read or refresh resets the clock and a missing object is a cache miss. Rows
+  written by older versions with inline data are never swept, and buckets the operator does not
+  manage are skipped.
 - **Parameters** (`{{ name }}`) are substituted into the SQL text, not bound. Number, date and
   dropdown values are validated; free-text values are inserted as written, so using them requires
   manage access to the data source.

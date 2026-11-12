@@ -656,6 +656,7 @@ fn test_config(db_url: String, valkey_url: String) -> arcodash_core::Config {
         anthropic_model: "claude-sonnet-5-5".to_string(),
         query_timeout_secs: 300,
         max_query_rows: 10_000,
+        result_retention_days: 7,
     }
 }
 

@@ -614,6 +614,7 @@ pub mod blob {
     pub struct FailingBlobStore {
         detail: String,
         puts: AtomicUsize,
+        deletes: AtomicUsize,
     }
 
     impl FailingBlobStore {
@@ -622,11 +623,16 @@ pub mod blob {
             Self {
                 detail: detail.to_string(),
                 puts: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
             }
         }
 
         pub fn puts(&self) -> usize {
             self.puts.load(Ordering::SeqCst)
+        }
+
+        pub fn deletes(&self) -> usize {
+            self.deletes.load(Ordering::SeqCst)
         }
 
         fn err(&self) -> StorageError {
@@ -654,6 +660,7 @@ pub mod blob {
         }
 
         async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
             Err(self.err())
         }
 

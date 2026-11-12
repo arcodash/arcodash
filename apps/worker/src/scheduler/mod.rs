@@ -23,6 +23,7 @@ use crate::handlers::execute_query::ExecuteQueryContext;
 const LEADER_LOCK_KEY_MONITORS: &str = "arcodash:scheduler:leader:monitors";
 const LEADER_LOCK_KEY_DIGEST: &str = "arcodash:scheduler:leader:digest";
 const LEADER_LOCK_KEY_UPLOAD_SWEEP: &str = "arcodash:scheduler:leader:upload_sweep";
+const LEADER_LOCK_KEY_RESULT_SWEEP: &str = "arcodash:scheduler:leader:result_sweep";
 const LEADER_LOCK_KEY_SCHEMA_DAILY: &str = "arcodash:scheduler:leader:schema_daily";
 /// TTL for the once-per-user-per-day digest idempotence guard; two days so the key outlives the day
 /// it names.
@@ -65,6 +66,16 @@ fn upload_sweep_secs() -> u64 {
     let configured: u64 =
         arcodash_core::config::env_parsed("UPLOAD_SWEEP_SECS", UPLOAD_SWEEP_SECS_DEFAULT);
     configured.max(UPLOAD_SWEEP_SECS_MIN)
+}
+
+/// Default interval for the expired-result sweep (1 hour); floored at 60s.
+const RESULT_SWEEP_SECS_DEFAULT: u64 = 3600;
+const RESULT_SWEEP_SECS_MIN: u64 = 60;
+
+fn result_sweep_secs() -> u64 {
+    let configured: u64 =
+        arcodash_core::config::env_parsed("RESULT_SWEEP_SECS", RESULT_SWEEP_SECS_DEFAULT);
+    configured.max(RESULT_SWEEP_SECS_MIN)
 }
 
 /// Acquire or renew this replica's lock for `domain_key`. Contention and a Redis error both count
@@ -145,6 +156,36 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
             ),
         ),
     ));
+    let sweep_cursor: Arc<tokio::sync::Mutex<Option<sweeper::SweepCursor>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    jobs.push((
+        "result sweep",
+        Job::new_repeated_async(
+            Duration::from_secs(result_sweep_secs()),
+            leader_tick(&ctx, &lock_id, LEADER_LOCK_KEY_RESULT_SWEEP, move |ctx| {
+                let cursor = sweep_cursor.clone();
+                async move {
+                    let mut cursor = cursor.lock().await;
+                    let (stats, next) = sweeper::sweep_expired_results_with_limit(
+                        &ctx,
+                        sweeper::sweep_batch_limit(),
+                        sweeper::RESULT_SWEEP_MAX_PAGES,
+                        *cursor,
+                    )
+                    .await;
+                    *cursor = next;
+                    if stats != sweeper::ResultSweepStats::default() {
+                        tracing::info!(
+                            deleted = stats.deleted,
+                            skipped_orgs = stats.skipped_orgs,
+                            failed_orgs = stats.failed_orgs,
+                            "sweeper: expired results"
+                        );
+                    }
+                }
+            }),
+        ),
+    ));
     jobs.push((
         "daily schema",
         Job::new_async(
@@ -196,6 +237,7 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
         LEADER_LOCK_KEY_MONITORS,
         LEADER_LOCK_KEY_DIGEST,
         LEADER_LOCK_KEY_UPLOAD_SWEEP,
+        LEADER_LOCK_KEY_RESULT_SWEEP,
         LEADER_LOCK_KEY_SCHEMA_DAILY,
     ] {
         release_leader_lock(&ctx.redis, key, &lock_id).await;
@@ -210,7 +252,7 @@ fn leader_tick<F, Fut>(
     tick: F,
 ) -> impl FnMut(uuid::Uuid, JobScheduler) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync
 where
-    F: Fn(Arc<ExecuteQueryContext>) -> Fut + Copy + Send + Sync + 'static,
+    F: Fn(Arc<ExecuteQueryContext>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let ctx = ctx.clone();
@@ -218,6 +260,7 @@ where
     move |_, _| {
         let ctx = ctx.clone();
         let lock_id = lock_id.clone();
+        let tick = tick.clone();
         Box::pin(async move {
             if acquire_leader_lock(&ctx.redis, lock_key, &lock_id).await {
                 tick(ctx).await;
@@ -392,6 +435,7 @@ pub(crate) mod test_support {
             base_url: "http://localhost:3000".to_string(),
             query_timeout_secs: 300,
             max_query_rows: 10_000,
+            result_retention_days: 7,
             conveyor: std::sync::OnceLock::new(),
             ai: None,
             entitlements: std::sync::Arc::new(arcodash_core::entitlements::Unrestricted),

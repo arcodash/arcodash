@@ -148,6 +148,7 @@ pub async fn run(ext: WorkerExtensions) -> anyhow::Result<()> {
         base_url: config.base_url.clone(),
         query_timeout_secs: config.query_timeout_secs,
         max_query_rows: config.max_query_rows,
+        result_retention_days: config.result_retention_days,
         conveyor: std::sync::OnceLock::new(),
         ai: Some(Arc::new(ai_sink::AiRuntime {
             config: Arc::new(config.clone()),

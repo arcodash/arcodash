@@ -1358,3 +1358,27 @@ mod query_results_id_scoping_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn referenced_query_ids_matches_quoted_qualified_and_any_case() {
+        let sql = r#"SELECT * FROM "query_12" a JOIN [query_13] b ON 1=1 JOIN `query_14` c ON 1=1
+            JOIN main.query_15 d ON 1=1 WHERE query_16.col = 1 AND QuErY_17.x = 2"#;
+        let ids = referenced_query_ids(sql);
+        assert_eq!(ids, HashSet::from([12, 13, 14, 15, 16, 17]));
+        assert_eq!(
+            referenced_query_ids("SELECT * FROM QuErY_12"),
+            HashSet::from([12])
+        );
+    }
+
+    #[test]
+    fn referenced_query_ids_ignores_longer_identifiers_and_plain_sql() {
+        assert!(referenced_query_ids("SELECT * FROM query_12x").is_empty());
+        assert!(referenced_query_ids("SELECT * FROM xquery_12").is_empty());
+        assert!(referenced_query_ids("SELECT 1").is_empty());
+    }
+}
