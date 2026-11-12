@@ -347,7 +347,16 @@ pub async fn suggest_query_monitors(
     }
 
     let result_id = served.latest_query_data_id.ok_or_else(no_result)?;
-    let result = result_service::get(&db, org.id, &user, result_id).await?;
+    let result =
+        result_service::get_with_data(&db, state.result_reader(), org.id, &user, result_id)
+            .await
+            .map_err(|e| {
+                if e.status == axum::http::StatusCode::NOT_FOUND {
+                    no_result()
+                } else {
+                    e
+                }
+            })?;
     let data = result.data.as_ref().ok_or_else(no_result)?;
     let columns: Vec<ColumnMeta> = data
         .get("columns")

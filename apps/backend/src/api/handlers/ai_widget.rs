@@ -153,6 +153,7 @@ async fn run_first_time(
             scoped.db(),
             w.state.queue.as_ref(),
             w.state.conveyor.as_deref(),
+            w.state.result_reader(),
             &w.state.redis,
             org.id,
             &w.user,

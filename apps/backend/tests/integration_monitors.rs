@@ -3267,7 +3267,7 @@ async fn tile_incident_summary_first_line() {
             .unwrap()
             .unwrap()
     };
-    let tile = tile_data(&app.db, &[load().await])
+    let tile = tile_data(&app.db, app.state.result_reader(), &[load().await])
         .await
         .unwrap()
         .remove(&id)
@@ -3276,7 +3276,7 @@ async fn tile_incident_summary_first_line() {
     assert_eq!(tile.kind, "baseline");
 
     set_monitor_state(&app.db, id, "triggered").await;
-    let tile = tile_data(&app.db, &[load().await])
+    let tile = tile_data(&app.db, app.state.result_reader(), &[load().await])
         .await
         .unwrap()
         .remove(&id)
@@ -3285,7 +3285,7 @@ async fn tile_incident_summary_first_line() {
     assert_eq!(tile.learning.map(|l| l.have), Some(2));
 
     insert_observation(&app.db, org_id, id, None, "triggered", None, 1).await;
-    let tile = tile_data(&app.db, &[load().await])
+    let tile = tile_data(&app.db, app.state.result_reader(), &[load().await])
         .await
         .unwrap()
         .remove(&id)

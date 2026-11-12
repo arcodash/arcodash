@@ -247,6 +247,7 @@ dependencies = [
  "chrono-tz",
  "csv",
  "flate2",
+ "futures",
  "getrandom 0.4.3",
  "jsonwebtoken",
  "lettre",

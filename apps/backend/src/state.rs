@@ -90,6 +90,14 @@ impl FromRef<AppState> for Config {
 }
 
 impl AppState {
+    #[must_use]
+    pub fn result_reader(&self) -> crate::services::result_service::ResultReader<'_> {
+        crate::services::result_service::ResultReader {
+            resolver: self.storage.as_ref(),
+            pool: &self.db,
+        }
+    }
+
     /// `provider` claim this deployment mints and accepts on session cookies.
     #[must_use]
     pub fn session_provider(&self) -> &'static str {

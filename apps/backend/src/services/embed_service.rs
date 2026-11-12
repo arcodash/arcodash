@@ -731,12 +731,15 @@ pub struct PublicViz {
 /// always the current cached snapshot.
 pub async fn serialize_public(
     db: &impl ConnectionTrait,
+    results: crate::services::result_service::ResultReader<'_>,
     resolved: &ResolvedEmbed,
 ) -> Result<PublicEmbedResponse, ApiError> {
     match resolved.object_type {
-        EmbedObjectType::Dashboard => serialize_dashboard(db, resolved.embed.object_id).await,
+        EmbedObjectType::Dashboard => {
+            serialize_dashboard(db, results, resolved.embed.object_id).await
+        }
         EmbedObjectType::Visualization => {
-            serialize_visualization(db, resolved.embed.object_id).await
+            serialize_visualization(db, results, resolved.embed.object_id).await
         }
     }
 }
@@ -753,36 +756,47 @@ fn serving_query_result_id(q: &query::Model) -> Option<i64> {
 
 async fn fetch_query_result_data(
     db: &impl ConnectionTrait,
+    reader: crate::services::result_service::ResultReader<'_>,
     q: Option<&query::Model>,
 ) -> Result<(Option<Value>, Option<DateTime<Utc>>), ApiError> {
     let Some(qr_id) = q.and_then(serving_query_result_id) else {
         return Ok((None, None));
     };
-    let qr = query_result::Entity::find_by_id(qr_id).one(db).await?;
-    Ok(qr.map_or((None, None), |r| {
-        (r.data, Some(r.retrieved_at.with_timezone(&Utc)))
-    }))
+    let Some(qr) = query_result::Entity::find_by_id(qr_id).one(db).await? else {
+        return Ok((None, None));
+    };
+    let retrieved_at = qr.retrieved_at.with_timezone(&Utc);
+    // A missing object serves the empty state; it never triggers a run.
+    let data = reader.load(db, &qr).await?;
+    Ok((data, Some(retrieved_at)))
 }
 
 /// One round trip for every widget's serving result, keyed by `query_result` id.
 async fn fetch_query_results_by_ids(
     db: &impl ConnectionTrait,
+    reader: crate::services::result_service::ResultReader<'_>,
     ids: &HashSet<i64>,
 ) -> Result<HashMap<i64, query_result::Model>, ApiError> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    Ok(query_result::Entity::find()
+    let rows = query_result::Entity::find()
         .filter(query_result::Column::Id.is_in(ids.iter().copied()))
         .all(db)
-        .await?
+        .await?;
+    let mut loaded = reader.load_many(db, &rows).await?;
+    Ok(rows
         .into_iter()
-        .map(|r| (r.id, r))
+        .map(|mut r| {
+            r.data = loaded.remove(&r.id);
+            (r.id, r)
+        })
         .collect())
 }
 
 async fn serialize_dashboard(
     db: &impl ConnectionTrait,
+    reader: crate::services::result_service::ResultReader<'_>,
     dashboard_id: i64,
 ) -> Result<PublicEmbedResponse, ApiError> {
     let d = dashboard::Entity::find_by_id(dashboard_id)
@@ -849,7 +863,7 @@ async fn serialize_dashboard(
                     })
             })
             .collect();
-        monitor_service::tile_data(db, &public_monitors).await?
+        monitor_service::tile_data(db, reader, &public_monitors).await?
     };
 
     let query_ids: Vec<i64> = items
@@ -865,7 +879,7 @@ async fn serialize_dashboard(
         .filter_map(|i| i.viz_and_query.as_ref().and_then(|(_, q)| q.as_ref()))
         .filter_map(serving_query_result_id)
         .collect();
-    let results = fetch_query_results_by_ids(db, &qr_ids).await?;
+    let results = fetch_query_results_by_ids(db, reader, &qr_ids).await?;
 
     let mut widgets = Vec::with_capacity(items.len());
     let mut as_of: Option<DateTime<Utc>> = None;
@@ -930,6 +944,7 @@ async fn serialize_dashboard(
 
 async fn serialize_visualization(
     db: &impl ConnectionTrait,
+    reader: crate::services::result_service::ResultReader<'_>,
     viz_id: i64,
 ) -> Result<PublicEmbedResponse, ApiError> {
     let viz = visualization::Entity::find_by_id(viz_id)
@@ -937,7 +952,7 @@ async fn serialize_visualization(
         .await?
         .ok_or_else(not_found)?;
     let q = query::Entity::find_by_id(viz.query_id).one(db).await?;
-    let (data, as_of) = fetch_query_result_data(db, q.as_ref()).await?;
+    let (data, as_of) = fetch_query_result_data(db, reader, q.as_ref()).await?;
 
     Ok(PublicEmbedResponse {
         object_type: EmbedObjectType::Visualization.as_str().to_string(),

@@ -874,3 +874,262 @@ async fn adhoc_execute_after_publish_repoints_published_pointer() {
         "the ad-hoc/promoted run must repoint published_latest_query_data_id; got: {post}"
     );
 }
+
+/// Writes `data` as an object for the default org and inserts a row pointing at it with
+/// `data = NULL`.
+async fn seed_externalized_result(
+    app: &common::TestApp,
+    org_id: i64,
+    data_source_id: i64,
+    query_hash: &str,
+    query: &str,
+    data: Option<&serde_json::Value>,
+) -> i64 {
+    let location = match data {
+        Some(data) => {
+            let storage = app.state.storage.resolve(&app.db, org_id).await.unwrap();
+            arcodash_core::result_store::save_result(&storage, data_source_id, query_hash, data)
+                .await
+                .unwrap()
+                .location
+        }
+        None => {
+            // Object keys repeat across tests (ids restart); make sure none lingers.
+            let location = arcodash_core::result_store::result_rel_key(data_source_id, query_hash);
+            let storage = app.state.storage.resolve(&app.db, org_id).await.unwrap();
+            storage
+                .delete(arcodash_core::org_storage::StorageArea::Results, &location)
+                .await
+                .unwrap();
+            location
+        }
+    };
+    let now = chrono::Utc::now().into();
+    query_result::ActiveModel {
+        id: NotSet,
+        org_id: Set(org_id),
+        data_source_id: Set(data_source_id),
+        query_hash: Set(query_hash.to_string()),
+        query: Set(query.to_string()),
+        data: Set(None),
+        data_location: Set(Some(location)),
+        data_size_bytes: Set(Some(1)),
+        runtime: Set(Some(0.01)),
+        retrieved_at: Set(now),
+        last_used_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&app.db)
+    .await
+    .expect("seed externalized result failed")
+    .id
+}
+
+#[tokio::test]
+async fn cached_execute_with_missing_object_reruns() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let org_id = default_org_id(&app.db).await;
+
+    let ds_id = create_ds(&client, &app.address, "missing-obj-ds").await;
+    let sql = "SELECT 1";
+    let (query_id, hash) = create_query(&client, &app.address, ds_id, "Missing Obj", sql).await;
+    seed_externalized_result(&app, org_id, ds_id, &hash, sql, None).await;
+
+    let body = ok_json(
+        client
+            .post(format!("{}/api/queries/{query_id}/results", app.address))
+            .json(&serde_json::json!({ "parameters": {}, "max_age": 86400 }))
+            .send()
+            .await
+            .unwrap(),
+        "execute (expect miss)",
+    )
+    .await;
+    assert!(
+        body.get("job").is_some(),
+        "missing object must enqueue: {body}"
+    );
+    assert!(body.get("query_result").is_none(), "no cache hit: {body}");
+}
+
+#[tokio::test]
+async fn cached_execute_serves_externalized_object() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let org_id = default_org_id(&app.db).await;
+
+    let ds_id = create_ds(&client, &app.address, "ext-hit-ds").await;
+    let sql = "SELECT 1";
+    let (query_id, hash) = create_query(&client, &app.address, ds_id, "Ext Hit", sql).await;
+    let data = sample_data();
+    let result_id = seed_externalized_result(&app, org_id, ds_id, &hash, sql, Some(&data)).await;
+
+    let body = ok_json(
+        client
+            .post(format!("{}/api/queries/{query_id}/results", app.address))
+            .json(&serde_json::json!({ "parameters": {}, "max_age": 86400 }))
+            .send()
+            .await
+            .unwrap(),
+        "execute (expect hit)",
+    )
+    .await;
+    assert_eq!(
+        body["query_result"]["id"].as_i64(),
+        Some(result_id),
+        "{body}"
+    );
+    assert_eq!(body["query_result"]["data"], data);
+}
+
+#[tokio::test]
+async fn query_result_get_serves_externalized_data() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let org_id = default_org_id(&app.db).await;
+
+    let ds_id = create_ds(&client, &app.address, "ext-get-ds").await;
+    let data = sample_data();
+    let id = seed_externalized_result(&app, org_id, ds_id, "ext-get-hash", "SELECT 1", Some(&data))
+        .await;
+    let gone = seed_externalized_result(&app, org_id, ds_id, "gone-hash", "SELECT 2", None).await;
+
+    let body = ok_json(
+        client
+            .get(format!("{}/api/query_results/{id}", app.address))
+            .send()
+            .await
+            .unwrap(),
+        "get externalized",
+    )
+    .await;
+    assert_eq!(body["query_result"]["data"], data);
+
+    let resp = client
+        .get(format!("{}/api/query_results/{gone}", app.address))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn results_csv_export_reads_from_storage() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let org_id = default_org_id(&app.db).await;
+
+    let ds_id = create_ds(&client, &app.address, "ext-csv-ds").await;
+    let data = serde_json::json!({
+        "columns": [{"name": "city", "friendly_type": "string"}],
+        "rows": [{"city": "Lisbon"}, {"city": "Oslo"}]
+    });
+    let id = seed_externalized_result(&app, org_id, ds_id, "ext-csv-hash", "SELECT 1", Some(&data))
+        .await;
+
+    let resp = client
+        .get(format!("{}/api/query_results/{id}.csv", app.address))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("Lisbon") && text.contains("Oslo"),
+        "csv: {text}"
+    );
+}
+
+#[tokio::test]
+async fn run_result_csv_reads_externalized_object_and_404s_when_gone() {
+    use arcodash_core::entities::run;
+
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let org_id = default_org_id(&app.db).await;
+
+    let ds_id = create_ds(&client, &app.address, "ext-run-csv-ds").await;
+    let (query_id, _) = create_query(&client, &app.address, ds_id, "Run Csv", "SELECT 1").await;
+    let data = serde_json::json!({
+        "columns": [{"name": "city", "friendly_type": "string"}],
+        "rows": [{"city": "Lisbon"}, {"city": "Oslo"}]
+    });
+    let result_id = seed_externalized_result(
+        &app,
+        org_id,
+        ds_id,
+        "ext-run-csv-hash",
+        "SELECT 1",
+        Some(&data),
+    )
+    .await;
+
+    let now = chrono::Utc::now();
+    let run_id = run::ActiveModel {
+        id: NotSet,
+        org_id: Set(org_id),
+        entity_type: Set("query".to_string()),
+        entity_id: Set(query_id),
+        schedule_id: Set(None),
+        data_source_id: Set(Some(ds_id)),
+        scheduled_for: Set(None),
+        triggered_by: Set("manual".to_string()),
+        status: Set("success".to_string()),
+        waiting_on_run_id: Set(None),
+        job_id: Set(None),
+        worker_id: Set(None),
+        lease_expires_at: Set(None),
+        started_at: Set(Some(now.into())),
+        finished_at: Set(Some(now.into())),
+        duration_ms: Set(Some(10)),
+        row_count: Set(Some(2)),
+        error: Set(None),
+        data_age_secs: Set(None),
+        query_result_id: Set(Some(result_id)),
+        condition_met: Set(None),
+        created_at: Set(now.into()),
+        enqueued_at: Set(None),
+    }
+    .insert(&app.db)
+    .await
+    .unwrap()
+    .id;
+
+    let url = format!("{}/api/runs/{run_id}/result.csv", app.address);
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.starts_with("city"), "header: {text}");
+    assert!(
+        text.contains("Lisbon") && text.contains("Oslo"),
+        "csv: {text}"
+    );
+
+    let qr = query_result::Entity::find_by_id(result_id)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let storage = app.state.storage.resolve(&app.db, org_id).await.unwrap();
+    storage
+        .delete(
+            arcodash_core::org_storage::StorageArea::Results,
+            qr.data_location.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("result no longer retained"));
+}

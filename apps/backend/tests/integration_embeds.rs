@@ -2792,3 +2792,86 @@ async fn resolve_public_embed_rejects_a_signed_in_caller_from_a_different_org() 
         );
     }
 }
+
+#[tokio::test]
+async fn embed_serves_empty_state_when_object_missing() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let ds_id = create_ds(&client, &app.address).await;
+    let query_id = create_query(&client, &app.address, ds_id).await;
+    let viz_id = create_visualization(&client, &app.address, query_id).await;
+    let (dashboard_id, slug) = create_dashboard(&client, &app.address).await;
+    create_widget(&client, &app.address, dashboard_id, viz_id).await;
+    publish_dashboard(&client, &app.address, &slug).await;
+    let org_id = common::default_org_id(&app.db).await;
+
+    use arcodash_core::entities::query_result;
+    let now = sea_orm::prelude::DateTimeWithTimeZone::from(chrono::Utc::now());
+    let qr = query_result::ActiveModel {
+        id: NotSet,
+        org_id: Set(org_id),
+        data_source_id: Set(ds_id),
+        query_hash: Set("missing-object-hash".to_string()),
+        query: Set("SELECT 1".to_string()),
+        data: Set(None),
+        data_location: Set(Some(format!("{ds_id}/missing-object-hash.json.gz"))),
+        data_size_bytes: Set(Some(10)),
+        runtime: Set(Some(0.01)),
+        retrieved_at: Set(now),
+        last_used_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&app.db)
+    .await
+    .unwrap();
+    app.db
+        .execute_unprepared(&format!(
+            "UPDATE queries SET latest_query_data_id = {0}, published_latest_query_data_id = {0} WHERE id = {1}",
+            qr.id, query_id
+        ))
+        .await
+        .unwrap();
+
+    let embed: serde_json::Value = ok_json(
+        client
+            .post(format!("{}/api/embeds", app.address))
+            .json(&serde_json::json!({
+                "object_type": "dashboard", "object_id": dashboard_id, "anonymous": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        "create embed",
+    )
+    .await;
+    let token = embed["token"].as_str().unwrap();
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api/embed/{token}", app.address))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let widgets = body["widgets"].as_array().unwrap();
+    assert_eq!(widgets.len(), 1, "widget must still be present: {body}");
+    assert!(
+        widgets[0]["visualization"]["data"].is_null(),
+        "widget must carry no data: {body}"
+    );
+
+    let runs: i64 = app
+        .db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM runs",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(runs, 0, "serving an embed must never start a run");
+}

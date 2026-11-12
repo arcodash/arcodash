@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use arcodash_core::baseline::BASELINE_NEED;
 use arcodash_core::entities::{
     access_permission, data_source_group, escalation_step, group, monitor, monitor_subscription,
-    notification_delivery, notification_destination, query, user,
+    notification_delivery, notification_destination, query, query_result, user,
 };
 use arcodash_core::events::record_event;
 use arcodash_core::notify::{enqueue_send_notification, SendNotificationParams};
@@ -364,7 +364,7 @@ pub fn kind_and_learning(
 struct TileRow {
     monitor_id: i64,
     finished_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
-    row0: Option<Value>,
+    result_id: Option<i64>,
     run_status: Option<String>,
     run_error: Option<String>,
     obs_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
@@ -378,6 +378,7 @@ struct TileRow {
 /// run's. No authz; callers gate visibility first.
 pub async fn tile_data(
     db: &impl ConnectionTrait,
+    results: crate::services::result_service::ResultReader<'_>,
     monitors: &[monitor::Model],
 ) -> Result<HashMap<i64, MonitorTile>, ApiError> {
     let mut out = HashMap::with_capacity(monitors.len());
@@ -392,7 +393,7 @@ pub async fn tile_data(
         SELECT
             m.id AS monitor_id,
             lr.finished_at AS finished_at,
-            qr.data->'rows'->0 AS row0,
+            qr.id AS result_id,
             lr.status AS run_status,
             lr.error AS run_error,
             lo.observed_at AS obs_at,
@@ -431,6 +432,20 @@ pub async fn tile_data(
     ))
     .all(db)
     .await?;
+    let result_ids: Vec<i64> = rows.iter().filter_map(|r| r.result_id).collect();
+    let result_rows = if result_ids.is_empty() {
+        Vec::new()
+    } else {
+        query_result::Entity::find()
+            .filter(query_result::Column::Id.is_in(result_ids))
+            .all(db)
+            .await?
+    };
+    let loaded = results.load_many(db, &result_rows).await?;
+    let first_rows: HashMap<i64, Value> = loaded
+        .into_iter()
+        .filter_map(|(id, mut d)| Some((id, d.get_mut("rows")?.get_mut(0)?.take())))
+        .collect();
     let by_id: HashMap<i64, TileRow> = rows.into_iter().map(|r| (r.monitor_id, r)).collect();
     let summaries = observation_summaries(db, &ids).await?;
 
@@ -446,7 +461,10 @@ pub async fn tile_data(
             .filter(|r| r.use_obs == Some(true))
             .and_then(|r| r.obs_at);
         // The stored f64 is a fallback for when there is no result row to read the cell from.
-        let observed = match row.and_then(|r| r.row0.as_ref()) {
+        let observed = match row
+            .and_then(|r| r.result_id)
+            .and_then(|id| first_rows.get(&id))
+        {
             Some(row0) => column.as_deref().and_then(|col| row0.get(col).cloned()),
             None => fresh_obs.and_then(|_| {
                 row.and_then(|r| r.obs_value)
@@ -1271,6 +1289,31 @@ mod tests {
     use super::*;
     use sea_orm::{DbBackend, PaginatorTrait, QueryTrait};
 
+    fn test_blobs() -> &'static (
+        arcodash_core::test_support::blob::StaticResolver,
+        std::sync::Arc<arcodash_core::test_support::blob::MemoryBlobStore>,
+    ) {
+        use arcodash_core::org_storage::StorageMode;
+        use arcodash_core::test_support::blob::{MemoryBlobStore, StaticResolver};
+        static BLOBS: std::sync::OnceLock<(StaticResolver, std::sync::Arc<MemoryBlobStore>)> =
+            std::sync::OnceLock::new();
+        BLOBS.get_or_init(|| {
+            let store = std::sync::Arc::new(MemoryBlobStore::default());
+            let resolver =
+                StaticResolver::with_store(StorageMode::ArcoDash, store.clone(), "orgs/1/");
+            (resolver, store)
+        })
+    }
+
+    fn test_reader(
+        db: &sea_orm::DatabaseConnection,
+    ) -> crate::services::result_service::ResultReader<'_> {
+        crate::services::result_service::ResultReader {
+            resolver: &test_blobs().0,
+            pool: db,
+        }
+    }
+
     /// Exact SQL shape for an options patch: a single `UPDATE ... options || $1`, never a `SELECT`
     /// first.
     #[test]
@@ -1810,6 +1853,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tile_data_reads_row0_from_externalized_result() {
+        let Some(db) = test_db().await else { return };
+        let (org, admin, query) = seed(&db).await;
+        let monitor = insert_monitor(
+            &db,
+            org.id,
+            query.id,
+            admin.id,
+            json!({ "column": "value", "op": ">", "value": 5.0 }),
+            "triggered",
+        )
+        .await;
+        let qr = insert_query_result(&db, org.id, query.data_source_id, None).await;
+        let location = format!("{}/{}.json.gz", query.data_source_id, qr.query_hash);
+        arcodash_core::org_storage::BlobStore::put(
+            &*test_blobs().1,
+            &format!("orgs/1/results/{location}"),
+            arcodash_core::result_store::encode_result(&json!({ "rows": [{ "value": 42 }] }))
+                .unwrap(),
+            "application/gzip",
+        )
+        .await
+        .unwrap();
+        let mut active: query_result::ActiveModel = qr.clone().into();
+        active.data_location = Set(Some(location));
+        active.update(&db).await.unwrap();
+        insert_run(&db, org.id, monitor.id, "success", Utc::now(), Some(qr.id)).await;
+
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
+            .await
+            .unwrap();
+        assert_eq!(tiles[&monitor.id].observed, Some(json!(42)));
+    }
+
+    #[tokio::test]
     async fn tile_data_reports_observed_and_last_checked_from_the_completed_run() {
         let Some(db) = test_db().await else { return };
         let (org, admin, query) = seed(&db).await;
@@ -1832,7 +1910,7 @@ mod tests {
         let finished_at = Utc::now();
         insert_run(&db, org.id, monitor.id, "success", finished_at, Some(qr.id)).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).expect("tile must be present");
@@ -1864,7 +1942,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -1879,7 +1957,7 @@ mod tests {
         insert_run(&db, org.id, monitor.id, "success", Utc::now(), None).await;
         insert_run(&db, org.id, monitor.id, "failed", Utc::now(), None).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -1898,7 +1976,7 @@ mod tests {
         insert_run(&db, org.id, monitor.id, "failed", Utc::now(), None).await;
         insert_run(&db, org.id, monitor.id, "success", Utc::now(), None).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -1954,7 +2032,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -1979,7 +2057,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2059,7 +2137,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2094,7 +2172,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2117,7 +2195,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2149,7 +2227,7 @@ mod tests {
         .await;
         insert_run(&db, org_id, monitor.id, "failed", t, None).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2185,7 +2263,7 @@ mod tests {
         .await;
         insert_run(&db, org_id, monitor.id, "skipped", Utc::now(), None).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2203,7 +2281,7 @@ mod tests {
         let at = Utc::now();
         insert_observation(&db, org_id, monitor.id, at, Some(1.0), None, None, "ok").await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2232,7 +2310,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2247,7 +2325,7 @@ mod tests {
         let (org_id, _, _, monitor) = value_monitor(&db).await;
         insert_observation(&db, org_id, monitor.id, Utc::now(), None, None, None, "ok").await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2280,7 +2358,7 @@ mod tests {
         )
         .await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2319,7 +2397,7 @@ mod tests {
         .await;
         insert_run(&db, org_id, monitor.id, "success", t, Some(new_qr.id)).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2352,7 +2430,7 @@ mod tests {
         .await;
         insert_observation(&db, org_id, monitor.id, t, Some(8.0), None, None, "ok").await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2381,7 +2459,7 @@ mod tests {
         .await;
         insert_run(&db, org_id, monitor.id, "success", t, None).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();
@@ -2412,7 +2490,7 @@ mod tests {
         .await;
         insert_run(&db, org.id, monitor.id, "success", Utc::now(), Some(qr.id)).await;
 
-        let tiles = tile_data(&db, std::slice::from_ref(&monitor))
+        let tiles = tile_data(&db, test_reader(&db), std::slice::from_ref(&monitor))
             .await
             .unwrap();
         let tile = tiles.get(&monitor.id).unwrap();

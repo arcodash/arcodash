@@ -15,6 +15,9 @@ use crate::authz::authorize::{self, Action, QueryVerb};
 use crate::authz::permissions::load_effective_groups;
 use crate::error::ApiError;
 use crate::services::query_service;
+use arcodash_core::org_storage::{OrgStorageResolver, StorageError};
+use arcodash_core::result_store;
+use sea_orm::DatabaseConnection;
 
 pub enum ResultFormat {
     Json,
@@ -154,6 +157,51 @@ fn csv_safe_cell(v: &Value) -> String {
     }
 }
 
+/// Loads result payloads from org storage. `db` (the request's connection) carries the
+/// `last_used_at` write; `pool` is what the storage resolver reads settings through.
+#[derive(Clone, Copy)]
+pub struct ResultReader<'a> {
+    pub resolver: &'a dyn OrgStorageResolver,
+    pub pool: &'a DatabaseConnection,
+}
+
+impl ResultReader<'_> {
+    /// `None` when the result's object is gone.
+    ///
+    /// # Errors
+    ///
+    /// Storage unreachable/switching or an undecodable object.
+    pub async fn hydrate(
+        &self,
+        db: &impl ConnectionTrait,
+        qr: query_result::Model,
+    ) -> Result<Option<query_result::Model>, StorageError> {
+        result_store::hydrate_result(db, self.pool, self.resolver, qr).await
+    }
+
+    /// # Errors
+    ///
+    /// As [`Self::hydrate`].
+    pub async fn load(
+        &self,
+        db: &impl ConnectionTrait,
+        qr: &query_result::Model,
+    ) -> Result<Option<Value>, StorageError> {
+        result_store::load_result(db, self.pool, self.resolver, qr).await
+    }
+
+    /// # Errors
+    ///
+    /// As [`Self::hydrate`].
+    pub async fn load_many(
+        &self,
+        db: &impl ConnectionTrait,
+        qrs: &[query_result::Model],
+    ) -> Result<std::collections::HashMap<i64, Value>, StorageError> {
+        result_store::load_results(db, self.pool, self.resolver, qrs).await
+    }
+}
+
 /// `GET /api/query_results/<id>` — fetch a result row, gated on execute-tier data-source reach AND
 /// reach on at least one query the result could belong to.
 ///
@@ -190,6 +238,25 @@ pub async fn get(
     } else {
         Err(ApiError::not_found("query result not found"))
     }
+}
+
+/// [`get`] with `data` loaded from storage; a result whose object is gone reads as absent (404).
+///
+/// # Errors
+///
+/// As [`get`], plus storage errors mapped to their API status.
+pub async fn get_with_data(
+    db: &impl ConnectionTrait,
+    results: ResultReader<'_>,
+    org_id: i64,
+    user: &user::Model,
+    id: i64,
+) -> Result<query_result::Model, ApiError> {
+    let meta = get(db, org_id, user, id).await?;
+    results
+        .hydrate(db, meta)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no results yet"))
 }
 
 #[derive(Debug, FromQueryResult)]

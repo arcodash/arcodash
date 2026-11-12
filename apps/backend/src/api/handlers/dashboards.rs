@@ -280,10 +280,11 @@ async fn dashboard_response(
 /// The full response after a mutation: the live draft graph plus favorite/caller/lifecycle.
 async fn draft_dashboard_json(
     db: &Db,
+    results: crate::services::result_service::ResultReader<'_>,
     user: &user::Model,
     d: dashboard::Model,
 ) -> Result<Json<DashboardResponse>, ApiError> {
-    let widgets = build_widget_responses(db, d.id, user).await?;
+    let widgets = build_widget_responses(db, results, d.id, user).await?;
     let fav = is_fav(db, user.id, d.id).await?;
     let caller = dashboard_caller(db, user, d.id, d.user_id).await?;
     let (published, pending, summary) = lifecycle_fields(db, &d, caller.can_edit).await?;
@@ -354,28 +355,31 @@ impl From<dashboard::Model> for DashboardListItem {
 
 async fn build_widget_responses(
     db: &Db,
+    results: crate::services::result_service::ResultReader<'_>,
     dashboard_id: i64,
     user: &user::Model,
 ) -> Result<Vec<WidgetResponse>, ApiError> {
     let items = dashboard_service::load_widgets_with_viz(db, dashboard_id).await?;
-    widget_responses_with_freshness(db, items, user).await
+    widget_responses_with_freshness(db, results, items, user).await
 }
 
 /// Like [`build_widget_responses`] but walking the published snapshot: the graph every
 /// non-editor/public/embed read sees.
 async fn build_published_widget_responses(
     db: &Db,
+    results: crate::services::result_service::ResultReader<'_>,
     d: &dashboard::Model,
     user: &user::Model,
 ) -> Result<Vec<WidgetResponse>, ApiError> {
     let items = dashboard_service::load_published_widgets_with_viz(db, d).await?;
-    widget_responses_with_freshness(db, items, user).await
+    widget_responses_with_freshness(db, results, items, user).await
 }
 
 /// Builds every widget's response, attaching freshness and data-source access in one batched round
 /// trip each.
 async fn widget_responses_with_freshness(
     db: &Db,
+    results: crate::services::result_service::ResultReader<'_>,
     items: Vec<dashboard_service::WidgetWithViz>,
     user: &user::Model,
 ) -> Result<Vec<WidgetResponse>, ApiError> {
@@ -410,7 +414,7 @@ async fn widget_responses_with_freshness(
             )
             .await?;
             let monitors: Vec<_> = pairs.into_iter().map(|(m, _)| m).collect();
-            monitor_service::tile_data(db, &monitors).await?
+            monitor_service::tile_data(db, results, &monitors).await?
         };
 
     Ok(items
@@ -552,12 +556,13 @@ pub struct CreateDashboardRequest {
 
 /// `POST /api/dashboards`
 pub async fn create(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Json(payload): Json<CreateDashboardRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let d = dashboard_service::create(&db, user.org_id, &user, payload.name).await?;
-    let widgets = build_widget_responses(&db, d.id, &user).await?;
+    let widgets = build_widget_responses(&db, state.result_reader(), d.id, &user).await?;
     let caller = dashboard_caller(&db, &user, d.id, d.user_id).await?;
     Ok(Json(
         dashboard_response(&db, d, widgets, false, caller, false, false, None).await?,
@@ -592,6 +597,7 @@ pub struct GetDashboardQuery {
 ///
 /// The one seam deciding which graph a read returns.
 pub async fn get(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(slug): Path<String>,
@@ -601,9 +607,9 @@ pub async fn get(
     let fav = is_fav(&db, user.id, d.id).await?;
     let caller = dashboard_caller(&db, &user, d.id, d.user_id).await?;
     let widgets = if caller.can_edit && (params.draft || !dashboard_service::is_published(&d)) {
-        build_widget_responses(&db, d.id, &user).await?
+        build_widget_responses(&db, state.result_reader(), d.id, &user).await?
     } else {
-        build_published_widget_responses(&db, &d, &user).await?
+        build_published_widget_responses(&db, state.result_reader(), &d, &user).await?
     };
     let (published, pending, summary) = lifecycle_fields(&db, &d, caller.can_edit).await?;
     Ok(Json(
@@ -626,6 +632,7 @@ pub struct UpdateDashboardRequest {
 
 /// `POST /api/dashboards/:slug`
 pub async fn update(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(slug): Path<String>,
@@ -644,40 +651,43 @@ pub async fn update(
         payload.layout,
     )
     .await?;
-    draft_dashboard_json(&db, &user, d).await
+    draft_dashboard_json(&db, state.result_reader(), &user, d).await
 }
 
 /// `POST /api/dashboards/:slug/publish`: overwrite `published_snapshot` with the current draft.
 pub async fn publish(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let d = dashboard_service::get_by_slug(&db, user.org_id, &user, &slug).await?;
     let d = dashboard_service::publish(&db, &user, d).await?;
-    draft_dashboard_json(&db, &user, d).await
+    draft_dashboard_json(&db, state.result_reader(), &user, d).await
 }
 
 /// `POST /api/dashboards/:slug/unpublish` — return a live dashboard to draft.
 pub async fn unpublish(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let d = dashboard_service::get_by_slug(&db, user.org_id, &user, &slug).await?;
     let d = dashboard_service::unpublish(&db, &user, d).await?;
-    draft_dashboard_json(&db, &user, d).await
+    draft_dashboard_json(&db, state.result_reader(), &user, d).await
 }
 
 /// `POST /api/dashboards/:slug/discard`: overwrite the live draft from `published_snapshot`.
 pub async fn discard(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let d = dashboard_service::get_by_slug(&db, user.org_id, &user, &slug).await?;
     let d = dashboard_service::discard_changes(&db, &user, d).await?;
-    draft_dashboard_json(&db, &user, d).await
+    draft_dashboard_json(&db, state.result_reader(), &user, d).await
 }
 
 #[derive(Debug, Deserialize)]

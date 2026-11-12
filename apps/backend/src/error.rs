@@ -174,6 +174,27 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl From<arcodash_core::org_storage::StorageError> for ApiError {
+    fn from(err: arcodash_core::org_storage::StorageError) -> Self {
+        use arcodash_core::org_storage::StorageError;
+        match err {
+            StorageError::Unreachable { .. } => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Can't reach the storage bucket",
+            )
+            .with_code("storage_unreachable"),
+            StorageError::Switching => {
+                Self::conflict_with_code("Storage switch in progress", "storage_switching")
+            }
+            StorageError::NotFound => Self::new(StatusCode::NOT_FOUND, "result not found"),
+            StorageError::Other(e) => {
+                tracing::error!(error = %e, "storage error");
+                Self::internal("internal server error")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +205,31 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn storage_error_maps_to_api_status() {
+        use arcodash_core::org_storage::StorageError;
+
+        let unreachable = ApiError::from(StorageError::Unreachable {
+            detail: "AccessDenied".into(),
+        });
+        assert_eq!(unreachable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unreachable.error_code.as_deref(),
+            Some("storage_unreachable")
+        );
+
+        let switching = ApiError::from(StorageError::Switching);
+        assert_eq!(switching.status, StatusCode::CONFLICT);
+        assert_eq!(switching.error_code.as_deref(), Some("storage_switching"));
+
+        let other = ApiError::from(StorageError::Other(anyhow::anyhow!("x-secret-detail")));
+        assert_eq!(other.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(other.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("x-secret-detail"));
     }
 
     #[tokio::test]

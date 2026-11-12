@@ -601,6 +601,7 @@ pub async fn refresh(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -833,6 +834,7 @@ pub async fn execute_saved(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -866,6 +868,7 @@ pub struct LatestResultQuery {
 /// draft run alongside the published SQL. `published_only=true` opts an editor out of draft-first
 /// (dashboard widgets).
 pub async fn latest_result(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
@@ -887,7 +890,9 @@ pub async fn latest_result(
         query_service::resolve_serving_content(&q).latest_query_data_id
     }
     .ok_or_else(|| ApiError::not_found("no results yet for this query"))?;
-    let result = result_service::get(&db, user.org_id, &user, result_id).await?;
+    let result =
+        result_service::get_with_data(&db, state.result_reader(), user.org_id, &user, result_id)
+            .await?;
 
     Ok(Json(QueryResultEnvelope {
         query_result: QueryResultResponse::from(result),
@@ -925,6 +930,7 @@ pub async fn execute_ad_hoc(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -968,6 +974,7 @@ pub async fn parameter_values(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -1014,6 +1021,7 @@ pub async fn list_visualizations(
 /// (`download_limiter`): `route_layer` can't gate half a merged route, and the JSON branch is hit
 /// by every job-backed widget.
 pub async fn get_or_download_result(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id_str): Path<String>,
@@ -1030,7 +1038,9 @@ pub async fn get_or_download_result(
             ));
         }
         let id = parse_id(raw_id)?;
-        let result = result_service::get(&db, user.org_id, &user, id).await?;
+        let result =
+            result_service::get_with_data(&db, state.result_reader(), user.org_id, &user, id)
+                .await?;
         let fmt = match format_ext {
             "csv" => ResultFormat::Csv,
             "tsv" => ResultFormat::Tsv,
@@ -1070,7 +1080,8 @@ pub async fn get_or_download_result(
     }
 
     let id = parse_id(&id_str)?;
-    let result = result_service::get(&db, user.org_id, &user, id).await?;
+    let result =
+        result_service::get_with_data(&db, state.result_reader(), user.org_id, &user, id).await?;
     Ok(Json(QueryResultEnvelope {
         query_result: QueryResultResponse::from(result),
     })

@@ -720,6 +720,7 @@ impl DbPreview {
             scoped.db(),
             self.state.queue.as_ref(),
             self.state.conveyor.as_deref(),
+            self.state.result_reader(),
             &self.state.redis,
             self.user.org_id,
             &self.user,
@@ -743,7 +744,14 @@ impl DbPreview {
             Ok(s) => s,
             Err(e) => return PreviewOutcome::Err(e.message),
         };
-        let res = result_service::get(scoped.db(), self.user.org_id, &self.user, result_id).await;
+        let res = result_service::get_with_data(
+            scoped.db(),
+            self.state.result_reader(),
+            self.user.org_id,
+            &self.user,
+            result_id,
+        )
+        .await;
         let _ = scoped.commit().await;
         match res {
             Ok(r) => parse_preview(r.data.as_ref()),

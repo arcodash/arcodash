@@ -1285,6 +1285,7 @@ pub async fn execute(
     db: &impl ConnectionTrait,
     queue: &dyn Queue,
     conveyor: Option<&arcodash_core::Conveyor>,
+    results: crate::services::result_service::ResultReader<'_>,
     redis: &redis::aio::ConnectionManager,
     org_id: i64,
     user: &user::Model,
@@ -1405,6 +1406,7 @@ pub async fn execute(
     if max_age != Some(0) {
         let cached = find_fresh_cached_result(
             db,
+            results,
             org_id,
             data_source_id,
             &query_hash,
@@ -1583,6 +1585,7 @@ fn truncated_row_count(data: &Value) -> Option<usize> {
 /// `max_age_secs` and, when truncated, its row count still matches the current `max_query_rows`.
 async fn find_fresh_cached_result(
     db: &impl ConnectionTrait,
+    results: crate::services::result_service::ResultReader<'_>,
     org_id: i64,
     data_source_id: i64,
     query_hash: &str,
@@ -1597,19 +1600,27 @@ async fn find_fresh_cached_result(
         .one(db)
         .await?;
 
-    Ok(existing.filter(|result| {
-        let age_secs = (Utc::now() - result.retrieved_at.with_timezone(&Utc)).num_seconds();
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "truncated row counts are at most a max_query_rows cap, which is a u32"
-        )]
-        let truncated_to_other_cap = result
-            .data
-            .as_ref()
-            .and_then(truncated_row_count)
-            .is_some_and(|row_count| row_count as u32 != max_query_rows);
-        age_secs <= max_age_secs && !truncated_to_other_cap
-    }))
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let age_secs = (Utc::now() - existing.retrieved_at.with_timezone(&Utc)).num_seconds();
+    if age_secs > max_age_secs {
+        return Ok(None);
+    }
+    // A missing object is a miss, so the query re-runs.
+    let Some(hydrated) = results.hydrate(db, existing).await? else {
+        return Ok(None);
+    };
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "truncated row counts are at most a max_query_rows cap, which is a u32"
+    )]
+    let truncated_to_other_cap = hydrated
+        .data
+        .as_ref()
+        .and_then(truncated_row_count)
+        .is_some_and(|row_count| row_count as u32 != max_query_rows);
+    Ok((!truncated_to_other_cap).then_some(hydrated))
 }
 
 /// One `{name, value}` option pair for a Query-based Dropdown parameter.
@@ -1640,6 +1651,7 @@ pub async fn parameter_values(
     db: &impl ConnectionTrait,
     queue: &dyn Queue,
     conveyor: Option<&arcodash_core::Conveyor>,
+    results: crate::services::result_service::ResultReader<'_>,
     redis: &redis::aio::ConnectionManager,
     org_id: i64,
     user: &user::Model,
@@ -1688,6 +1700,7 @@ pub async fn parameter_values(
 
     if let Some(cached) = find_fresh_cached_result(
         db,
+        results,
         org_id,
         resolved.data_source_id,
         &resolved.query_hash,
@@ -1706,6 +1719,7 @@ pub async fn parameter_values(
         db,
         queue,
         conveyor,
+        results,
         redis,
         org_id,
         user,

@@ -114,7 +114,7 @@ pub(crate) async fn serve_public_embed(
     {
         Ok(resolved) => {
             apply_frame_ancestors(&mut headers, &resolved.embed);
-            match embed_service::serialize_public(db, &resolved).await {
+            match embed_service::serialize_public(db, state.result_reader(), &resolved).await {
                 Ok(body) => {
                     crate::metrics::record_embed_serve("served");
                     (headers, Json(body)).into_response()
