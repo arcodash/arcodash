@@ -587,7 +587,13 @@ pub async fn requeue_stale_pending_notifications(ctx: &ExecuteQueryContext) -> u
         };
 
         let explanation = if state == "triggered" {
-            crate::handlers::explain_alert::latest_explanation(&ctx.db, monitor_id).await
+            crate::handlers::explain_alert::latest_explanation(
+                &ctx.db,
+                ctx.storage.as_ref(),
+                org_id,
+                monitor_id,
+            )
+            .await
         } else {
             None
         };

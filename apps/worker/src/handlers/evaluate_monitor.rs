@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement};
 use uuid::Uuid;
 
@@ -16,6 +16,7 @@ use arcodash_core::events::record_event;
 use arcodash_core::models::{parse_monitor_options, MonitorOptions};
 use arcodash_core::monitor_eval::EvaluateMonitorPayload;
 use arcodash_core::notify::{enqueue_send_notification, SendNotificationParams};
+use arcodash_core::observation_store;
 use arcodash_core::schedule_spec::ScheduleSpec;
 
 use crate::handlers::execute_query::ExecuteQueryContext;
@@ -113,7 +114,7 @@ async fn handle_inner(
         return Ok(());
     };
     let eval = evaluate_state(&ctx.db, &*ctx.storage, &monitor, org_id).await?;
-    let observation_id = record_observation(&ctx.db, org_id, monitor.id, None, &eval).await;
+    let observation_id = record_observation(ctx, org_id, monitor.id, None, &eval).await;
     apply_transition_and_notify(ctx, org_id, &monitor, None, &eval, observation_id).await
 }
 
@@ -276,7 +277,7 @@ pub async fn evaluate_and_finalize(
         );
         return Ok(());
     }
-    let observation_id = record_observation(&ctx.db, org_id, monitor.id, Some(run_id), &eval).await;
+    let observation_id = record_observation(ctx, org_id, monitor.id, Some(run_id), &eval).await;
     apply_transition_and_notify(ctx, org_id, monitor, Some(run_id), &eval, observation_id).await
 }
 
@@ -286,7 +287,7 @@ const MAX_OBSERVATIONS: i64 = 500;
 /// Appends one history point for a real check and trims to the newest `MAX_OBSERVATIONS`.
 /// Best-effort.
 async fn record_observation(
-    db: &sea_orm::DatabaseConnection,
+    ctx: &ExecuteQueryContext,
     org_id: i64,
     monitor_id: i64,
     run_id: Option<i64>,
@@ -295,16 +296,16 @@ async fn record_observation(
     if eval.state == "unknown" {
         return None;
     }
+    let db = &ctx.db;
     let inserted = db
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO monitor_observations \
              (org_id, monitor_id, observed_at, value, state, run_id, query_result_id) \
-             VALUES ($1, $2, now(), $3, $4, $5, $6) RETURNING id",
+             VALUES ($1, $2, now(), NULL, $3, $4, $5) RETURNING id, observed_at",
             [
                 org_id.into(),
                 monitor_id.into(),
-                eval.value.into(),
                 eval.state.as_str().into(),
                 run_id.into(),
                 eval.query_result_id.into(),
@@ -312,15 +313,20 @@ async fn record_observation(
         ))
         .await
         .and_then(|r| r.ok_or_else(|| sea_orm::DbErr::RecordNotFound("observation id".into())))
-        .and_then(|r| r.try_get::<i64>("", "id"));
-    let id = match inserted {
-        Ok(id) => id,
+        .and_then(|r| {
+            Ok((
+                r.try_get::<i64>("", "id")?,
+                r.try_get::<chrono::DateTime<Utc>>("", "observed_at")?,
+            ))
+        });
+    let (id, observed_at) = match inserted {
+        Ok(row) => row,
         Err(e) => {
             tracing::warn!(monitor_id, error = %e, "record_observation: insert failed");
             return None;
         }
     };
-    if let Err(e) = db
+    let pruned = db
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "DELETE FROM monitor_observations WHERE monitor_id = $1 \
@@ -330,29 +336,99 @@ async fn record_observation(
              )",
             [monitor_id.into(), MAX_OBSERVATIONS.into()],
         ))
-        .await
-    {
+        .await;
+    if let Err(e) = &pruned {
         tracing::warn!(monitor_id, error = %e, "record_observation: prune failed");
+    }
+    let oldest = if pruned.is_ok() {
+        oldest_observation(db, monitor_id).await
+    } else {
+        None
+    };
+    match ctx.storage.resolve(db, org_id).await {
+        Ok(storage) => {
+            let values = observation_store::ObservationValues {
+                id,
+                observed_at,
+                value: eval.value,
+                explanation: None,
+            };
+            if let Err(e) =
+                observation_store::append_observation(db, &storage, monitor_id, &values, oldest)
+                    .await
+            {
+                tracing::warn!(monitor_id, error = %e, "record_observation: storing values failed");
+            }
+            if let Some(oldest) = oldest {
+                if (oldest.year(), oldest.month()) < (observed_at.year(), observed_at.month()) {
+                    if let Err(e) =
+                        observation_store::prune_months_before(&storage, monitor_id, oldest).await
+                    {
+                        tracing::warn!(monitor_id, error = %e, "record_observation: stored prune failed");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(monitor_id, error = %e, "record_observation: storage unavailable");
+        }
     }
     Some(id)
 }
 
-/// Best-effort write of an alert explanation onto its observation row.
+/// Timestamp of the oldest retained observation. Best-effort.
+async fn oldest_observation(
+    db: &sea_orm::DatabaseConnection,
+    monitor_id: i64,
+) -> Option<chrono::DateTime<Utc>> {
+    db.query_one_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT min(observed_at) AS oldest FROM monitor_observations WHERE monitor_id = $1",
+        [monitor_id.into()],
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| {
+        r.try_get::<Option<chrono::DateTime<Utc>>>("", "oldest")
+            .ok()
+            .flatten()
+    })
+}
+
+/// Best-effort write of an alert explanation into the observation's stored values.
 async fn persist_explanation(
     ctx: &ExecuteQueryContext,
+    org_id: i64,
     monitor_id: i64,
     observation_id: i64,
     text: String,
 ) {
-    if let Err(e) = ctx
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE monitor_observations SET explanation = $1 WHERE id = $2",
-            [text.into(), observation_id.into()],
-        ))
-        .await
-    {
+    let result: anyhow::Result<()> = async {
+        let row = ctx
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT observed_at FROM monitor_observations WHERE id = $1",
+                [observation_id.into()],
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("observation row missing"))?;
+        let observed_at = row.try_get::<chrono::DateTime<Utc>>("", "observed_at")?;
+        let storage = ctx.storage.resolve(&ctx.db, org_id).await?;
+        observation_store::set_explanation(
+            &ctx.db,
+            &storage,
+            monitor_id,
+            observation_id,
+            observed_at,
+            &text,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
         tracing::warn!(monitor_id, error = %e, "evaluate_monitor: failed to persist explanation");
     }
 }
@@ -365,14 +441,14 @@ async fn backfill_incident_explanation(
     observation_id: Option<i64>,
 ) {
     let Some(id) = observation_id else { return };
-    if explain_alert::latest_explanation(&ctx.db, monitor.id)
+    if explain_alert::latest_explanation(&ctx.db, ctx.storage.as_ref(), monitor.org_id, monitor.id)
         .await
         .is_some()
     {
         return;
     }
     if let Some(text) = explain_alert::explanation_for(ctx, monitor, eval, observation_id).await {
-        persist_explanation(ctx, monitor.id, id, text).await;
+        persist_explanation(ctx, monitor.org_id, monitor.id, id, text).await;
     }
 }
 
@@ -481,7 +557,7 @@ async fn apply_transition_and_notify(
         None
     };
     if let (Some(text), Some(id)) = (&explanation, observation_id) {
-        persist_explanation(ctx, monitor.id, id, text.clone()).await;
+        persist_explanation(ctx, monitor.org_id, monitor.id, id, text.clone()).await;
     }
 
     for sub in &subs {
@@ -726,22 +802,12 @@ async fn evaluate_state(
         let sensitivity: arcodash_core::models::Sensitivity = option("sensitivity")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "BASELINE_WINDOW is a small constant"
-        )]
-        let mut history: Vec<f64> = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT value FROM monitor_observations \
-                 WHERE monitor_id = $1 AND value IS NOT NULL \
-                 ORDER BY observed_at DESC, id DESC LIMIT $2",
-                [monitor.id.into(), (BASELINE_WINDOW as i64).into()],
-            ))
-            .await?
-            .iter()
-            .map(|r| r.try_get::<f64>("", "value"))
-            .collect::<Result<_, _>>()?;
+        let mut history: Vec<f64> =
+            explain_alert::recent_values(db, resolver, org_id, monitor.id, None, BASELINE_WINDOW)
+                .await?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
         history.reverse();
         match baseline_verdict(&history, cell_val, sensitivity.z_threshold()) {
             BaselineVerdict::Outlier { z, median, .. } => (
@@ -2076,22 +2142,39 @@ mod freshness_protocol_tests {
         assert_eq!(run.condition_met, Some(true));
     }
 
-    async fn stored_explanation(db: &sea_orm::DatabaseConnection, run_id: i64) -> Option<String> {
-        query_row(
-            db,
-            "SELECT explanation FROM monitor_observations WHERE run_id = $1",
+    async fn stored_explanation(ctx: &ExecuteQueryContext, run_id: i64) -> Option<String> {
+        let row = query_row(
+            &ctx.db,
+            "SELECT id, org_id, monitor_id, observed_at, explanation FROM monitor_observations \
+             WHERE run_id = $1",
             [run_id.into()],
         )
+        .await;
+        let legacy: Option<String> = row.try_get("", "explanation").unwrap();
+        assert!(legacy.is_none(), "explanations are not written to the row");
+        let storage = ctx
+            .storage
+            .resolve(&ctx.db, row.try_get("", "org_id").unwrap())
+            .await
+            .unwrap();
+        let at: chrono::DateTime<Utc> = row.try_get("", "observed_at").unwrap();
+        observation_store::load_observations(
+            &storage,
+            row.try_get("", "monitor_id").unwrap(),
+            at,
+            at,
+        )
         .await
-        .try_get("", "explanation")
         .unwrap()
+        .remove(&row.try_get::<i64>("", "id").unwrap())
+        .and_then(|v| v.explanation)
     }
 
     /// Records three prior `ok` observations (10, 20, 30) so explanations have history.
-    async fn seed_history(db: &sea_orm::DatabaseConnection, org_id: i64, mon_id: i64) {
+    async fn seed_history(ctx: &ExecuteQueryContext, org_id: i64, mon_id: i64) {
         for v in [10.0, 20.0, 30.0] {
             let eval = Evaluation::new("ok", None, None, Some(v), None);
-            record_observation(db, org_id, mon_id, None, &eval).await;
+            record_observation(ctx, org_id, mon_id, None, &eval).await;
         }
     }
 
@@ -2121,12 +2204,12 @@ mod freshness_protocol_tests {
         let mon = reload(&db, mon.id).await;
         subscribe(&db, org_id, mon.id).await;
         let ctx = test_ctx(db.clone(), redis.clone());
-        seed_history(&db, org_id, mon.id).await;
+        seed_history(&ctx, org_id, mon.id).await;
         let run_id = seed_live_run(&db, org_id, mon.id).await;
         evaluate_and_finalize(&ctx, org_id, &mon, run_id, Some((qr_id, 0)))
             .await
             .unwrap();
-        let stored = stored_explanation(&db, run_id).await;
+        let stored = stored_explanation(&ctx, run_id).await;
         let queued = find_and_remove_notification_for_monitor(
             &redis,
             &queue::QueueName::Default.queue_key(),
@@ -2220,14 +2303,14 @@ mod freshness_protocol_tests {
         let mon = reload(&db, mon.id).await;
         subscribe(&db, org_id, mon.id).await;
         let ctx = test_ctx(db.clone(), redis.clone());
-        seed_history(&db, org_id, mon.id).await;
+        seed_history(&ctx, org_id, mon.id).await;
         let mut stored = Vec::new();
         for _ in 0..2 {
             let run_id = seed_live_run(&db, org_id, mon.id).await;
             evaluate_and_finalize(&ctx, org_id, &mon, run_id, Some((qr_id, 0)))
                 .await
                 .unwrap();
-            stored.push(stored_explanation(&db, run_id).await);
+            stored.push(stored_explanation(&ctx, run_id).await);
         }
         let queued = find_and_remove_notification_for_monitor(
             &redis,
@@ -2291,10 +2374,7 @@ mod freshness_protocol_tests {
             .await
             .unwrap();
         let rows = observation_rows(&db, mon.id).await;
-        assert_eq!(
-            rows,
-            vec![(Some(100.0), "triggered".to_string(), Some(run1))]
-        );
+        assert_eq!(rows, vec![(None, "triggered".to_string(), Some(run1))]);
 
         let mon = monitor::Model {
             options: serde_json::json!({"column": "value", "op": ">", "value": 500.0}),
@@ -2306,7 +2386,7 @@ mod freshness_protocol_tests {
             .unwrap();
         let rows = observation_rows(&db, mon.id).await;
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1], (Some(100.0), "ok".to_string(), Some(run2)));
+        assert_eq!(rows[1], (None, "ok".to_string(), Some(run2)));
     }
 
     async fn set_result_row(db: &sea_orm::DatabaseConnection, qr_id: i64, value: f64) {
@@ -2372,6 +2452,130 @@ mod freshness_protocol_tests {
         );
     }
 
+    /// Inserts an `ok` observation `mins_ago` minutes back, with `inline` in the legacy column.
+    async fn seed_observation_row(
+        db: &sea_orm::DatabaseConnection,
+        org_id: i64,
+        mon_id: i64,
+        mins_ago: i64,
+        inline: Option<f64>,
+    ) -> (i64, chrono::DateTime<Utc>) {
+        let row = query_row(
+            db,
+            "INSERT INTO monitor_observations (org_id, monitor_id, observed_at, value, state) \
+             VALUES ($1, $2, now() - ($3 || ' minutes')::interval, $4, 'ok') \
+             RETURNING id, observed_at",
+            [
+                org_id.into(),
+                mon_id.into(),
+                mins_ago.to_string().into(),
+                inline.into(),
+            ],
+        )
+        .await;
+        (
+            row.try_get("", "id").unwrap(),
+            row.try_get("", "observed_at").unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn evaluate_monitor_writes_null_value_column_and_object() {
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 123.5, over_50()).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        eval_once(&db, &ctx, org_id, mon.id, qr_id).await;
+        let rows = observation_rows(&db, mon.id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, None);
+        let id: i64 = query_row(
+            &db,
+            "SELECT id FROM monitor_observations WHERE monitor_id = $1",
+            [mon.id.into()],
+        )
+        .await
+        .try_get("", "id")
+        .unwrap();
+        let storage = ctx.storage.resolve(&db, org_id).await.unwrap();
+        let stored = observation_store::load_observations(
+            &storage,
+            mon.id,
+            Utc::now() - chrono::Duration::days(1),
+            Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored[&id].value, Some(123.5));
+    }
+
+    #[tokio::test]
+    async fn baseline_reads_history_from_storage() {
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, baseline()).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let storage = ctx.storage.resolve(&db, org_id).await.unwrap();
+        for i in 0..8 {
+            let (id, observed_at) = seed_observation_row(&db, org_id, mon.id, 10 + i, None).await;
+            let values = observation_store::ObservationValues {
+                id,
+                observed_at,
+                value: Some(100.0 + (i % 2) as f64),
+                explanation: None,
+            };
+            observation_store::append_observation(&db, &storage, mon.id, &values, None)
+                .await
+                .unwrap();
+        }
+        set_result_row(&db, qr_id, 400.0).await;
+        assert_eq!(
+            eval_once(&db, &ctx, org_id, mon.id, qr_id).await,
+            "triggered"
+        );
+    }
+
+    #[tokio::test]
+    async fn baseline_storage_failure_fails_evaluation_without_transition() {
+        let Some((db, _redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, baseline()).await;
+        for i in 0..8 {
+            seed_observation_row(&db, org_id, mon.id, 10 + i, None).await;
+        }
+        set_result_row(&db, qr_id, 100.0).await;
+        let before = observation_rows(&db, mon.id).await.len();
+        let failing = arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            Arc::new(arcodash_core::test_support::blob::FailingBlobStore::default()),
+            "org-root",
+        );
+        let m = reload(&db, mon.id).await;
+        assert!(evaluate_state(&db, &failing, &m, org_id).await.is_err());
+        assert_eq!(observation_rows(&db, mon.id).await.len(), before);
+        assert_eq!(reload(&db, mon.id).await.state, m.state);
+    }
+
+    #[tokio::test]
+    async fn legacy_observation_values_still_read() {
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, baseline()).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        for i in 0..8 {
+            seed_observation_row(&db, org_id, mon.id, 10 + i, Some(100.0 + (i % 2) as f64)).await;
+        }
+        set_result_row(&db, qr_id, 400.0).await;
+        assert_eq!(
+            eval_once(&db, &ctx, org_id, mon.id, qr_id).await,
+            "triggered"
+        );
+    }
+
     async fn baseline_first_check(opts: serde_json::Value) -> Option<String> {
         let (db, redis) = setup().await?;
         let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, opts).await;
@@ -2418,11 +2622,14 @@ mod freshness_protocol_tests {
 
     #[tokio::test]
     async fn unknown_writes_no_observation() {
-        let Some(db) = test_db().await else { return };
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let ctx = test_ctx(db.clone(), redis);
         let (org_id, mon, _) = seed_published_monitor(&db, Utc::now(), 100.0, over_50()).await;
         let eval = Evaluation::new("unknown", None, None, None, None);
         assert_eq!(
-            record_observation(&db, org_id, mon.id, None, &eval).await,
+            record_observation(&ctx, org_id, mon.id, None, &eval).await,
             None
         );
         assert!(observation_rows(&db, mon.id).await.is_empty());
@@ -2457,7 +2664,10 @@ mod freshness_protocol_tests {
 
     #[tokio::test]
     async fn observations_pruned_to_500_newest_kept() {
-        let Some(db) = test_db().await else { return };
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let ctx = test_ctx(db.clone(), redis);
         let (org_id, mon, _) = seed_published_monitor(&db, Utc::now(), 100.0, over_50()).await;
         exec_sql(
             &db,
@@ -2468,14 +2678,27 @@ mod freshness_protocol_tests {
         )
         .await;
         let eval = Evaluation::new("triggered", None, None, Some(0.5), None);
-        record_observation(&db, org_id, mon.id, None, &eval)
+        record_observation(&ctx, org_id, mon.id, None, &eval)
             .await
             .unwrap();
         let rows = observation_rows(&db, mon.id).await;
         assert_eq!(rows.len(), 500);
-        assert!(rows.iter().any(|r| r.0 == Some(0.5)));
+        assert!(rows.iter().any(|r| r.0.is_none() && r.1 == "triggered"));
         assert!(!rows.iter().any(|r| r.0 == Some(505.0)));
         assert!(rows.iter().any(|r| r.0 == Some(1.0)));
+        let storage = ctx.storage.resolve(&ctx.db, org_id).await.unwrap();
+        let rel = observation_store::observation_rel_key(mon.id, Utc::now());
+        let bytes = storage
+            .get(arcodash_core::org_storage::StorageArea::Monitors, &rel)
+            .await
+            .unwrap();
+        assert!(
+            bytes
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count()
+                <= 500
+        );
     }
 }
 

@@ -44,6 +44,7 @@ pub async fn run_due_escalations(
     entitlements: &dyn arcodash_core::entitlements::OrgEntitlements,
     queue: &dyn Queue,
     conveyor: Option<&Conveyor>,
+    storage: &dyn arcodash_core::org_storage::OrgStorageResolver,
 ) -> anyhow::Result<EscalationSummary> {
     let rows = db
         .query_all_raw(Statement::from_string(
@@ -189,7 +190,8 @@ pub async fn run_due_escalations(
         crate::health::ESCALATIONS_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let explanation =
-            crate::handlers::explain_alert::latest_explanation(db, m.monitor_id).await;
+            crate::handlers::explain_alert::latest_explanation(db, storage, m.org_id, m.monitor_id)
+                .await;
         if let Err(e) = enqueue_send_notification(
             queue,
             conveyor,
@@ -335,9 +337,15 @@ mod tests {
         entitlements: &dyn OrgEntitlements,
     ) {
         let queue = ValkeyQueue::new(redis.clone());
-        run_due_escalations(db, entitlements, &queue, None)
-            .await
-            .unwrap();
+        run_due_escalations(
+            db,
+            entitlements,
+            &queue,
+            None,
+            &crate::scheduler::test_support::test_storage(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn seed_step(

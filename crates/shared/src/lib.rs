@@ -20,6 +20,7 @@ pub mod models;
 pub mod monitor_eval;
 pub mod net_guard;
 pub mod notify;
+pub mod observation_store;
 pub mod org_seed;
 pub mod org_settings;
 pub mod org_storage;

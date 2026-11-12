@@ -277,6 +277,7 @@ async fn escalation_tick(ctx: Arc<ExecuteQueryContext>) {
         ctx.entitlements.as_ref(),
         ctx.queue.as_ref(),
         ctx.conveyor.get().map(std::convert::AsRef::as_ref),
+        ctx.storage.as_ref(),
     )
     .await
     {
@@ -565,6 +566,15 @@ pub(crate) mod test_support {
             query_timeout_secs: 30,
             ..test_ctx(db, redis)
         }
+    }
+
+    /// In-memory org storage for scheduler tests.
+    pub(crate) fn test_storage() -> arcodash_core::test_support::blob::StaticResolver {
+        arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default()),
+            "orgs/test/",
+        )
     }
 
     /// `ObjectStore::from_env()` against the emulator, defaulting `UPLOAD_BUCKET` when unset.

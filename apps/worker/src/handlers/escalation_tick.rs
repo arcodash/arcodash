@@ -22,6 +22,7 @@ impl TaskHandler for EscalationTickHandler {
             self.ctx.entitlements.as_ref(),
             self.ctx.queue.as_ref(),
             self.ctx.conveyor.get().map(std::convert::AsRef::as_ref),
+            self.ctx.storage.as_ref(),
         )
         .await?;
         if summary.failed > 0 {
