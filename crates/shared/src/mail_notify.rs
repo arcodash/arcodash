@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use arcodash_conveyor::{Conveyor, EnqueueRequest};
 
 use crate::entities::mail_delivery;
+use crate::org_storage::{OrgStorage, StorageArea, StorageError};
 use crate::queue::{JobMessage, Queue, QueueName};
 
 /// Terminalizes a just-inserted `mail_deliveries` row after its enqueue failed, so the sweeper's
@@ -31,6 +32,44 @@ async fn mark_enqueue_failed(db: &impl ConnectionTrait, id: i64, error: &anyhow:
     if let Err(e) = result {
         tracing::error!(delivery_id = id, error = %e, "mail_notify: failed to mark a mail_deliveries row failed after its enqueue failed");
     }
+}
+
+/// Object key (within the emails area) of delivery `delivery_id`'s body.
+#[must_use]
+pub fn mail_body_key(delivery_id: i64) -> String {
+    format!("{delivery_id}.html")
+}
+
+/// The body of a `send_mail` row: its stored object, else the inline column of rows written before
+/// bodies moved to storage.
+///
+/// # Errors
+///
+/// `NotFound` when the row has neither or the object is gone; otherwise the store's error.
+pub async fn load_mail_body(
+    storage: &OrgStorage,
+    d: &mail_delivery::Model,
+) -> Result<String, StorageError> {
+    load_body(storage, d.body_location.as_deref(), d.body_html.as_deref()).await
+}
+
+/// [`load_mail_body`] over the two raw columns.
+///
+/// # Errors
+///
+/// As [`load_mail_body`].
+pub async fn load_body(
+    storage: &OrgStorage,
+    location: Option<&str>,
+    inline: Option<&str>,
+) -> Result<String, StorageError> {
+    if let Some(rel) = location {
+        let bytes = storage.get(StorageArea::Emails, rel).await?;
+        return String::from_utf8(bytes.to_vec()).map_err(|e| {
+            StorageError::Other(anyhow::anyhow!("stored mail body is not UTF-8: {e}"))
+        });
+    }
+    inline.map(str::to_owned).ok_or(StorageError::NotFound)
 }
 
 /// Enqueue the conveyor task for delivery row `id`; `Ok(false)` when conveyor reports it already
@@ -70,7 +109,9 @@ pub struct SendMailPayload {
     pub org_id: i64,
     pub to: String,
     pub subject: String,
-    pub body_html: String,
+    /// Absent on tasks enqueued by `enqueue_send_mail`: the handler loads the stored body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
 }
 
 /// Route `send_digest` enqueues through the conveyor SDK instead of the legacy default queue.
@@ -125,13 +166,19 @@ pub async fn enqueue_send_digest(
     Ok(id)
 }
 
-/// Insert the durable `mail_deliveries` row, then enqueue.
+/// Insert the durable `mail_deliveries` row, store the body as an object, then enqueue.
 ///
 /// Same routing shape as [`enqueue_send_digest`], gated on [`conveyor_send_mail_enabled`] instead.
-/// No in-app caller wires this yet — it exists so the handler/table/sweep can be exercised by a
-/// real integration test; a manual "send test email" action would be the natural producer.
+/// The body never lands in Postgres: when the object write fails the row is failed and the error
+/// returned.
+///
+/// # Errors
+///
+/// A database error, a storage error from writing the body, or the enqueue error.
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue_send_mail(
     db: &impl sea_orm::ConnectionTrait,
+    storage: &OrgStorage,
     queue: &dyn Queue,
     conveyor: Option<&Conveyor>,
     org_id: i64,
@@ -139,13 +186,32 @@ pub async fn enqueue_send_mail(
     subject: String,
     body_html: String,
 ) -> anyhow::Result<i64> {
-    let id = mail_delivery::insert_pending_mail(db, org_id, &to, &subject, &body_html).await?;
+    let id = mail_delivery::insert_pending_mail(db, org_id, &to, &subject).await?;
+    let rel = mail_body_key(id);
+    let stored = storage
+        .put(
+            StorageArea::Emails,
+            &rel,
+            body_html.clone().into_bytes().into(),
+            "text/html; charset=utf-8",
+        )
+        .await;
+    if let Err(e) = stored {
+        let e = anyhow::Error::new(e);
+        mark_enqueue_failed(db, id, &e).await;
+        return Err(e);
+    }
+    if let Err(e) = mail_delivery::set_body_location(db, id, &rel).await {
+        let e = anyhow::Error::new(e);
+        mark_enqueue_failed(db, id, &e).await;
+        return Err(e);
+    }
     let result = if let Some(c) = conveyor.filter(|_| conveyor_send_mail_enabled()) {
         let payload = serde_json::to_value(SendMailPayload {
             org_id,
             to,
             subject,
-            body_html,
+            body_html: None,
         })?;
         enqueue_on_conveyor(c, "send_mail", payload, org_id, id)
             .await
@@ -200,6 +266,126 @@ mod tests {
         Some((db, org_id))
     }
 
+    fn mem_storage(
+        org_id: i64,
+    ) -> (
+        OrgStorage,
+        std::sync::Arc<crate::test_support::blob::MemoryBlobStore>,
+    ) {
+        let mem = std::sync::Arc::new(crate::test_support::blob::MemoryBlobStore::default());
+        let storage = OrgStorage::new(
+            org_id,
+            crate::org_storage::StorageMode::ArcoDash,
+            mem.clone(),
+            format!("orgs/{org_id}/"),
+        );
+        (storage, mem)
+    }
+
+    async fn delivery(db: &sea_orm::DatabaseConnection, id: i64) -> mail_delivery::Model {
+        mail_delivery::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mail_body_is_stored_outside_postgres() {
+        let Some((db, org_id)) = db_with_org("org-mail-body-stored").await else {
+            return;
+        };
+        let (storage, mem) = mem_storage(org_id);
+        let id = enqueue_send_mail(
+            &db,
+            &storage,
+            &RecordingQueue::default(),
+            None,
+            org_id,
+            "to@test.local".to_string(),
+            "subject".to_string(),
+            "<p>secret body</p>".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let row = delivery(&db, id).await;
+        assert_eq!(row.body_html, None);
+        assert_eq!(
+            row.body_location.as_deref(),
+            Some(format!("{id}.html").as_str())
+        );
+        assert_eq!(
+            mem.content_type(&storage.key(StorageArea::Emails, &format!("{id}.html")))
+                .as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            load_mail_body(&storage, &row).await.unwrap(),
+            "<p>secret body</p>"
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_sender_reads_legacy_inline_body() {
+        let Some((db, org_id)) = db_with_org("org-mail-body-legacy").await else {
+            return;
+        };
+        let (storage, _) = mem_storage(org_id);
+        let id = mail_delivery::insert_pending_mail(&db, org_id, "to@test.local", "s")
+            .await
+            .unwrap();
+        let mut row = delivery(&db, id).await;
+        assert!(matches!(
+            load_mail_body(&storage, &row).await,
+            Err(StorageError::NotFound)
+        ));
+        row.body_html = Some("<p>legacy</p>".to_string());
+        assert_eq!(
+            load_mail_body(&storage, &row).await.unwrap(),
+            "<p>legacy</p>"
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_put_failure_marks_delivery_failed() {
+        let Some((db, org_id)) = db_with_org("org-mail-put-fails").await else {
+            return;
+        };
+        let storage = OrgStorage::new(
+            org_id,
+            crate::org_storage::StorageMode::ArcoDash,
+            std::sync::Arc::new(crate::test_support::blob::FailingBlobStore::default()),
+            "orgs/x/",
+        );
+        let queue = RecordingQueue::default();
+        let err = enqueue_send_mail(
+            &db,
+            &storage,
+            &queue,
+            None,
+            org_id,
+            "to@test.local".to_string(),
+            "subject".to_string(),
+            "<p>secret body</p>".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<StorageError>().is_some());
+        assert!(queue.sent.lock().unwrap().is_empty());
+
+        let row = mail_delivery::Entity::find()
+            .filter(mail_delivery::Column::OrgId.eq(org_id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.body_html, None);
+        assert_eq!(row.body_location, None);
+        assert!(!row.error.unwrap_or_default().contains("secret body"));
+    }
+
     #[tokio::test]
     async fn legacy_branch_reproduces_exact_send_digest_shape() {
         let Some((db, org_id)) = db_with_org("org-mail-notify-digest").await else {
@@ -236,8 +422,10 @@ mod tests {
         };
 
         let queue = RecordingQueue::default();
+        let (storage, _) = mem_storage(org_id);
         let id = enqueue_send_mail(
             &db,
+            &storage,
             &queue,
             None,
             org_id,
@@ -288,7 +476,7 @@ mod tests {
             org_id: 1,
             to: "to@test.local".to_string(),
             subject: "subject".to_string(),
-            body_html: "body".to_string(),
+            body_html: Some("body".to_string()),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: SendMailPayload = serde_json::from_str(&json).unwrap();
@@ -345,8 +533,10 @@ mod tests {
             return;
         };
 
+        let (storage, _) = mem_storage(org_id);
         enqueue_send_mail(
             &db,
+            &storage,
             &FailingQueue,
             None,
             org_id,

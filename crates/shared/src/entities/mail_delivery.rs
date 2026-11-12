@@ -1,8 +1,8 @@
 //! Durable row for `SendDigest`/`SendMail`, shared by `task_type` (`send_digest` | `send_mail`).
 //!
 //! `send_digest` only needs `entity_id` (the `user_id`);
-//! `send_mail` needs the full `to_email`/`subject`/`body_html` payload so a lost Redis message is
-//! rebuildable from this row alone. No `attempt_number`: neither task type has a bounded-retry
+//! `send_mail` keeps `to_email`/`subject` here and its body in object storage (`body_location`;
+//! `body_html` only on rows written before that) so a lost Redis message is rebuildable. No `attempt_number`: neither task type has a bounded-retry
 //! loop, so the stale-pending sweep is the sole recovery path for both.
 
 use sea_orm::entity::prelude::*;
@@ -66,25 +66,57 @@ pub async fn insert_pending_digest(
     Ok(row.id)
 }
 
-/// Insert a not-yet-attempted `send_mail` row and return its id, BEFORE the LPUSH — the full
-/// payload is stored so the sweep can rebuild the `SendMail` message from Postgres alone.
+/// Insert a not-yet-attempted `send_mail` row and return its id, BEFORE the enqueue. The body is
+/// stored as an object afterwards; see `mail_notify::enqueue_send_mail`.
 pub async fn insert_pending_mail(
     db: &impl sea_orm::ConnectionTrait,
     org_id: i64,
     to: &str,
     subject: &str,
-    body_html: &str,
 ) -> Result<i64, sea_orm::DbErr> {
     let row = ActiveModel {
         org_id: Set(org_id),
         task_type: Set("send_mail".to_string()),
         to_email: Set(Some(to.to_string())),
         subject: Set(Some(subject.to_string())),
-        body_html: Set(Some(body_html.to_string())),
         status: Set("pending".to_string()),
         ..Default::default()
     }
     .insert(db)
     .await?;
     Ok(row.id)
+}
+
+/// Point a delivery row at its stored body.
+pub async fn set_body_location(
+    db: &impl sea_orm::ConnectionTrait,
+    id: i64,
+    location: &str,
+) -> Result<(), sea_orm::DbErr> {
+    ActiveModel {
+        id: Set(id),
+        body_location: Set(Some(location.to_string())),
+        ..Default::default()
+    }
+    .update(db)
+    .await?;
+    Ok(())
+}
+
+/// Terminalizes a `pending`/`retrying` row whose body object can no longer be found. Best-effort:
+/// a failed update is logged and left for the next sweep.
+pub async fn fail_body_missing(db: &impl sea_orm::ConnectionTrait, id: i64) {
+    use sea_orm::{DbBackend, Statement};
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE mail_deliveries SET status = 'failed', finished_at = now(), \
+             error = 'mail body not found in storage' \
+             WHERE id = $1 AND status IN ('pending', 'retrying')",
+            [id.into()],
+        ))
+        .await;
+    if let Err(e) = result {
+        tracing::error!(delivery_id = id, error = %e, "failed to mark a mail delivery failed");
+    }
 }

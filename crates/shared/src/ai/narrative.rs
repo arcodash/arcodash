@@ -22,7 +22,7 @@ use super::settings::ResolvedProvider;
 use super::{AiError, AiProvider, AiProviderKind, JsonGeneration};
 use crate::authz::access::query_is_published;
 use crate::entities::{dashboard, dashboard_narrative, query, query_result, visualization, widget};
-use crate::org_storage::OrgStorageResolver;
+use crate::org_storage::{OrgStorage, OrgStorageResolver, StorageArea, StorageError};
 use crate::result_store::load_results;
 
 pub const MAX_WIDGETS: usize = 12;
@@ -361,6 +361,67 @@ fn same_data(a: &Digest, b: &Digest) -> bool {
         })
 }
 
+/// Failure of a narrative database or object-storage operation.
+#[derive(Debug, thiserror::Error)]
+pub enum NarrativeError {
+    #[error(transparent)]
+    Db(#[from] DbErr),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+/// Tells the resolver about a failed storage operation when the store was unreachable; other
+/// errors are not a health signal.
+pub async fn report_unreachable(
+    resolver: &dyn crate::org_storage::OrgStorageResolver,
+    db: &sea_orm::DatabaseConnection,
+    org_id: i64,
+    err: &StorageError,
+) {
+    if matches!(err, StorageError::Unreachable { .. }) {
+        resolver.report_failure(db, org_id, err).await;
+    }
+}
+
+/// A narrative's text and the digest it was built from, as stored in its object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NarrativeContent {
+    pub summary: String,
+    pub highlights: Value,
+    pub body: Option<String>,
+    pub digest: Value,
+}
+
+/// The content of `n`: inline columns of rows written before content moved to storage win, else
+/// the object at `data_location`. `Ok(None)` when the object is gone or the row has neither.
+///
+/// # Errors
+///
+/// `Unreachable`/`Switching`/`Other` from the store; a missing object is `Ok(None)`.
+pub async fn load_narrative_content(
+    storage: &OrgStorage,
+    n: &dashboard_narrative::Model,
+) -> Result<Option<NarrativeContent>, StorageError> {
+    if let Some(summary) = &n.summary {
+        return Ok(Some(NarrativeContent {
+            summary: summary.clone(),
+            highlights: n.highlights.clone().unwrap_or_else(|| json!([])),
+            body: n.body.clone(),
+            digest: n.digest.clone().unwrap_or_default(),
+        }));
+    }
+    let Some(rel) = &n.data_location else {
+        return Ok(None);
+    };
+    match storage.get(StorageArea::Narratives, rel).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            StorageError::Other(anyhow::anyhow!("stored narrative is malformed: {e}"))
+        }),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Newest stored digest of this dashboard that differs from `current` once restricted to the
 /// widgets the reader may see, so a previous run by a wider-access user never leaks values.
 #[allow(
@@ -369,10 +430,11 @@ fn same_data(a: &Digest, b: &Digest) -> bool {
 )]
 pub async fn previous_digest(
     db: &impl ConnectionTrait,
+    storage: &OrgStorage,
     dashboard_id: i64,
     current: &Digest,
     readable: &HashSet<i64>,
-) -> Result<Option<(DateTime<Utc>, Digest)>, DbErr> {
+) -> Result<Option<(DateTime<Utc>, Digest)>, NarrativeError> {
     let rows = dashboard_narrative::Entity::find()
         .filter(dashboard_narrative::Column::DashboardId.eq(dashboard_id))
         .order_by_desc(dashboard_narrative::Column::CreatedAt)
@@ -381,7 +443,12 @@ pub async fn previous_digest(
         .all(db)
         .await?;
     for row in rows {
-        let Ok(mut prev) = serde_json::from_value::<Digest>(row.digest.unwrap_or_default()) else {
+        let content = match load_narrative_content(storage, &row).await {
+            Ok(Some(c)) => c,
+            Ok(None) | Err(StorageError::Other(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let Ok(mut prev) = serde_json::from_value::<Digest>(content.digest) else {
             continue;
         };
         prev.widgets.retain(|w| readable.contains(&w.query_id));
@@ -843,6 +910,12 @@ where
     }
 }
 
+/// Insert the narrative row, write its content as an object, and prune the dashboard's history
+/// (objects included). A failed object write removes the row again.
+///
+/// # Errors
+///
+/// A database error, or the storage error from writing the content.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::cast_possible_wrap,
@@ -850,6 +923,7 @@ where
 )]
 pub async fn store(
     db: &impl ConnectionTrait,
+    storage: &OrgStorage,
     org_id: i64,
     dashboard_id: i64,
     user_id: Option<i64>,
@@ -857,20 +931,25 @@ pub async fn store(
     n: &Narrative,
     digest: &Digest,
     model: &str,
-) -> Result<dashboard_narrative::Model, DbErr> {
+) -> Result<(dashboard_narrative::Model, NarrativeContent), NarrativeError> {
+    use sea_orm::ActiveModelTrait;
     use sea_orm::ActiveValue::Set;
+    let content = NarrativeContent {
+        summary: n.summary.clone(),
+        highlights: serde_json::to_value(&n.highlights).unwrap_or(json!([])),
+        body: n.body.clone(),
+        digest: serde_json::to_value(digest).unwrap_or(json!({})),
+    };
     let row = dashboard_narrative::ActiveModel {
         org_id: Set(org_id),
         dashboard_id: Set(dashboard_id),
         user_id: Set(user_id),
         created_at: Set(Utc::now().into()),
         source: Set(source.to_string()),
-        summary: Set(Some(n.summary.clone())),
-        highlights: Set(Some(
-            serde_json::to_value(&n.highlights).unwrap_or(json!([])),
-        )),
-        body: Set(n.body.clone()),
-        digest: Set(Some(serde_json::to_value(digest).unwrap_or(json!({})))),
+        summary: Set(None),
+        highlights: Set(None),
+        body: Set(None),
+        digest: Set(None),
         confidence: Set(n.confidence.clone()),
         model: Set(model.to_string()),
         ..Default::default()
@@ -878,15 +957,73 @@ pub async fn store(
     let row = dashboard_narrative::Entity::insert(row)
         .exec_with_returning(db)
         .await?;
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "DELETE FROM dashboard_narratives WHERE dashboard_id = $1 AND id NOT IN (\
-         SELECT id FROM dashboard_narratives WHERE dashboard_id = $1 \
-         ORDER BY created_at DESC, id DESC LIMIT $2)",
-        [dashboard_id.into(), (KEEP_PER_DASHBOARD as i64).into()],
-    ))
+    let rel = format!("{dashboard_id}/{}.json", row.id);
+    let bytes = serde_json::to_vec(&content).unwrap_or_default();
+    if let Err(e) = storage
+        .put(
+            StorageArea::Narratives,
+            &rel,
+            bytes.into(),
+            "application/json",
+        )
+        .await
+    {
+        if let Err(del) = dashboard_narrative::Entity::delete_by_id(row.id)
+            .exec(db)
+            .await
+        {
+            tracing::error!(narrative_id = row.id, error = %del, "narrative: failed to remove the row after its content write failed");
+        }
+        return Err(e.into());
+    }
+    let row = dashboard_narrative::ActiveModel {
+        id: Set(row.id),
+        data_location: Set(Some(rel)),
+        ..Default::default()
+    }
+    .update(db)
     .await?;
-    Ok(row)
+    prune(db, storage, dashboard_id).await?;
+    Ok((row, content))
+}
+
+/// Keeps the newest [`KEEP_PER_DASHBOARD`] narratives of a dashboard; pruned objects are removed
+/// best-effort.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "KEEP_PER_DASHBOARD is a small constant that fits i64"
+)]
+async fn prune(
+    db: &impl ConnectionTrait,
+    storage: &OrgStorage,
+    dashboard_id: i64,
+) -> Result<(), DbErr> {
+    let doomed = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, data_location FROM dashboard_narratives WHERE dashboard_id = $1 \
+             AND id NOT IN (SELECT id FROM dashboard_narratives WHERE dashboard_id = $1 \
+             ORDER BY created_at DESC, id DESC LIMIT $2)",
+            [dashboard_id.into(), (KEEP_PER_DASHBOARD as i64).into()],
+        ))
+        .await?;
+    if doomed.is_empty() {
+        return Ok(());
+    }
+    let mut ids = Vec::with_capacity(doomed.len());
+    for r in &doomed {
+        ids.push(r.try_get::<i64>("", "id")?);
+        if let Some(rel) = r.try_get::<Option<String>>("", "data_location")? {
+            if let Err(e) = storage.delete(StorageArea::Narratives, &rel).await {
+                tracing::warn!(error = %e, "narrative: failed to delete a pruned narrative object");
+            }
+        }
+    }
+    dashboard_narrative::Entity::delete_many()
+        .filter(dashboard_narrative::Column::Id.is_in(ids))
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 pub async fn latest_for_user(
@@ -897,6 +1034,11 @@ pub async fn latest_for_user(
     dashboard_narrative::Entity::find()
         .filter(dashboard_narrative::Column::DashboardId.eq(dashboard_id))
         .filter(dashboard_narrative::Column::UserId.eq(user_id))
+        .filter(
+            sea_orm::Condition::any()
+                .add(dashboard_narrative::Column::DataLocation.is_not_null())
+                .add(dashboard_narrative::Column::Summary.is_not_null()),
+        )
         .order_by_desc(dashboard_narrative::Column::CreatedAt)
         .order_by_desc(dashboard_narrative::Column::Id)
         .one(db)
@@ -1796,6 +1938,7 @@ mod tests {
     async fn previous_is_filtered_to_readable_and_skips_identical() {
         let Some(db) = test_db().await else { return };
         let f = fx(&db).await;
+        let (storage, _) = test_storage();
         let a = add_widget(&db, &f, 0, Some(1)).await;
         let b = add_widget(&db, &f, 1, Some(2)).await;
         let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
@@ -1809,6 +1952,7 @@ mod tests {
         old.widgets[1].rows = vec![vec![json!(200)]];
         store(
             &db,
+            &storage,
             f.org_id,
             f.dash.id,
             Some(f.user_id),
@@ -1821,6 +1965,7 @@ mod tests {
         .unwrap();
         store(
             &db,
+            &storage,
             f.org_id,
             f.dash.id,
             Some(f.user_id),
@@ -1832,7 +1977,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (_, prev) = previous_digest(&db, f.dash.id, &cur, &both)
+        let (_, prev) = previous_digest(&db, &storage, f.dash.id, &cur, &both)
             .await
             .unwrap()
             .unwrap();
@@ -1843,7 +1988,7 @@ mod tests {
         let cur_a = build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &only_a)
             .await
             .unwrap();
-        let (_, prev) = previous_digest(&db, f.dash.id, &cur_a, &only_a)
+        let (_, prev) = previous_digest(&db, &storage, f.dash.id, &cur_a, &only_a)
             .await
             .unwrap()
             .unwrap();
@@ -1852,7 +1997,7 @@ mod tests {
         let _ = b;
 
         let empty: HashSet<i64> = HashSet::new();
-        assert!(previous_digest(&db, f.dash.id, &cur, &empty)
+        assert!(previous_digest(&db, &storage, f.dash.id, &cur, &empty)
             .await
             .unwrap()
             .is_none());
@@ -1862,9 +2007,11 @@ mod tests {
     async fn store_prunes_to_thirty() {
         let Some(db) = test_db().await else { return };
         let f = fx(&db).await;
+        let (storage, mem) = test_storage();
         let other = fx(&db).await;
         store(
             &db,
+            &storage,
             other.org_id,
             other.dash.id,
             None,
@@ -1878,6 +2025,7 @@ mod tests {
         for i in 0..32 {
             store(
                 &db,
+                &storage,
                 f.org_id,
                 f.dash.id,
                 Some(f.user_id),
@@ -1899,8 +2047,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(latest.summary.as_deref(), Some("n31"));
-        assert_eq!(latest.body.as_deref(), Some("body of n31"));
+        let content = load_narrative_content(&storage, &latest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(content.summary, "n31");
+        assert_eq!(content.body.as_deref(), Some("body of n31"));
+        let _ = &mem;
         assert!(latest_for_user(&db, f.dash.id, f.user_id + 1_000_000)
             .await
             .unwrap()
@@ -1911,6 +2064,203 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, 1);
+    }
+
+    #[tokio::test]
+    async fn latest_for_user_skips_rows_without_content() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let (storage, _mem) = test_storage();
+        let (kept, _) = store(
+            &db,
+            &storage,
+            f.org_id,
+            f.dash.id,
+            Some(f.user_id),
+            "manual",
+            &narr("real"),
+            &Digest::default(),
+            "m",
+        )
+        .await
+        .unwrap();
+        let bare = dashboard_narrative::Entity::insert(dashboard_narrative::ActiveModel {
+            org_id: Set(f.org_id),
+            dashboard_id: Set(f.dash.id),
+            user_id: Set(Some(f.user_id)),
+            created_at: Set(Utc::now().into()),
+            source: Set("manual".to_string()),
+            confidence: Set("low".to_string()),
+            model: Set("m".to_string()),
+            ..Default::default()
+        })
+        .exec_with_returning(&db)
+        .await
+        .unwrap();
+        assert!(bare.id > kept.id);
+        let latest = latest_for_user(&db, f.dash.id, f.user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.id, kept.id);
+    }
+
+    fn test_storage() -> (OrgStorage, Arc<crate::test_support::blob::MemoryBlobStore>) {
+        let mem = Arc::new(crate::test_support::blob::MemoryBlobStore::default());
+        let storage = OrgStorage::new(
+            0,
+            crate::org_storage::StorageMode::ArcoDash,
+            mem.clone(),
+            "org-root/",
+        );
+        (storage, mem)
+    }
+
+    async fn row_by_id(db: &DatabaseConnection, id: i64) -> Option<dashboard_narrative::Model> {
+        dashboard_narrative::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn narrative_row_has_no_content_columns() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let (storage, _) = test_storage();
+        let (row, _) = store(
+            &db,
+            &storage,
+            f.org_id,
+            f.dash.id,
+            Some(f.user_id),
+            "manual",
+            &narr("secret"),
+            &Digest::default(),
+            "m",
+        )
+        .await
+        .unwrap();
+        let row = row_by_id(&db, row.id).await.unwrap();
+        assert!(row.summary.is_none() && row.highlights.is_none());
+        assert!(row.body.is_none() && row.digest.is_none());
+        let rel = format!("{}/{}.json", f.dash.id, row.id);
+        assert_eq!(row.data_location.as_deref(), Some(rel.as_str()));
+        let obj = storage.get(StorageArea::Narratives, &rel).await.unwrap();
+        let content: NarrativeContent = serde_json::from_slice(&obj).unwrap();
+        assert_eq!(content.summary, "secret");
+        assert_eq!(content.body.as_deref(), Some("body of secret"));
+    }
+
+    #[tokio::test]
+    async fn narrative_loads_from_storage() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let (storage, _) = test_storage();
+        let (row, stored) = store(
+            &db,
+            &storage,
+            f.org_id,
+            f.dash.id,
+            Some(f.user_id),
+            "manual",
+            &narr("a"),
+            &Digest::default(),
+            "m",
+        )
+        .await
+        .unwrap();
+        let loaded = load_narrative_content(&storage, &row)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, stored);
+
+        let mut legacy = row.clone();
+        legacy.data_location = None;
+        legacy.summary = Some("inline".into());
+        legacy.body = Some("inline body".into());
+        let loaded = load_narrative_content(&storage, &legacy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.summary, "inline");
+        assert_eq!(loaded.highlights, json!([]));
+
+        storage
+            .delete(
+                StorageArea::Narratives,
+                row.data_location.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(load_narrative_content(&storage, &row)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn narrative_store_put_failure_removes_row() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let storage = OrgStorage::new(
+            0,
+            crate::org_storage::StorageMode::ArcoDash,
+            Arc::new(crate::test_support::blob::FailingBlobStore::default()),
+            "org-root/",
+        );
+        let err = store(
+            &db,
+            &storage,
+            f.org_id,
+            f.dash.id,
+            Some(f.user_id),
+            "manual",
+            &narr("a"),
+            &Digest::default(),
+            "m",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, NarrativeError::Storage(_)));
+        let n = dashboard_narrative::Entity::find()
+            .filter(dashboard_narrative::Column::DashboardId.eq(f.dash.id))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn narrative_prune_deletes_pruned_objects() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let (storage, mem) = test_storage();
+        let mut ids = Vec::new();
+        for i in 0..=KEEP_PER_DASHBOARD {
+            let (row, _) = store(
+                &db,
+                &storage,
+                f.org_id,
+                f.dash.id,
+                Some(f.user_id),
+                "manual",
+                &narr(&format!("n{i}")),
+                &Digest::default(),
+                "m",
+            )
+            .await
+            .unwrap();
+            ids.push(row.id);
+        }
+        let key =
+            |id: i64| storage.key(StorageArea::Narratives, &format!("{}/{id}.json", f.dash.id));
+        let keys = mem.keys();
+        assert!(!keys.contains(&key(ids[0])));
+        assert!(row_by_id(&db, ids[0]).await.is_none());
+        assert!(keys.contains(&key(ids[1])));
+        assert_eq!(keys.len() as u64, KEEP_PER_DASHBOARD);
     }
 
     fn live_widget(

@@ -47,16 +47,16 @@ pub struct NarrativeResponse {
     pub model: String,
 }
 
-impl From<dashboard_narrative::Model> for NarrativeResponse {
-    fn from(m: dashboard_narrative::Model) -> Self {
+impl NarrativeResponse {
+    fn new(m: dashboard_narrative::Model, c: narrative::NarrativeContent) -> Self {
         Self {
             id: m.id,
             dashboard_id: m.dashboard_id,
             created_at: m.created_at.with_timezone(&Utc),
             source: m.source,
-            summary: m.summary.unwrap_or_default(),
-            highlights: m.highlights.unwrap_or_else(|| serde_json::json!([])),
-            body: m.body,
+            summary: c.summary,
+            highlights: c.highlights,
+            body: c.body,
             confidence: m.confidence,
             model: m.model,
         }
@@ -175,13 +175,14 @@ pub async fn explain_dashboard(
         .filter_map(|(q, ok)| ok.then_some(q))
         .collect();
 
+    let storage = state.storage.resolve(&state.db, org.id).await?;
     let digest =
         narrative::build_digest(&db, &state.db, &*state.storage, org.id, &widgets, &readable)
             .await?;
     if digest.widgets.is_empty() {
         return Ok(failed(EMPTY_MESSAGE));
     }
-    let previous = narrative::previous_digest(&db, dash.id, &digest, &readable).await?;
+    let previous = narrative::previous_digest(&db, &storage, dash.id, &digest, &readable).await?;
     let prompt = narrative::build_prompt(&dash.name, &digest, previous.as_ref());
 
     scope.detach(db).await?;
@@ -211,8 +212,9 @@ pub async fn explain_dashboard(
     };
 
     let txn = scope.begin(&org).await?;
-    let row = narrative::store(
+    let (row, content) = match narrative::store(
         txn.db(),
+        &storage,
         org.id,
         dash.id,
         Some(user.id),
@@ -221,11 +223,20 @@ pub async fn explain_dashboard(
         &digest,
         &model,
     )
-    .await?;
+    .await
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            if let narrative::NarrativeError::Storage(se) = &e {
+                narrative::report_unreachable(&*state.storage, &state.db, org.id, se).await;
+            }
+            return Err(e.into());
+        }
+    };
     txn.commit().await?;
 
     Ok(Json(ExplainDashboardResponse::Ok {
-        narrative: row.into(),
+        narrative: NarrativeResponse::new(row, content),
     }))
 }
 
@@ -236,6 +247,7 @@ pub struct LatestNarrativeResponse {
 
 /// `GET /api/dashboards/{id}/narrative` — the caller's own newest narrative, or 404.
 pub async fn latest_narrative(
+    State(state): State<AppState>,
     db: Db,
     CurrentOrg(org): CurrentOrg,
     CurrentUser(user): CurrentUser,
@@ -245,7 +257,16 @@ pub async fn latest_narrative(
     let row = narrative::latest_for_user(&db, dash.id, user.id)
         .await?
         .ok_or_else(|| ApiError::not_found("no narrative yet"))?;
+    let storage = state.storage.resolve(&state.db, org.id).await?;
+    let content = match narrative::load_narrative_content(&storage, &row).await {
+        Ok(c) => c,
+        Err(e) => {
+            narrative::report_unreachable(&*state.storage, &state.db, org.id, &e).await;
+            return Err(e.into());
+        }
+    }
+    .ok_or_else(|| ApiError::not_found("no narrative yet"))?;
     Ok(Json(LatestNarrativeResponse {
-        narrative: row.into(),
+        narrative: NarrativeResponse::new(row, content),
     }))
 }

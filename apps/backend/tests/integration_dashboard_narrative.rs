@@ -399,6 +399,71 @@ async fn success_persists_row_and_get_returns_it_without_digest() {
 }
 
 #[tokio::test]
+async fn dashboard_narrative_endpoint_reads_from_storage() {
+    use arcodash_core::org_storage::{StorageArea, StorageError};
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let admin = app.admin_client().await;
+    let org = org_id(&app).await;
+    let uid = admin_id(&app).await;
+    let (stub, _) = spawn_stub().await;
+    configure(&admin, &app.address, &stub, json!({})).await;
+    let d = new_dashboard(&app, org, uid).await;
+    let ds = new_ds(&app, org).await;
+    add_widget(&app, org, uid, ds, d.id, "Rev", 100, 0).await;
+
+    reset_rate_limit(&app, org, uid).await;
+    let posted = post_json(&app, &admin, d.id).await;
+    assert_eq!(posted["status"], "ok", "{posted}");
+
+    let row = dashboard_narrative::Entity::find()
+        .filter(dashboard_narrative::Column::DashboardId.eq(d.id))
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.summary.is_none() && row.body.is_none() && row.digest.is_none());
+    let rel = row.data_location.clone().expect("content location");
+    let storage = app.state.storage.resolve(&app.db, org).await.unwrap();
+
+    let stored: Value =
+        serde_json::from_slice(&storage.get(StorageArea::Narratives, &rel).await.unwrap()).unwrap();
+    let mut edited = stored.clone();
+    edited["summary"] = json!("Read from the object.");
+    storage
+        .put(
+            StorageArea::Narratives,
+            &rel,
+            serde_json::to_vec(&edited).unwrap().into(),
+            "application/json",
+        )
+        .await
+        .unwrap();
+
+    let get = || async {
+        admin
+            .get(url(
+                &app,
+                &format!("/api/dashboards/{}/narrative", d.id),
+                None,
+            ))
+            .send()
+            .await
+            .unwrap()
+    };
+    let got: Value = get().await.json().await.unwrap();
+    assert_eq!(got["narrative"]["summary"], "Read from the object.");
+    assert!(got["narrative"].get("digest").is_none());
+
+    storage.delete(StorageArea::Narratives, &rel).await.unwrap();
+    assert!(matches!(
+        storage.get(StorageArea::Narratives, &rel).await,
+        Err(StorageError::NotFound)
+    ));
+    assert_eq!(get().await.status(), 404);
+}
+
+#[tokio::test]
 async fn get_hides_another_users_row() {
     let app = skip_if_none!(spawn_app().await);
     app.cleanup().await;

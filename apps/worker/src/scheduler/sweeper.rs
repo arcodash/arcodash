@@ -8,7 +8,9 @@ use sea_orm::{
     Statement, TransactionTrait,
 };
 
-use arcodash_core::entities::{data_source_upload, monitor, run};
+use arcodash_core::entities::{data_source_upload, mail_delivery, monitor, run};
+use arcodash_core::mail_notify::load_body;
+use arcodash_core::org_storage::{OrgStorage, StorageArea, StorageError};
 use arcodash_core::queue::{JobMessage, QueueName};
 
 use crate::delivery_lifecycle;
@@ -630,14 +632,14 @@ pub async fn requeue_stale_pending_notifications(ctx: &ExecuteQueryContext) -> u
     reclaimed
 }
 
-/// Same recovery for `mail_deliveries` (`pending` and `retrying`); the full `send_mail` payload lives
-/// in the row.
+/// Same recovery for `mail_deliveries` (`pending` and `retrying`); the `send_mail` body is loaded
+/// from object storage (or the legacy inline column).
 pub async fn requeue_stale_pending_mail(ctx: &ExecuteQueryContext) -> usize {
     let Some(rows) = load_batch(
         &ctx.db,
         Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id, org_id, task_type, entity_id, to_email, subject, body_html \
+            "SELECT id, org_id, task_type, entity_id, to_email, subject, body_html, body_location \
              FROM mail_deliveries \
              WHERE lease_expires_at IS NULL \
                AND ((status = 'pending' \
@@ -659,6 +661,7 @@ pub async fn requeue_stale_pending_mail(ctx: &ExecuteQueryContext) -> usize {
     };
 
     let mut reclaimed = 0usize;
+    let mut storages: std::collections::HashMap<i64, OrgStorage> = std::collections::HashMap::new();
     for row in rows {
         let Ok(id) = row.try_get::<i64>("", "id") else {
             tracing::error!(
@@ -693,16 +696,70 @@ pub async fn requeue_stale_pending_mail(ctx: &ExecuteQueryContext) -> usize {
                 }
             }
             "send_mail" => {
-                let (Ok(Some(to)), Ok(Some(subject)), Ok(Some(body_html))) = (
+                let (Ok(Some(to)), Ok(Some(subject))) = (
                     row.try_get::<Option<String>>("", "to_email"),
                     row.try_get::<Option<String>>("", "subject"),
-                    row.try_get::<Option<String>>("", "body_html"),
                 ) else {
                     tracing::warn!(
                         delivery_id = id,
                         "sweeper: send_mail row missing payload, cannot recover"
                     );
                     continue;
+                };
+                let storage = match storages.entry(org_id) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        match ctx.storage.resolve(&ctx.db, org_id).await {
+                            Ok(s) => v.insert(s),
+                            Err(e) => {
+                                tracing::warn!(delivery_id = id, org_id, error = %e, "sweeper: send_mail storage unavailable, retrying next sweep");
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let mut location = row
+                    .try_get::<Option<String>>("", "body_location")
+                    .ok()
+                    .flatten();
+                let inline = row
+                    .try_get::<Option<String>>("", "body_html")
+                    .ok()
+                    .flatten();
+                let probed_key = arcodash_core::mail_notify::mail_body_key(id);
+                let probing = location.is_none() && inline.is_none();
+                if probing {
+                    location = Some(probed_key.clone());
+                }
+                let body_html = match load_body(storage, location.as_deref(), inline.as_deref())
+                    .await
+                {
+                    Ok(b) => {
+                        if probing {
+                            if let Err(e) =
+                                mail_delivery::set_body_location(&ctx.db, id, &probed_key).await
+                            {
+                                tracing::warn!(delivery_id = id, error = %e, "sweeper: failed to record a rescued mail body location");
+                            }
+                        }
+                        b
+                    }
+                    Err(StorageError::NotFound) => {
+                        tracing::warn!(
+                            delivery_id = id,
+                            "sweeper: send_mail body missing, marking failed"
+                        );
+                        mail_delivery::fail_body_missing(&ctx.db, id).await;
+                        if let Err(e) = storage.delete(StorageArea::Emails, &probed_key).await {
+                            tracing::warn!(delivery_id = id, error = %e, "sweeper: failed to delete a failed mail's body object");
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        ctx.storage.report_failure(&ctx.db, org_id, &e).await;
+                        tracing::warn!(delivery_id = id, org_id, error = %e, "sweeper: send_mail body unavailable, retrying next sweep");
+                        continue;
+                    }
                 };
                 JobMessage::SendMail {
                     org_id,
@@ -2649,7 +2706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_stale_pending_mail_rebuilds_send_mail_with_full_payload() {
+    async fn requeue_stale_pending_mail_loads_body_from_storage() {
         let Some((db, redis)) = setup().await else {
             eprintln!("skipping: TEST_DATABASE_URL not set");
             return;
@@ -2660,16 +2717,31 @@ mod tests {
         let to = format!("stale-mail-{suffix}@test.local");
         let subject = "stale subject".to_string();
         let body_html = "<p>stale body</p>".to_string();
-        let delivery_id =
-            mail_delivery::insert_pending_mail(&db, org.id, &to, &subject, &body_html)
-                .await
-                .unwrap();
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let storage = ctx.storage.resolve(&db, org.id).await.unwrap();
+        let delivery_id = arcodash_core::mail_notify::enqueue_send_mail(
+            &db,
+            &storage,
+            &arcodash_core::test_support::RecordingQueue::default(),
+            None,
+            org.id,
+            to.clone(),
+            subject.clone(),
+            body_html.clone(),
+        )
+        .await
+        .unwrap();
+        let row = mail_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.body_html, None);
         backdate_created_at(&db, "mail_deliveries", delivery_id, STALE_PENDING_SECS + 30).await;
 
         let key = queue::QueueName::Default.queue_key();
         drain(&redis, &key).await;
 
-        let ctx = test_ctx(db.clone(), redis.clone());
         requeue_stale_pending_mail(&ctx).await;
 
         let job = find_and_remove_job(&redis, &key, |j| {
@@ -2692,6 +2764,78 @@ mod tests {
             }
             other => panic!("expected SendMail, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn requeue_stale_pending_mail_rescues_orphaned_body() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(&db, &format!("org-mail-orphan-{suffix}")).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let storage = ctx.storage.resolve(&db, org.id).await.unwrap();
+        let delivery_id = mail_delivery::insert_pending_mail(&db, org.id, "to@test.local", "s")
+            .await
+            .unwrap();
+        let rel = arcodash_core::mail_notify::mail_body_key(delivery_id);
+        storage
+            .put(
+                StorageArea::Emails,
+                &rel,
+                "<p>orphan</p>".as_bytes().to_vec().into(),
+                "text/html; charset=utf-8",
+            )
+            .await
+            .unwrap();
+        backdate_created_at(&db, "mail_deliveries", delivery_id, STALE_PENDING_SECS + 30).await;
+
+        let key = queue::QueueName::Default.queue_key();
+        drain(&redis, &key).await;
+        requeue_stale_pending_mail(&ctx).await;
+
+        let job = find_and_remove_job(&redis, &key, |j| {
+            matches!(j, queue::JobMessage::SendMail { delivery_id: Some(id), .. } if *id == delivery_id)
+        })
+        .await
+        .expect("an orphaned body must be rescued and the mail re-enqueued");
+        match job {
+            queue::JobMessage::SendMail { body_html, .. } => {
+                assert_eq!(body_html, "<p>orphan</p>");
+            }
+            other => panic!("expected SendMail, got {other:?}"),
+        }
+        let row = mail_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.body_location.as_deref(), Some(rel.as_str()));
+        assert_eq!(row.status, "pending");
+        let _ = storage.delete(StorageArea::Emails, &rel).await;
+    }
+
+    #[tokio::test]
+    async fn requeue_stale_pending_mail_fails_row_whose_body_is_gone() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(&db, &format!("org-mail-body-gone-{suffix}")).await;
+        let delivery_id = mail_delivery::insert_pending_mail(&db, org.id, "to@test.local", "s")
+            .await
+            .unwrap();
+        backdate_created_at(&db, "mail_deliveries", delivery_id, STALE_PENDING_SECS + 30).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        requeue_stale_pending_mail(&ctx).await;
+        let row = mail_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
     }
 
     /// Moves a `mail_deliveries` row to `retrying` with a backdated `started_at` and no live lease.

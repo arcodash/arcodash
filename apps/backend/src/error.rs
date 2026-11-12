@@ -174,6 +174,16 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl From<arcodash_core::ai::narrative::NarrativeError> for ApiError {
+    fn from(err: arcodash_core::ai::narrative::NarrativeError) -> Self {
+        use arcodash_core::ai::narrative::NarrativeError;
+        match err {
+            NarrativeError::Db(e) => e.into(),
+            NarrativeError::Storage(e) => e.into(),
+        }
+    }
+}
+
 impl From<arcodash_core::org_storage::StorageError> for ApiError {
     fn from(err: arcodash_core::org_storage::StorageError) -> Self {
         use arcodash_core::org_storage::StorageError;

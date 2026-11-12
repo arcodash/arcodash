@@ -8,8 +8,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use arcodash_conveyor::{TaskContext, TaskOutcome, TaskResult, TypedTaskHandler};
-use arcodash_core::mail_notify::SendMailPayload;
+use arcodash_core::entities::mail_delivery;
+use arcodash_core::mail_notify::{load_mail_body, SendMailPayload};
 use arcodash_core::mailer::MailOutcome;
+use arcodash_core::org_storage::StorageError;
+use sea_orm::EntityTrait;
 
 use crate::delivery_lifecycle::{self, MAIL_DELIVERIES};
 use crate::handlers::execute_query::{send_email, ExecuteQueryContext};
@@ -100,12 +103,19 @@ impl TypedTaskHandler for SendMailHandler {
     type Payload = SendMailPayload;
 
     async fn run(&self, task: TaskContext, p: SendMailPayload) -> TaskResult {
+        let body_html = match p.body_html {
+            Some(b) => b,
+            None => match self.load_stored_body(&task, p.org_id).await {
+                Ok(b) => b,
+                Err(outcome) => return Ok(outcome),
+            },
+        };
         let result = deliver(
             &self.ctx,
             p.org_id,
             p.to,
             p.subject,
-            p.body_html,
+            body_html,
             task.entity_id,
         )
         .await;
@@ -115,6 +125,44 @@ impl TypedTaskHandler for SendMailHandler {
                 error: format!("{e:#}"),
             },
         })
+    }
+}
+
+impl SendMailHandler {
+    /// The body stored for the task's delivery row; `Err` carries the outcome to return instead.
+    async fn load_stored_body(
+        &self,
+        task: &TaskContext,
+        org_id: i64,
+    ) -> Result<String, TaskOutcome> {
+        let failed = |error: String| TaskOutcome::Failed { error };
+        let Some(id) = task.entity_id else {
+            return Err(failed("send_mail task has no delivery id".to_string()));
+        };
+        let ctx = &self.ctx;
+        let row = mail_delivery::Entity::find_by_id(id)
+            .one(&ctx.db)
+            .await
+            .map_err(|e| failed(format!("{e:#}")))?
+            .ok_or_else(|| failed(format!("mail delivery {id} not found")))?;
+        let storage = ctx
+            .storage
+            .resolve(&ctx.db, org_id)
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+        match load_mail_body(&storage, &row).await {
+            Ok(b) => Ok(b),
+            Err(StorageError::NotFound) => {
+                mail_delivery::fail_body_missing(&ctx.db, id).await;
+                Err(failed("mail body not found in storage".to_string()))
+            }
+            Err(e) => {
+                if matches!(e, StorageError::Unreachable { .. }) {
+                    ctx.storage.report_failure(&ctx.db, org_id, &e).await;
+                }
+                Err(failed(e.to_string()))
+            }
+        }
     }
 }
 
@@ -128,7 +176,7 @@ mod tests {
     use arcodash_core::mail_notify::enqueue_send_mail;
     use arcodash_core::queue::ValkeyQueue;
     use redis::AsyncCommands;
-    use sea_orm::EntityTrait;
+    use sea_orm::ConnectionTrait;
 
     /// `enqueue_send_mail` inserts the durable row before the LPUSH, then a real dispatch through
     /// `consumer::dispatch` claims it. No mailer is configured in this test process, so
@@ -154,8 +202,10 @@ mod tests {
             .is_some()
         {}
 
+        let storage = ctx.storage.resolve(&db, org.id).await.unwrap();
         let delivery_id = enqueue_send_mail(
             &db,
+            &storage,
             &queue,
             None,
             org.id,
@@ -208,7 +258,7 @@ mod tests {
         let ctx = Arc::new(test_ctx(db.clone(), redis.clone()));
 
         let delivery_id =
-            mail_delivery::insert_pending_mail(&db, org.id, "to@test.local", "subject", "body")
+            mail_delivery::insert_pending_mail(&db, org.id, "to@test.local", "subject")
                 .await
                 .unwrap();
 
@@ -227,7 +277,7 @@ mod tests {
             org_id: org.id,
             to: "to@test.local".to_string(),
             subject: "subject".to_string(),
-            body_html: "body".to_string(),
+            body_html: Some("body".to_string()),
         })
         .unwrap();
 
@@ -266,5 +316,153 @@ mod tests {
         assert_eq!(row.status, "skipped");
         assert!(row.finished_at.is_some());
         assert!(row.lease_expires_at.is_none());
+    }
+    fn conveyor_for(
+        db: &sea_orm::DatabaseConnection,
+        redis: &redis::aio::ConnectionManager,
+        ctx: &Arc<ExecuteQueryContext>,
+    ) -> Arc<arcodash_conveyor::Conveyor> {
+        let redis_url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL required");
+        arcodash_conveyor::ConveyorBuilder::new(db.clone(), redis.clone(), redis_url)
+            .register("send_mail", SendMailHandler { ctx: ctx.clone() })
+            .tier("email", &["send_mail"], 4)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn conveyor_send_mail_payload_carries_no_body() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(&db, &format!("org-mail-nobody-{suffix}")).await;
+        let ctx = Arc::new(test_ctx(db.clone(), redis.clone()));
+        let conveyor = conveyor_for(&db, &redis, &ctx);
+        let storage = ctx.storage.resolve(&db, org.id).await.unwrap();
+        let marker = format!("secret-body-{suffix}");
+
+        std::env::set_var("CONVEYOR_SEND_MAIL_ENABLED", "true");
+        let enqueued = enqueue_send_mail(
+            &db,
+            &storage,
+            &ValkeyQueue::new(redis.clone()),
+            Some(&*conveyor),
+            org.id,
+            "to@test.local".to_string(),
+            "subject".to_string(),
+            marker.clone(),
+        )
+        .await;
+        std::env::remove_var("CONVEYOR_SEND_MAIL_ENABLED");
+        let delivery_id = enqueued.unwrap();
+
+        let rows = db
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT payload::text AS payload FROM conveyor_tasks \
+                 WHERE task_type = 'send_mail' AND entity_id = $1",
+                [delivery_id.into()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the delivery must have one conveyor task");
+        let text: String = rows[0].try_get("", "payload").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(payload.get("body_html").is_none());
+        assert!(!text.contains(&marker));
+    }
+
+    #[tokio::test]
+    async fn conveyor_send_mail_handler_delivers_stored_body() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let mailpit =
+            std::env::var("MAILPIT_API_BASE").unwrap_or_else(|_| "http://localhost:8026".into());
+        let http = reqwest::Client::new();
+        if http
+            .get(format!("{mailpit}/api/v1/info"))
+            .send()
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: Mailpit not reachable at {mailpit}");
+            return;
+        }
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(&db, &format!("org-mail-handler-{suffix}")).await;
+        let mut ctx = test_ctx(db.clone(), redis.clone());
+        ctx.mailer = Some(Arc::new(
+            arcodash_core::mailer::Mailer::builder_dangerous("localhost")
+                .port(1026)
+                .build(),
+        ));
+        let ctx = Arc::new(ctx);
+        let storage = ctx.storage.resolve(&db, org.id).await.unwrap();
+        let to = format!("stored-body-{suffix}@test.local");
+        let marker = format!("stored-body-marker-{suffix}");
+        let delivery_id = enqueue_send_mail(
+            &db,
+            &storage,
+            &ValkeyQueue::new(redis.clone()),
+            None,
+            org.id,
+            to.clone(),
+            "stored".to_string(),
+            marker.clone(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = SendMailHandler { ctx: ctx.clone() }
+            .run(
+                arcodash_conveyor::TaskContext {
+                    task_id: arcodash_conveyor::TaskId(0),
+                    task_type: "send_mail".into(),
+                    attempt: 1,
+                    tenant_id: Some(org.id),
+                    entity_id: Some(delivery_id),
+                },
+                SendMailPayload {
+                    org_id: org.id,
+                    to: to.clone(),
+                    subject: "stored".to_string(),
+                    body_html: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, TaskOutcome::Success { .. }));
+
+        let row = mail_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "sent");
+
+        let search: serde_json::Value = http
+            .get(format!("{mailpit}/api/v1/search"))
+            .query(&[("query", format!("to:{to}"))])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = search["messages"][0]["ID"]
+            .as_str()
+            .expect("the mail must reach Mailpit");
+        let message: serde_json::Value = http
+            .get(format!("{mailpit}/api/v1/message/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(message["Text"].as_str().unwrap().contains(&marker));
     }
 }

@@ -335,7 +335,8 @@ async fn brief_for(
     if current.widgets.is_empty() {
         anyhow::bail!("no readable widgets");
     }
-    let previous = narrative::previous_digest(&ctx.db, d.id, &current, &readable).await?;
+    let storage = ctx.storage.resolve(&ctx.db, org.id).await?;
+    let previous = narrative::previous_digest(&ctx.db, &storage, d.id, &current, &readable).await?;
     let prompt = narrative::build_prompt(&d.name, &current, previous.as_ref());
     let sink = DbAttemptSink::new(&ctx.db, org.clone(), Some(user.id));
     let (_, model, outcome) = narrative::generate(
@@ -350,8 +351,9 @@ async fn brief_for(
     )
     .await;
     let n = outcome.map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    narrative::store(
+    if let Err(e) = narrative::store(
         &ctx.db,
+        &storage,
         org.id,
         d.id,
         Some(user.id),
@@ -360,7 +362,13 @@ async fn brief_for(
         &current,
         &model,
     )
-    .await?;
+    .await
+    {
+        if let narrative::NarrativeError::Storage(se) = &e {
+            narrative::report_unreachable(&*ctx.storage, &ctx.db, org.id, se).await;
+        }
+        tracing::warn!(dashboard_id = d.id, error = %e, "send_digest: failed to store the generated narrative");
+    }
     Ok(n.summary)
 }
 
