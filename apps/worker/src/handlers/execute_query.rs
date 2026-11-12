@@ -1,5 +1,5 @@
-//! `execute_query` handler. Results go inline into `query_results.data`; connectors that opt into
-//! auto-limit get `LIMIT max_rows + 1` appended and the sentinel row is trimmed and flagged as
+//! `execute_query` handler. Results are written as gzip JSON objects to the organization's storage
+//! (`query_results.data_location` points at them); connectors that opt into auto-limit get `LIMIT max_rows + 1` appended and the sentinel row is trimmed and flagged as
 //! `data.truncated`.
 //!
 //! Cancellation: the Redis flag `job:<id>:cancel` is checked before start and polled while the
@@ -29,6 +29,7 @@ use arcodash_core::hash::gen_query_hash;
 use arcodash_core::mailer::Mailer;
 use arcodash_core::query_exec::ExecuteQueryPayload;
 use arcodash_core::queue::{self, JobStatus, Queue};
+use arcodash_core::result_store::save_result;
 use arcodash_core::secrets;
 
 use crate::run_lifecycle::{self, RunOutcome, RunStatus};
@@ -61,7 +62,6 @@ pub struct ExecuteQueryContext {
     /// Per-org gating of background work and AI features.
     pub entitlements: Arc<dyn arcodash_core::entitlements::OrgEntitlements>,
     /// Resolves an organization's object storage.
-    #[expect(dead_code, reason = "read by the result write path")]
     pub storage: Arc<dyn arcodash_core::org_storage::OrgStorageResolver>,
 }
 
@@ -526,6 +526,9 @@ async fn run_query(
         );
     }
 
+    // Resolved before querying so a warehouse run is never spent on a result that can't be stored.
+    let storage = ctx.storage.resolve(&ctx.db, job.org_id).await?;
+
     let effective_max_rows = job
         .max_rows
         .unwrap_or(ctx.max_query_rows)
@@ -594,24 +597,27 @@ async fn run_query(
             existing
         }
         Some(existing) => {
+            let stored = save_result(&storage, job.data_source_id, &query_hash, &data).await?;
             let mut active: query_result::ActiveModel = existing.into();
             active.query = Set(job.query_text.clone());
-            active.data = Set(Some(data));
-            active.data_location = Set(None);
-            active.data_size_bytes = Set(None);
+            active.data = Set(None);
+            active.data_location = Set(Some(stored.location));
+            active.data_size_bytes = Set(Some(stored.size_bytes));
             active.runtime = Set(Some(result.runtime_seconds));
             active.retrieved_at = Set(retrieved_at.into());
+            active.last_used_at = Set(retrieved_at.into());
             active.update(&txn).await?
         }
         None => {
+            let stored = save_result(&storage, job.data_source_id, &query_hash, &data).await?;
             let active = query_result::ActiveModel {
                 org_id: Set(job.org_id),
                 data_source_id: Set(job.data_source_id),
                 query_hash: Set(query_hash),
                 query: Set(job.query_text.clone()),
-                data: Set(Some(data)),
-                data_location: Set(None),
-                data_size_bytes: Set(None),
+                data: Set(None),
+                data_location: Set(Some(stored.location)),
+                data_size_bytes: Set(Some(stored.size_bytes)),
                 runtime: Set(Some(result.runtime_seconds)),
                 retrieved_at: Set(retrieved_at.into()),
                 last_used_at: Set(retrieved_at.into()),
@@ -1710,12 +1716,161 @@ mod auto_limit_truncation_tests {
         }
     }
 
+    /// Reads a freshly written result back from the context's object storage.
+    async fn stored_result(ctx: &ExecuteQueryContext, qr: &query_result::Model) -> Value {
+        let storage = ctx.storage.resolve(&ctx.db, qr.org_id).await.unwrap();
+        let loc = qr.data_location.as_deref().expect("data_location set");
+        let bytes = storage
+            .get(arcodash_core::org_storage::StorageArea::Results, loc)
+            .await
+            .unwrap();
+        arcodash_core::result_store::decode_result(&bytes).unwrap()
+    }
+
     fn job(org_id: i64, data_source_id: i64) -> ExecuteQueryPayload {
         test_job(
             format!("auto-limit-test-{}", uuid::Uuid::new_v4()),
             org_id,
             data_source_id,
         )
+    }
+
+    fn ctx_with_store(
+        ctx: ExecuteQueryContext,
+        store: Arc<dyn arcodash_core::org_storage::BlobStore>,
+    ) -> ExecuteQueryContext {
+        ExecuteQueryContext {
+            storage: Arc::new(
+                arcodash_core::test_support::blob::StaticResolver::with_store(
+                    arcodash_core::org_storage::StorageMode::ArcoDash,
+                    store,
+                    "orgs/test/",
+                ),
+            ),
+            ..ctx
+        }
+    }
+
+    async fn result_rows(
+        db: &sea_orm::DatabaseConnection,
+        org_id: i64,
+        ds_id: i64,
+    ) -> Vec<query_result::Model> {
+        query_result::Entity::find()
+            .filter(query_result::Column::OrgId.eq(org_id))
+            .filter(query_result::Column::DataSourceId.eq(ds_id))
+            .all(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn execute_query_stores_object_and_null_inline_data() {
+        use arcodash_core::test_support::blob::MemoryBlobStore;
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("store-obj-{}", uuid::Uuid::new_v4())).await;
+        let mut registry = ConnectorRegistry::new();
+        registry.register(Arc::new(StubConnector::new("store-obj-stub", 3)));
+        let ds = seed_data_source_of_type(&db, org.id, "store-obj-stub").await;
+        let mem = Arc::new(MemoryBlobStore::default());
+        let ctx = ctx_with_store(
+            ctx_with_registry(db.clone(), redis, registry, 100),
+            mem.clone(),
+        );
+
+        let outcome = run_query(&ctx, &job(org.id, ds.id), None)
+            .await
+            .unwrap()
+            .expect("not cancelled");
+        let saved = query_result::Entity::find_by_id(outcome.query_result_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(saved.data.is_none());
+        let loc = saved.data_location.clone().expect("data_location set");
+        assert!(saved.data_size_bytes.unwrap() > 0);
+        assert_eq!(saved.last_used_at, saved.retrieved_at);
+        assert_eq!(mem.keys(), [format!("orgs/test/results/{loc}")]);
+        let data = stored_result(&ctx, &saved).await;
+        assert_eq!(data["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(data["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn execute_query_put_failure_persists_no_row() {
+        use arcodash_core::test_support::blob::FailingBlobStore;
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("store-fail-{}", uuid::Uuid::new_v4())).await;
+        let mut registry = ConnectorRegistry::new();
+        registry.register(Arc::new(StubConnector::new("store-fail-stub", 2)));
+        let ds = seed_data_source_of_type(&db, org.id, "store-fail-stub").await;
+        let store = Arc::new(FailingBlobStore::new("AccessDenied"));
+        let ctx = ctx_with_store(
+            ctx_with_registry(db.clone(), redis, registry, 100),
+            store.clone(),
+        );
+
+        let Err(err) = run_query(&ctx, &job(org.id, ds.id), None).await else {
+            panic!("a failed put must fail the run");
+        };
+        assert!(err.to_string().contains("AccessDenied"), "{err}");
+        assert_eq!(store.puts(), 1);
+        assert!(result_rows(&db, org.id, ds.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseded_run_does_not_overwrite_newer_object() {
+        use arcodash_core::test_support::blob::MemoryBlobStore;
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("store-super-{}", uuid::Uuid::new_v4())).await;
+        let mut registry = ConnectorRegistry::new();
+        registry.register(Arc::new(StubConnector::new("store-super-stub", 1)));
+        let ds = seed_data_source_of_type(&db, org.id, "store-super-stub").await;
+        let j = job(org.id, ds.id);
+        let future = sea_orm::prelude::DateTimeWithTimeZone::from(
+            chrono::Utc::now() + chrono::Duration::seconds(5),
+        );
+        query_result::ActiveModel {
+            org_id: Set(org.id),
+            data_source_id: Set(ds.id),
+            query_hash: Set(gen_query_hash(&j.query_text, &j.parameters)),
+            query: Set("newer".to_string()),
+            data: Set(None),
+            data_location: Set(Some("newer.json.gz".to_string())),
+            data_size_bytes: Set(Some(1)),
+            runtime: Set(Some(0.0)),
+            retrieved_at: Set(future),
+            last_used_at: Set(future),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let mem = Arc::new(MemoryBlobStore::default());
+        let ctx = ctx_with_store(
+            ctx_with_registry(db.clone(), redis, registry, 100),
+            mem.clone(),
+        );
+
+        let outcome = run_query(&ctx, &j, None)
+            .await
+            .unwrap()
+            .expect("not cancelled");
+        assert!(outcome.superseded);
+        assert_eq!(mem.puts(), 0);
+        let rows = result_rows(&db, org.id, ds.id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].data_location.as_deref(), Some("newer.json.gz"));
     }
 
     /// Seed a minimal `queries` row for a job to bind to.
@@ -1849,7 +2004,7 @@ mod auto_limit_truncation_tests {
             .await
             .unwrap()
             .unwrap();
-        let data = saved.data.unwrap();
+        let data = stored_result(&ctx, &saved).await;
         assert_eq!(data["truncated"], true);
         assert_eq!(
             data["rows"].as_array().unwrap().len(),
@@ -1887,7 +2042,7 @@ mod auto_limit_truncation_tests {
             .await
             .unwrap()
             .unwrap();
-        let truncated = saved.data.unwrap()["truncated"] == true;
+        let truncated = stored_result(&ctx, &saved).await["truncated"] == true;
         (outcome.row_count, truncated)
     }
 
@@ -1938,7 +2093,7 @@ mod auto_limit_truncation_tests {
             .await
             .unwrap()
             .unwrap();
-        let data = saved.data.unwrap();
+        let data = stored_result(&ctx, &saved).await;
         assert_eq!(data["truncated"], false);
         assert_eq!(data["rows"].as_array().unwrap().len(), max_rows as usize);
     }
@@ -1975,7 +2130,7 @@ mod auto_limit_truncation_tests {
             .await
             .unwrap()
             .unwrap();
-        let data = saved.data.unwrap();
+        let data = stored_result(&ctx, &saved).await;
         assert_eq!(data["truncated"], false);
         assert_eq!(
             data["rows"].as_array().unwrap().len(),

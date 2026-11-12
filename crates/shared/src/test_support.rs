@@ -617,6 +617,7 @@ pub mod blob {
     }
 
     impl FailingBlobStore {
+        #[must_use]
         pub fn new(detail: &str) -> Self {
             Self {
                 detail: detail.to_string(),

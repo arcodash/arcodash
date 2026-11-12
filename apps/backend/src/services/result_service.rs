@@ -1,8 +1,8 @@
 //! `query_results` fetch: `GET /api/query_results/<id>` and `GET /api/queries/<id>/results`
 //! (latest, no execution). No HTTP types here.
 //!
-//! No external object-store offload: `data_location`/`data_size_bytes` stay `NULL`, every result is
-//! stored inline in `query_results.data` (jsonb).
+//! Results are stored as gzip JSON objects via `result_store`; rows written by older versions may
+//! still hold inline `data`.
 
 use csv::WriterBuilder;
 use rust_xlsxwriter::Workbook;

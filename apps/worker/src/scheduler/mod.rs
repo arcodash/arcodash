@@ -395,9 +395,13 @@ pub(crate) mod test_support {
             conveyor: std::sync::OnceLock::new(),
             ai: None,
             entitlements: std::sync::Arc::new(arcodash_core::entitlements::Unrestricted),
-            storage: std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
-                store,
-            )),
+            storage: std::sync::Arc::new(
+                arcodash_core::test_support::blob::StaticResolver::with_store(
+                    arcodash_core::org_storage::StorageMode::ArcoDash,
+                    Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default()),
+                    "orgs/test/",
+                ),
+            ),
         }
     }
 

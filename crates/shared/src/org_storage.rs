@@ -236,7 +236,11 @@ impl OrgStorage {
     /// Like `key`, but preserves a trailing `/` on the caller's prefix.
     fn prefix_key(&self, area: StorageArea, rel_prefix: &str) -> String {
         let mut key = self.key(area, rel_prefix);
-        if (rel_prefix.ends_with('/') || sanitize_rel(rel_prefix).is_empty()) && !key.ends_with('/')
+        let sanitized = sanitize_rel(rel_prefix);
+        if (sanitized.is_empty()
+            || sanitized != rel_prefix.trim_end_matches('/')
+            || rel_prefix.ends_with('/'))
+            && !key.ends_with('/')
         {
             key.push('/');
         }
@@ -310,6 +314,18 @@ mod tests {
         }
         assert_eq!(s.delete_prefix(StorageArea::Results, "").await.unwrap(), 1);
         assert_eq!(mem.keys(), ["results-old/b"]);
+    }
+
+    #[tokio::test]
+    async fn dot_dot_prefix_never_widens_to_sibling_ids() {
+        let (s, mem) = storage(StorageMode::ArcoDash, "");
+        for k in ["results/3/a", "results/30/b"] {
+            mem.put(k, Bytes::from_static(b"x"), "text/plain")
+                .await
+                .unwrap();
+        }
+        assert_eq!(s.list(StorageArea::Results, "3/..").await.unwrap().len(), 1);
+        assert_eq!(s.list(StorageArea::Results, "3/.").await.unwrap().len(), 1);
     }
 
     #[test]
