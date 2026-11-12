@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Statement,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +22,8 @@ use super::settings::ResolvedProvider;
 use super::{AiError, AiProvider, AiProviderKind, JsonGeneration};
 use crate::authz::access::query_is_published;
 use crate::entities::{dashboard, dashboard_narrative, query, query_result, visualization, widget};
+use crate::org_storage::OrgStorageResolver;
+use crate::result_store::load_results;
 
 pub const MAX_WIDGETS: usize = 12;
 pub const MAX_ROWS: usize = 20;
@@ -254,18 +256,24 @@ fn widget_title(w: &WidgetRef) -> String {
 /// Digest of the readable widgets' cached results.
 ///
 /// Unreadable widgets are omitted entirely so neither their title nor their numbers can reach the
-/// prompt. A widget without a cached result is listed as `no data yet`. Runs one read-only lookup
-/// of the stored results.
+/// prompt. A widget without a cached result, or whose stored object is gone, is listed as
+/// `no data yet`. Runs one read-only lookup of the result rows and one batched load of their data.
+///
+/// # Errors
+///
+/// Database failure, or the storage backend being unreachable.
 #[allow(
     clippy::implicit_hasher,
     reason = "callers pass std HashSets; generic hasher adds nothing"
 )]
 pub async fn build_digest(
     db: &impl ConnectionTrait,
+    resolver_db: &DatabaseConnection,
+    resolver: &dyn OrgStorageResolver,
     org_id: i64,
     widgets: &[WidgetRef],
     readable: &HashSet<i64>,
-) -> Result<Digest, DbErr> {
+) -> anyhow::Result<Digest> {
     let visible: Vec<&WidgetRef> = widgets
         .iter()
         .filter(|w| readable.contains(&w.query.id))
@@ -277,18 +285,31 @@ pub async fn build_digest(
         .iter()
         .filter_map(|w| serving_result_id(&w.query))
         .collect();
-    let results: HashMap<i64, query_result::Model> = if ids.is_empty() {
-        HashMap::new()
+    let rows: Vec<query_result::Model> = if ids.is_empty() {
+        Vec::new()
     } else {
         query_result::Entity::find()
             .filter(query_result::Column::Id.is_in(ids))
             .filter(query_result::Column::OrgId.eq(org_id))
             .all(db)
             .await?
-            .into_iter()
-            .map(|r| (r.id, r))
-            .collect()
     };
+    // Rows under another data source than the widget serves are never shown, so skip loading them.
+    let served: HashSet<(i64, i64)> = visible
+        .iter()
+        .filter_map(|w| {
+            Some((
+                serving_result_id(&w.query)?,
+                serving_data_source_id(&w.query),
+            ))
+        })
+        .collect();
+    let rows: Vec<query_result::Model> = rows
+        .into_iter()
+        .filter(|r| served.contains(&(r.id, r.data_source_id)))
+        .collect();
+    let data = load_results(db, resolver_db, resolver, &rows).await?;
+    let results: HashMap<i64, query_result::Model> = rows.into_iter().map(|r| (r.id, r)).collect();
 
     let widgets = visible
         .iter()
@@ -296,7 +317,7 @@ pub async fn build_digest(
             let result = serving_result_id(&w.query)
                 .and_then(|id| results.get(&id))
                 .filter(|r| r.data_source_id == serving_data_source_id(&w.query))
-                .and_then(|r| r.data.as_ref().map(|d| (r, d)));
+                .and_then(|r| data.get(&r.id).map(|d| (r, d)));
             let (table, retrieved_at, status) = match result {
                 Some((r, data)) => (
                     compact(data),
@@ -890,7 +911,7 @@ mod tests {
     use crate::entities::{data_source, organization, user};
     use crate::test_support::test_db;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, PaginatorTrait};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     fn table(rows: usize, cols: usize) -> Value {
         let names: Vec<String> = (0..cols).map(|i| format!("c{i}")).collect();
@@ -1555,6 +1576,107 @@ mod tests {
         .unwrap()
     }
 
+    fn test_resolver() -> crate::test_support::blob::StaticResolver {
+        resolver_over(Arc::new(
+            crate::test_support::blob::MemoryBlobStore::default(),
+        ))
+    }
+
+    fn resolver_over_failing() -> crate::test_support::blob::StaticResolver {
+        crate::test_support::blob::StaticResolver::with_store(
+            crate::org_storage::StorageMode::ArcoDash,
+            Arc::new(crate::test_support::blob::FailingBlobStore::default()),
+            "org-root",
+        )
+    }
+
+    fn resolver_over(
+        store: Arc<crate::test_support::blob::MemoryBlobStore>,
+    ) -> crate::test_support::blob::StaticResolver {
+        crate::test_support::blob::StaticResolver::with_store(
+            crate::org_storage::StorageMode::ArcoDash,
+            store,
+            "org-root",
+        )
+    }
+
+    /// Moves the widget's inline result to an object; `write_object` false leaves it dangling.
+    async fn externalize(
+        db: &DatabaseConnection,
+        resolver: &crate::test_support::blob::StaticResolver,
+        w: &WidgetRef,
+        write_object: bool,
+    ) {
+        use crate::org_storage::OrgStorageResolver;
+        let qr = query_result::Entity::find_by_id(w.query.latest_query_data_id.unwrap())
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        let location = crate::result_store::result_rel_key(qr.data_source_id, &qr.query_hash);
+        if write_object {
+            let storage = resolver.resolve(db, qr.org_id).await.unwrap();
+            crate::result_store::save_result(
+                &storage,
+                qr.data_source_id,
+                &qr.query_hash,
+                qr.data.as_ref().unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut am: query_result::ActiveModel = qr.into();
+        am.data = Set(None);
+        am.data_location = Set(Some(location));
+        am.update(db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_digest_reads_externalized_results() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let w = add_widget(&db, &f, 0, Some(7)).await;
+        let store = Arc::new(crate::test_support::blob::MemoryBlobStore::default());
+        let resolver = resolver_over(store.clone());
+        externalize(&db, &resolver, &w, true).await;
+        assert_eq!(store.keys().len(), 1);
+        let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
+        let d = build_digest(&db, &db, &resolver, f.org_id, &ws, &all(&ws))
+            .await
+            .unwrap();
+        assert_eq!(d.widgets[0].status, "ok");
+        assert_eq!(d.widgets[0].rows, vec![vec![json!(7)]]);
+        assert!(d.widgets[0].retrieved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn build_digest_missing_object_is_no_result() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let w = add_widget(&db, &f, 0, Some(7)).await;
+        let resolver = test_resolver();
+        externalize(&db, &resolver, &w, false).await;
+        let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
+        let d = build_digest(&db, &db, &resolver, f.org_id, &ws, &all(&ws))
+            .await
+            .unwrap();
+        assert_eq!(d.widgets[0].status, "no data yet");
+        assert!(d.widgets[0].rows.is_empty());
+        assert!(d.widgets[0].retrieved_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_digest_unreachable_storage_errors() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let w = add_widget(&db, &f, 0, Some(7)).await;
+        externalize(&db, &test_resolver(), &w, false).await;
+        let failing = resolver_over_failing();
+        let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
+        let err = build_digest(&db, &db, &failing, f.org_id, &ws, &all(&ws)).await;
+        assert!(err.is_err(), "unreachable storage must not read as no data");
+    }
+
     #[tokio::test]
     async fn widget_without_result_is_no_data_yet() {
         let Some(db) = test_db().await else { return };
@@ -1562,7 +1684,9 @@ mod tests {
         add_widget(&db, &f, 0, Some(5)).await;
         add_widget(&db, &f, 1, None).await;
         let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
-        let d = build_digest(&db, f.org_id, &ws, &all(&ws)).await.unwrap();
+        let d = build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &all(&ws))
+            .await
+            .unwrap();
         assert_eq!(d.widgets[0].status, "ok");
         assert_eq!(d.widgets[0].rows, vec![vec![json!(5)]]);
         assert!(d.widgets[0].retrieved_at.is_some());
@@ -1602,7 +1726,9 @@ mod tests {
         res.data_source_id = Set(other.id);
         res.update(&db).await.unwrap();
         let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
-        let d = build_digest(&db, f.org_id, &ws, &all(&ws)).await.unwrap();
+        let d = build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &all(&ws))
+            .await
+            .unwrap();
         assert_eq!(d.widgets[0].status, "no data yet");
     }
 
@@ -1614,7 +1740,9 @@ mod tests {
             add_widget(&db, &f, row, Some(row)).await;
         }
         let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
-        let d = build_digest(&db, f.org_id, &ws, &all(&ws)).await.unwrap();
+        let d = build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &all(&ws))
+            .await
+            .unwrap();
         assert_eq!(d.widgets.len(), MAX_WIDGETS);
         assert_eq!(d.skipped, 2);
         let firsts: Vec<_> = d
@@ -1633,7 +1761,9 @@ mod tests {
         let b = add_widget(&db, &f, 1, Some(2)).await;
         let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
         let readable: HashSet<i64> = [a.query.id].into();
-        let d = build_digest(&db, f.org_id, &ws, &readable).await.unwrap();
+        let d = build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &readable)
+            .await
+            .unwrap();
         assert_eq!(d.widgets.len(), 1);
         let json = serde_json::to_string(&d).unwrap();
         assert!(!json.contains(&b.viz.name) && d.skipped == 0);
@@ -1646,7 +1776,9 @@ mod tests {
         add_widget(&db, &f, 0, Some(1)).await;
         let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
         let (runs, results) = (count(&db, "runs").await, count(&db, "query_results").await);
-        build_digest(&db, f.org_id, &ws, &all(&ws)).await.unwrap();
+        build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &all(&ws))
+            .await
+            .unwrap();
         assert_eq!(count(&db, "runs").await, runs);
         assert_eq!(count(&db, "query_results").await, results);
     }
@@ -1668,7 +1800,9 @@ mod tests {
         let b = add_widget(&db, &f, 1, Some(2)).await;
         let ws = dashboard_widgets(&db, &f.dash).await.unwrap();
         let both = all(&ws);
-        let cur = build_digest(&db, f.org_id, &ws, &both).await.unwrap();
+        let cur = build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &both)
+            .await
+            .unwrap();
 
         let mut old = cur.clone();
         old.widgets[0].rows = vec![vec![json!(100)]];
@@ -1706,7 +1840,9 @@ mod tests {
         assert_eq!(prev.widgets[0].rows, vec![vec![json!(100)]]);
 
         let only_a: HashSet<i64> = [a.query.id].into();
-        let cur_a = build_digest(&db, f.org_id, &ws, &only_a).await.unwrap();
+        let cur_a = build_digest(&db, &db, &test_resolver(), f.org_id, &ws, &only_a)
+            .await
+            .unwrap();
         let (_, prev) = previous_digest(&db, f.dash.id, &cur_a, &only_a)
             .await
             .unwrap()

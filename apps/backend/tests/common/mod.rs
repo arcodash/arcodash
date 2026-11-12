@@ -272,7 +272,13 @@ async fn build_test_state(
     mutate_config(&mut config);
     let store = test_object_store().await;
     let connectors = Arc::new(
-        arcodash_core::connectors::registry::ConnectorRegistry::with_db(db.clone(), store.clone()),
+        arcodash_core::connectors::registry::ConnectorRegistry::with_db(
+            db.clone(),
+            store.clone(),
+            std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+                store.clone(),
+            )),
+        ),
     );
     let queue =
         arcodash_core::queue::build_queue(&config, redis.clone()).expect("failed to build queue");

@@ -384,7 +384,7 @@ pub(crate) mod test_support {
             db,
             redis: redis.clone(),
             connectors: Arc::new(ConnectorRegistry::default()),
-            store: store.clone(),
+            store,
             encryption_key: [0u8; 32],
             queue: Arc::new(ValkeyQueue::new(redis)),
             mailer: None,

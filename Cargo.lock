@@ -254,6 +254,7 @@ dependencies = [
  "mongodb",
  "rand 0.8.8",
  "redis",
+ "regex",
  "reqwest",
  "rsa 0.9.10",
  "rusqlite",

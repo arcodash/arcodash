@@ -9,6 +9,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+regex = { workspace = true }
 arcodash-conveyor = { path = "../conveyor" }
 tokio = { workspace = true }
 sea-orm = { workspace = true }

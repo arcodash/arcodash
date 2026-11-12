@@ -82,7 +82,14 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("failed to ensure upload bucket exists against the storage emulator")?;
     }
-    let connectors = Arc::new(ConnectorRegistry::with_db(db.clone(), store.clone()));
+    let storage: Arc<dyn arcodash_core::org_storage::OrgStorageResolver> = Arc::new(
+        arcodash_core::org_storage::DefaultStorageResolver::new(store.clone()),
+    );
+    let connectors = Arc::new(ConnectorRegistry::with_db(
+        db.clone(),
+        store.clone(),
+        storage.clone(),
+    ));
     let queue = build_queue(&config, redis.clone()).context("failed to build job queue")?;
     // Producer-only: this process never registers a handler or consumes a tier (that's
     // `apps/worker`'s job) — it only ever calls `enqueue()`/`status()`. Built unconditionally on
@@ -101,9 +108,7 @@ async fn main() -> anyhow::Result<()> {
         entitlements: Arc::new(Unrestricted),
         reserved_org_settings_keys: Arc::new(Vec::new()),
         external_auth: None,
-        storage: Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
-            store.clone(),
-        )),
+        storage,
         db: db.clone(),
         // OSS binary: one pool, same connection as `db`.
         conveyor_db: db,

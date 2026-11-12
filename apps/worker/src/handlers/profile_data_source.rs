@@ -813,6 +813,7 @@ mod tests {
             arcodash_core::connectors::registry::ConnectorRegistry::with_db(
                 db.clone(),
                 ctx.store.clone(),
+                ctx.storage.clone(),
             ),
         );
         let org = seed_org(&db, &format!("org-profile-{}", uuid::Uuid::new_v4())).await;

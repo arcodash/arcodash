@@ -63,7 +63,8 @@ pub struct AppExtensions {
     pub reserved_org_settings_keys: Vec<&'static str>,
     /// Replaces the built-in login system; `None` keeps it.
     pub external_auth: Option<ExternalAuth>,
-    /// Resolves each organization's object storage; `None` keeps the shared-bucket default.
+    /// Resolves each organization's object storage; `None` keeps the shared-bucket default. The
+    /// `ConnectorRegistry` in `AppState` must be built with this same resolver.
     pub storage_resolver: Option<Arc<dyn arcodash_core::org_storage::OrgStorageResolver>>,
 }
 

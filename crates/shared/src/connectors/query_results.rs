@@ -7,14 +7,19 @@
 //! The visible table set depends on the caller, so this schema is never persisted to the shared
 //! `data_sources.schema` cache.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, FromQueryResult};
 use serde_json::{json, Value};
+
+use crate::entities::query_result;
+use crate::org_storage::OrgStorageResolver;
+use crate::result_store::load_results;
 
 use super::{
     friendly_type_from_json_sample, ColumnMeta, ColumnSchema, NetworkTarget, QueryExecutionResult,
@@ -31,19 +36,24 @@ const MAX_ROWS: usize = 50_000;
 
 pub struct QueryResultsConnector {
     db: DatabaseConnection,
+    storage: Arc<dyn OrgStorageResolver>,
 }
 
 impl QueryResultsConnector {
     #[must_use]
-    pub const fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(db: DatabaseConnection, storage: Arc<dyn OrgStorageResolver>) -> Self {
+        Self { db, storage }
     }
 
     /// The datasets visible to the caller whose ids [`inject_caller`] put in `opts`.
-    async fn load_for_caller(&self, opts: &Value) -> Result<Vec<ResultData>> {
+    async fn load_for_caller(
+        &self,
+        opts: &Value,
+        only: Option<&HashSet<i64>>,
+    ) -> Result<Vec<ResultData>> {
         let org_id = super::injected_id(opts, "org_id", "query_results")?;
         let user_id = super::injected_id(opts, "user_id", "query_results")?;
-        load_result_data(&self.db, org_id, user_id).await
+        load_result_data(&self.db, &*self.storage, org_id, user_id, only).await
     }
 }
 
@@ -54,7 +64,7 @@ struct ResultData {
     rows: Vec<Value>,
 }
 
-/// Loads the most recent `data`-populated result per query, joined to `queries` for the table name
+/// Loads the latest result per query that has data or an object pointer, joined to `queries` for the table name
 /// and authorization. `org_id` scopes both sides (join condition and WHERE): `query_hash` isn't
 /// secret or org-scoped, so identical SQL in two orgs hashes identically and a one-sided filter
 /// would leak another org's cached data. The DB role bypasses RLS, so this is the only org
@@ -67,12 +77,14 @@ struct ResultData {
 /// `query_results_authz_agreement_tests` keeps the two in step.
 async fn load_result_data(
     db: &DatabaseConnection,
+    storage: &dyn OrgStorageResolver,
     org_id: i64,
     user_id: i64,
+    only: Option<&HashSet<i64>>,
 ) -> Result<Vec<ResultData>> {
     // Raw SQL (DISTINCT ON, array containment and the access CTEs are awkward in sea-orm): joins
-    // query_results to queries on query_hash and data_source_id, picks the latest non-null row per
-    // query, limits to MAX_RESULTS.
+    // query_results to queries on query_hash and data_source_id, picks the latest row with data or
+    // an object pointer per query, limits to MAX_RESULTS.
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
     let stmt = Statement::from_sql_and_values(
@@ -100,7 +112,7 @@ async fn load_result_data(
                 )
                 SELECT DISTINCT ON (q.id)
                     q.id          AS query_id,
-                    qr.data       AS data
+                    qr.*
                 FROM query_results qr
                 JOIN queries q
                   ON  q.query_hash      = qr.query_hash
@@ -108,7 +120,7 @@ async fn load_result_data(
                   AND qr.data_source_id IN (q.data_source_id, COALESCE(q.published_data_source_id, q.data_source_id))
                 CROSS JOIN my_admin
                 CROSS JOIN my_unrestricted
-                WHERE qr.data IS NOT NULL
+                WHERE (qr.data IS NOT NULL OR qr.data_location IS NOT NULL)
                   AND qr.org_id = $1
                   AND q.org_id = $1
                   AND (
@@ -152,12 +164,45 @@ async fn load_result_data(
         .await
         .context("failed to load query results for meta-connector")?;
 
-    Ok(rows
+    let mut matched = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let query_id: i64 = row
+            .try_get("", "query_id")
+            .context("failed to read query id for meta-connector")?;
+        if only.is_some_and(|ids| !ids.contains(&query_id)) {
+            continue;
+        }
+        let model = query_result::Model::from_query_result(row, "")
+            .context("failed to read query result row for meta-connector")?;
+        matched.push((query_id, model));
+    }
+    hydrate_matched(db, storage, org_id, matched).await
+}
+
+/// Fills each matched row's data from storage. Queries with identical SQL on one data source share
+/// a result row, so each distinct row is fetched once and cloned per query.
+async fn hydrate_matched(
+    db: &DatabaseConnection,
+    storage: &dyn OrgStorageResolver,
+    org_id: i64,
+    matched: Vec<(i64, query_result::Model)>,
+) -> Result<Vec<ResultData>> {
+    let mut seen = HashSet::new();
+    let models: Vec<query_result::Model> = matched
+        .iter()
+        .filter(|(_, m)| seen.insert(m.id))
+        .map(|(_, m)| m.clone())
+        .collect();
+    // A source whose object is gone is left out, like one with no cached result.
+    let loaded = load_results(db, db, storage, &models)
+        .await
+        .context("failed to load stored query results")?;
+
+    Ok(matched
         .into_iter()
-        .filter_map(|row| {
-            let query_id: i64 = row.try_get("", "query_id").ok()?;
-            let data: Value = row.try_get("", "data").ok()?;
-            let columns = parse_columns(&data);
+        .filter_map(|(query_id, model)| {
+            let data = loaded.get(&model.id)?;
+            let columns = parse_columns(data);
             if columns.is_empty() {
                 // A zero-column table isn't creatable in SQLite; warn instead of failing later
                 // with a bare "no such table".
@@ -175,6 +220,18 @@ async fn load_result_data(
             })
         })
         .collect())
+}
+
+/// Ids of every `query_<n>` table name in `sql`; a superset of the tables it reads is fine since
+/// authorization already happened in SQL and unreferenced results are just not loaded.
+fn referenced_query_ids(sql: &str) -> HashSet<i64> {
+    static TABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bquery_(\d+)\b").expect("valid regex")
+    });
+    TABLE
+        .captures_iter(sql)
+        .filter_map(|c| c[1].parse().ok())
+        .collect()
 }
 
 fn parse_columns(data: &Value) -> Vec<ColumnMeta> {
@@ -416,7 +473,7 @@ impl QueryRunner for QueryResultsConnector {
 
     async fn get_schema(&self, opts: &Value) -> Result<Vec<TableSchema>> {
         let tables = self
-            .load_for_caller(opts)
+            .load_for_caller(opts, None)
             .await?
             .into_iter()
             .map(|d| TableSchema {
@@ -436,7 +493,8 @@ impl QueryRunner for QueryResultsConnector {
     }
 
     async fn run_query(&self, opts: &Value, query: &str) -> Result<QueryExecutionResult> {
-        let datasets = self.load_for_caller(opts).await?;
+        let referenced = referenced_query_ids(query);
+        let datasets = self.load_for_caller(opts, Some(&referenced)).await?;
         let query = query.to_string();
         let conn = open_sqlite_conn()?;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -627,7 +685,12 @@ mod query_results_authz_agreement_tests {
         caller_id: i64,
         query_id: i64,
     ) -> bool {
-        load_result_data(db, org_id, caller_id)
+        let resolver = crate::test_support::blob::StaticResolver::with_store(
+            crate::org_storage::StorageMode::ArcoDash,
+            Arc::new(crate::test_support::blob::MemoryBlobStore::default()),
+            "org-root",
+        );
+        load_result_data(db, &resolver, org_id, caller_id, None)
             .await
             .expect("load_result_data failed")
             .iter()

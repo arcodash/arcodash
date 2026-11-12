@@ -175,7 +175,9 @@ pub async fn explain_dashboard(
         .filter_map(|(q, ok)| ok.then_some(q))
         .collect();
 
-    let digest = narrative::build_digest(&db, org.id, &widgets, &readable).await?;
+    let digest =
+        narrative::build_digest(&db, &state.db, &*state.storage, org.id, &widgets, &readable)
+            .await?;
     if digest.widgets.is_empty() {
         return Ok(failed(EMPTY_MESSAGE));
     }

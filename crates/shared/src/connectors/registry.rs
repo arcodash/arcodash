@@ -25,6 +25,7 @@ use super::{
     classify_run_query_error, connect_err, guard_targets, query_timeout_secs, NetworkTarget,
     QueryExecutionResult, QueryRunner, TableSchema,
 };
+use crate::org_storage::OrgStorageResolver;
 use crate::storage::ObjectStore;
 
 #[derive(Clone)]
@@ -220,11 +221,15 @@ impl QueryRunner for LoggingConnector {
 impl ConnectorRegistry {
     /// Build the full application registry. `store` backs the upload-based CSV/SQLite connectors
     /// (`ObjectStore::from_env()`).
-    pub fn with_db(db: DatabaseConnection, store: Arc<ObjectStore>) -> Self {
+    pub fn with_db(
+        db: DatabaseConnection,
+        store: Arc<ObjectStore>,
+        storage: Arc<dyn OrgStorageResolver>,
+    ) -> Self {
         let mut r = Self::new();
 
         r.register(Arc::new(PostgresConnector::new()));
-        r.register(Arc::new(QueryResultsConnector::new(db.clone())));
+        r.register(Arc::new(QueryResultsConnector::new(db.clone(), storage)));
         r.register(Arc::new(MySqlConnector::mysql()));
         r.register(Arc::new(MySqlConnector::mariadb()));
         r.register(Arc::new(MySqlConnector::tidb()));
@@ -270,7 +275,11 @@ mod tests {
         unsafe {
             std::env::remove_var("UPLOAD_BUCKET");
         }
-        ConnectorRegistry::with_db(DatabaseConnection::default(), store)
+        ConnectorRegistry::with_db(
+            DatabaseConnection::default(),
+            store.clone(),
+            Arc::new(crate::org_storage::DefaultStorageResolver::new(store)),
+        )
     }
 
     #[test]

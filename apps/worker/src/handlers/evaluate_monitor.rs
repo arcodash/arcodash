@@ -112,7 +112,7 @@ async fn handle_inner(
     let Some((monitor, _)) = load_checkable_monitor(&ctx.db, org_id, monitor_id).await? else {
         return Ok(());
     };
-    let eval = evaluate_state(&ctx.db, &monitor, org_id).await?;
+    let eval = evaluate_state(&ctx.db, &*ctx.storage, &monitor, org_id).await?;
     let observation_id = record_observation(&ctx.db, org_id, monitor.id, None, &eval).await;
     apply_transition_and_notify(ctx, org_id, &monitor, None, &eval, observation_id).await
 }
@@ -250,7 +250,7 @@ pub async fn evaluate_and_finalize(
     run_id: i64,
     evaluated: Option<(i64, i64)>,
 ) -> anyhow::Result<()> {
-    let eval = evaluate_state(&ctx.db, monitor, org_id).await?;
+    let eval = evaluate_state(&ctx.db, &*ctx.storage, monitor, org_id).await?;
     let won = run_lifecycle::finalize_run(
         ctx,
         run_id,
@@ -674,18 +674,24 @@ impl Evaluation {
 /// `"unknown"` = no result resolved; `"unevaluable"` = a result exists but the condition couldn't
 /// be computed (`reason` says why). `observed` is the compared cell's display string, set only for
 /// `"triggered"`/`"ok"`; `value` and `query_result_id` identify the reading.
+///
+/// # Errors
+///
+/// Database failure, or the result's storage being unreachable or switching.
 async fn evaluate_state(
     db: &sea_orm::DatabaseConnection,
+    resolver: &dyn arcodash_core::org_storage::OrgStorageResolver,
     monitor: &monitor::Model,
     org_id: i64,
 ) -> anyhow::Result<Evaluation> {
     crate::health::MONITOR_EVALS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let Some((qr_id, data)) = resolve_result_row(db, monitor, org_id)
-        .await?
-        .and_then(|qr| Some((qr.id, qr.data?)))
-    else {
+    let Some(qr) = resolve_result_row(db, monitor, org_id).await? else {
         return Ok(Evaluation::new("unknown", None, None, None, None));
     };
+    let Some(data) = arcodash_core::result_store::load_result(db, db, resolver, &qr).await? else {
+        return Ok(Evaluation::new("unknown", None, None, None, None));
+    };
+    let qr_id = qr.id;
     let unevaluable = |reason: String| -> anyhow::Result<Evaluation> {
         Ok(Evaluation::new(
             "unevaluable",
@@ -817,6 +823,55 @@ mod fixtures {
             return None;
         };
         Some(arcodash_core::db::connect(&url).await.unwrap())
+    }
+
+    pub(super) fn test_resolver() -> arcodash_core::test_support::blob::StaticResolver {
+        resolver_over(std::sync::Arc::new(
+            arcodash_core::test_support::blob::MemoryBlobStore::default(),
+        ))
+    }
+
+    pub(super) fn resolver_over(
+        store: std::sync::Arc<arcodash_core::test_support::blob::MemoryBlobStore>,
+    ) -> arcodash_core::test_support::blob::StaticResolver {
+        arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            store,
+            "org-root",
+        )
+    }
+
+    /// Moves the result row's inline data to an object in `resolver`'s store; `write_object`
+    /// false leaves the pointer dangling.
+    pub(super) async fn externalize_result(
+        db: &sea_orm::DatabaseConnection,
+        resolver: &arcodash_core::test_support::blob::StaticResolver,
+        qr_id: i64,
+        write_object: bool,
+    ) {
+        use arcodash_core::org_storage::OrgStorageResolver;
+        let qr = query_result::Entity::find_by_id(qr_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        let location =
+            arcodash_core::result_store::result_rel_key(qr.data_source_id, &qr.query_hash);
+        if write_object {
+            let storage = resolver.resolve(db, qr.org_id).await.unwrap();
+            arcodash_core::result_store::save_result(
+                &storage,
+                qr.data_source_id,
+                &qr.query_hash,
+                qr.data.as_ref().unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut am: query_result::ActiveModel = qr.into();
+        am.data = Set(None);
+        am.data_location = Set(Some(location));
+        am.update(db).await.unwrap();
     }
 
     /// `value > 50` on column `value`.
@@ -972,7 +1027,10 @@ mod org_scoping_tests {
 
         // Attack: an org-A monitor pointing at org B's query.
         let base_monitor = mem_monitor(org_a.id, query_b.id, over_50());
-        let Evaluation { state, .. } = evaluate_state(&db, &base_monitor, org_a.id).await.unwrap();
+        let Evaluation { state, .. } =
+            evaluate_state(&db, &test_resolver(), &base_monitor, org_a.id)
+                .await
+                .unwrap();
         assert_eq!(
             state, "unknown",
             "a monitor's query_id pointing at another org's query must evaluate as unknown, \
@@ -984,13 +1042,80 @@ mod org_scoping_tests {
             org_id: org_b.id,
             ..base_monitor
         };
-        let Evaluation { state, .. } = evaluate_state(&db, &same_org_monitor, org_b.id)
-            .await
-            .unwrap();
+        let Evaluation { state, .. } =
+            evaluate_state(&db, &test_resolver(), &same_org_monitor, org_b.id)
+                .await
+                .unwrap();
         assert_eq!(
             state, "triggered",
             "same-org read must see the real query_result and evaluate the threshold"
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_state_reads_externalized_result() {
+        let Some(db) = test_db().await else { return };
+        let org = seed_org(&db, &format!("org-ext-evalmonitor-{}", Uuid::new_v4())).await;
+        let query = seed_query_with_result(&db, org.id, serde_json::json!(100.0)).await;
+        let store =
+            std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default());
+        let resolver = resolver_over(store.clone());
+        externalize_result(&db, &resolver, query.latest_query_data_id.unwrap(), true).await;
+        assert_eq!(store.keys().len(), 1);
+
+        let monitor = mem_monitor(org.id, query.id, over_50());
+        let eval = evaluate_state(&db, &resolver, &monitor, org.id)
+            .await
+            .unwrap();
+        assert_eq!(eval.state, "triggered");
+        assert_eq!(eval.query_result_id, query.latest_query_data_id);
+
+        let calm = mem_monitor(
+            org.id,
+            query.id,
+            serde_json::json!({ "column": "value", "op": ">", "value": 500.0 }),
+        );
+        let eval = evaluate_state(&db, &resolver, &calm, org.id).await.unwrap();
+        assert_eq!(eval.state, "ok");
+    }
+
+    #[tokio::test]
+    async fn evaluate_state_missing_object_is_unknown() {
+        let Some(db) = test_db().await else { return };
+        let org = seed_org(&db, &format!("org-gone-evalmonitor-{}", Uuid::new_v4())).await;
+        let query = seed_query_with_result(&db, org.id, serde_json::json!(100.0)).await;
+        let resolver = test_resolver();
+        externalize_result(&db, &resolver, query.latest_query_data_id.unwrap(), false).await;
+
+        let monitor = mem_monitor(org.id, query.id, over_50());
+        let eval = evaluate_state(&db, &resolver, &monitor, org.id)
+            .await
+            .unwrap();
+        assert_eq!(eval.state, "unknown");
+    }
+
+    #[tokio::test]
+    async fn evaluate_state_unreachable_storage_errors() {
+        let Some(db) = test_db().await else { return };
+        let org = seed_org(&db, &format!("org-down-evalmonitor-{}", Uuid::new_v4())).await;
+        let query = seed_query_with_result(&db, org.id, serde_json::json!(100.0)).await;
+        externalize_result(
+            &db,
+            &test_resolver(),
+            query.latest_query_data_id.unwrap(),
+            false,
+        )
+        .await;
+        let failing = arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            std::sync::Arc::new(arcodash_core::test_support::blob::FailingBlobStore::default()),
+            "org-root",
+        );
+
+        let monitor = mem_monitor(org.id, query.id, over_50());
+        assert!(evaluate_state(&db, &failing, &monitor, org.id)
+            .await
+            .is_err());
     }
 
     #[test]
@@ -1016,7 +1141,9 @@ mod org_scoping_tests {
         let query = seed_query_with_result(&db, org.id, serde_json::json!("100.5")).await;
 
         let monitor = mem_monitor(org.id, query.id, over_50());
-        let Evaluation { state, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, .. } = evaluate_state(&db, &test_resolver(), &monitor, org.id)
+            .await
+            .unwrap();
         assert_eq!(
             state, "triggered",
             "a JSON-string-encoded numeric cell must still be compared against the threshold"
@@ -1036,7 +1163,10 @@ mod org_scoping_tests {
 
         let options = serde_json::json!({ "column": "revenue", "value": 50.0, "op": ">" });
         let monitor = mem_monitor(org.id, query.id, options);
-        let Evaluation { state, reason, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, reason, .. } =
+            evaluate_state(&db, &test_resolver(), &monitor, org.id)
+                .await
+                .unwrap();
         assert_eq!(state, "unevaluable");
         let reason = reason.expect("unevaluable state must carry a reason");
         assert!(
@@ -1063,7 +1193,10 @@ mod org_scoping_tests {
         .await;
 
         let monitor = mem_monitor(org.id, query.id, over_50());
-        let Evaluation { state, reason, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, reason, .. } =
+            evaluate_state(&db, &test_resolver(), &monitor, org.id)
+                .await
+                .unwrap();
         assert_eq!(state, "unevaluable");
         assert!(reason.is_some());
     }
@@ -1474,7 +1607,9 @@ mod published_result_tests {
         set_latest_query_data(&db, q.id, draft.id).await;
 
         let monitor = mem_monitor(org.id, q.id, over_50());
-        let Evaluation { state, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, .. } = evaluate_state(&db, &test_resolver(), &monitor, org.id)
+            .await
+            .unwrap();
         assert_eq!(
             state, "triggered",
             "must evaluate the published result (value=100 > 50), not the draft's own newer \

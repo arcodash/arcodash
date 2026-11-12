@@ -1826,6 +1826,61 @@ mod auto_limit_truncation_tests {
     }
 
     #[tokio::test]
+    async fn execute_query_refresh_moves_legacy_inline_row_to_object() {
+        use arcodash_core::test_support::blob::MemoryBlobStore;
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("store-legacy-{}", uuid::Uuid::new_v4())).await;
+        let mut registry = ConnectorRegistry::new();
+        registry.register(Arc::new(StubConnector::new("store-legacy-stub", 2)));
+        let ds = seed_data_source_of_type(&db, org.id, "store-legacy-stub").await;
+        let j = job(org.id, ds.id);
+        let hash = gen_query_hash(&j.query_text, &j.parameters);
+        let old = sea_orm::prelude::DateTimeWithTimeZone::from(
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        );
+        let seeded = query_result::ActiveModel {
+            org_id: Set(org.id),
+            data_source_id: Set(ds.id),
+            query_hash: Set(hash.clone()),
+            query: Set(j.query_text.clone()),
+            data: Set(Some(serde_json::json!({ "columns": [], "rows": [] }))),
+            data_location: Set(None),
+            data_size_bytes: Set(None),
+            runtime: Set(Some(0.0)),
+            retrieved_at: Set(old),
+            last_used_at: Set(old),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let mem = Arc::new(MemoryBlobStore::default());
+        let ctx = ctx_with_store(
+            ctx_with_registry(db.clone(), redis, registry, 100),
+            mem.clone(),
+        );
+
+        run_query(&ctx, &j, None)
+            .await
+            .unwrap()
+            .expect("not cancelled");
+        let rows = result_rows(&db, org.id, ds.id).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, seeded.id);
+        assert!(row.data.is_none());
+        let expected = arcodash_core::result_store::result_rel_key(ds.id, &hash);
+        assert_eq!(row.data_location.as_deref(), Some(expected.as_str()));
+        assert!(row.data_size_bytes.unwrap() > 0);
+        assert_eq!(row.last_used_at, row.retrieved_at);
+        assert!(row.retrieved_at > seeded.retrieved_at);
+        assert_eq!(mem.keys(), [format!("orgs/test/results/{expected}")]);
+    }
+
+    #[tokio::test]
     async fn superseded_run_does_not_overwrite_newer_object() {
         use arcodash_core::test_support::blob::MemoryBlobStore;
         let Some((db, redis)) = setup().await else {

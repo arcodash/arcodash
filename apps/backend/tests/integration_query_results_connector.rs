@@ -6,6 +6,8 @@
 mod common;
 use common::spawn_app;
 
+use std::sync::Arc;
+
 use sea_orm::ActiveModelTrait;
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::EntityTrait;
@@ -194,6 +196,93 @@ async fn seed_query(
     (q, query_hash)
 }
 
+/// Like [`seed_org_with_result`] but the row carries only an object pointer; `write_object` false
+/// leaves the pointer dangling.
+async fn seed_externalized_result(
+    app: &common::TestApp,
+    label: &str,
+    write_object: bool,
+) -> (i64, i64, i64) {
+    let (org_id, ds_id, query_id, query_hash, owner_id) =
+        seed_org_and_query(&app.db, label, "SELECT 'ext' AS c").await;
+    let location = arcodash_core::result_store::result_rel_key(ds_id, &query_hash);
+    if write_object {
+        let storage = app
+            .state
+            .storage
+            .resolve(&app.db, org_id)
+            .await
+            .expect("resolve storage");
+        arcodash_core::result_store::save_result(
+            &storage,
+            ds_id,
+            &query_hash,
+            &json!({
+                "columns": [{"name": "c", "friendly_type": "string"}],
+                "rows": [{"c": "from-object"}],
+            }),
+        )
+        .await
+        .expect("save result object");
+    }
+    let now = chrono::Utc::now().into();
+    query_result::ActiveModel {
+        id: NotSet,
+        org_id: Set(org_id),
+        data_source_id: Set(ds_id),
+        query_hash: Set(query_hash),
+        query: Set("SELECT 'ext' AS c".to_string()),
+        data: Set(None),
+        data_location: Set(Some(location)),
+        data_size_bytes: Set(Some(1)),
+        runtime: Set(Some(0.01)),
+        retrieved_at: Set(now),
+        last_used_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&app.db)
+    .await
+    .expect("seed externalized query_result");
+    (org_id, query_id, owner_id)
+}
+
+#[tokio::test]
+async fn query_results_connector_joins_externalized_results() {
+    let app = skip_if_none!(spawn_app().await);
+    let (org_id, query_id, owner_id) = seed_externalized_result(&app, "qrds-ext", true).await;
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
+    let opts = json!({ "org_id": org_id, "user_id": owner_id });
+
+    let out = connector
+        .run_query(&opts, &format!("SELECT c FROM query_{query_id}"))
+        .await
+        .expect("query over externalized result");
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0]["c"], "from-object");
+}
+
+#[tokio::test]
+async fn query_results_connector_treats_missing_object_as_no_result() {
+    let app = skip_if_none!(spawn_app().await);
+    let (org_id, query_id, owner_id) = seed_externalized_result(&app, "qrds-gone", false).await;
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
+    let opts = json!({ "org_id": org_id, "user_id": owner_id });
+
+    let names: Vec<String> = connector
+        .get_schema(&opts)
+        .await
+        .expect("get_schema")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(!names.contains(&format!("query_{query_id}")), "{names:?}");
+    assert!(connector
+        .run_query(&opts, &format!("SELECT c FROM query_{query_id}"))
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn get_schema_only_returns_calling_orgs_tables() {
     let app = skip_if_none!(spawn_app().await);
@@ -203,7 +292,7 @@ async fn get_schema_only_returns_calling_orgs_tables() {
     let (org_b, query_b, owner_b) =
         seed_org_with_result(&app.db, "qrds-schema-b", "SELECT 2 AS b", "b", "2").await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
 
     let tables_a = connector
         .get_schema(&json!({ "org_id": org_a, "user_id": owner_a }))
@@ -243,7 +332,7 @@ async fn run_query_cannot_read_another_orgs_cached_result() {
     let (_org_b, query_b, _owner_b) =
         seed_org_with_result(&app.db, "qrds-run-b", "SELECT 2 AS b", "b", "2").await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
 
     let own = connector
         .run_query(
@@ -288,7 +377,7 @@ async fn hash_collision_across_orgs_does_not_leak_data() {
     )
     .await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
 
     // Org A has no cached results: get_schema must return no tables, not org B's under A's query
     // id.
@@ -318,7 +407,7 @@ async fn hash_collision_across_orgs_does_not_leak_data() {
 #[tokio::test]
 async fn missing_org_id_in_opts_fails_closed() {
     let app = skip_if_none!(spawn_app().await);
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
 
     let err = connector.get_schema(&json!({})).await.unwrap_err();
     assert!(
@@ -341,7 +430,7 @@ async fn missing_org_id_in_opts_fails_closed() {
 #[tokio::test]
 async fn missing_user_id_in_opts_fails_closed() {
     let app = skip_if_none!(spawn_app().await);
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
 
     let err = connector
         .get_schema(&json!({ "org_id": 1 }))
@@ -456,7 +545,7 @@ async fn restricted_group_cannot_read_query_over_denied_data_source() {
     restrict_group(&app.db, group_id).await;
     assign_group(&app.db, fx.ds_allowed, group_id).await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": fx.org_id, "user_id": caller.id });
 
     let tables = connector
@@ -496,7 +585,7 @@ async fn admin_sees_and_reads_every_query() {
 
     let (admin, _role_id) = common::user_with_role(&app.db, fx.org_id, &["admin"]).await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": fx.org_id, "user_id": admin.id });
 
     let tables = connector
@@ -529,7 +618,7 @@ async fn explicit_grant_overrides_data_source_denial() {
 
     grant_access(&app.db, fx.query_denied, caller.id, "view").await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": fx.org_id, "user_id": caller.id });
 
     let tables = connector
@@ -561,7 +650,7 @@ async fn unrecognized_access_type_grants_nothing() {
 
     grant_access(&app.db, fx.query_denied, caller.id, "bogus").await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": fx.org_id, "user_id": caller.id });
 
     let tables = connector
@@ -604,7 +693,7 @@ async fn drafters_own_query_not_readable_by_another_user_despite_data_source_acc
     // Unrestricted group (full data-source reach), but no ownership or grant on this query.
     let (caller, _role_id) = common::user_with_role(&app.db, org_id, &[]).await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": org_id, "user_id": caller.id });
 
     let tables = connector
@@ -643,7 +732,7 @@ async fn owner_always_sees_own_query_regardless_of_visibility() {
     let (q, hash) = seed_query(&app.db, org_id, ds.id, &owner, "SELECT 4 AS d", None).await;
     seed_result(&app.db, org_id, ds.id, &hash, &q.query, "d", "4").await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": org_id, "user_id": owner.id });
 
     let tables = connector
@@ -690,7 +779,7 @@ async fn join_excludes_result_row_from_a_different_data_source() {
     // published one.
     seed_result(&app.db, org_id, ds_b.id, &hash, &q.query, "e", "5").await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": org_id, "user_id": owner.id });
 
     let tables = connector
@@ -765,7 +854,7 @@ async fn null_and_numeric_values_bind_with_their_real_sqlite_types() {
     )
     .await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": org_id, "user_id": owner_id });
     let table = format!("query_{query_id}");
 
@@ -844,7 +933,7 @@ async fn a_result_with_no_columns_is_skipped_without_breaking_other_tables() {
     let ok_query = ok_query.insert(&app.db).await.expect("insert ok query");
     seed_result(&app.db, org_id, ds_id, &ok_hash, "SELECT 1 AS a", "a", "1").await;
 
-    let connector = QueryResultsConnector::new(app.db.clone());
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
     let opts = json!({ "org_id": org_id, "user_id": owner_id });
 
     let tables = connector
@@ -866,4 +955,164 @@ async fn a_result_with_no_columns_is_skipped_without_breaking_other_tables() {
         .await
         .expect("run_query against the well-formed table must still succeed");
     assert_eq!(result.rows.len(), 1);
+}
+
+/// Insert another query owned by `user_id` on `ds_id`; returns `(query_id, query_hash)`.
+async fn insert_query(
+    db: &sea_orm::DatabaseConnection,
+    org_id: i64,
+    ds_id: i64,
+    user_id: i64,
+    query_text: &str,
+) -> (i64, String) {
+    let mut query = test_support::new_query(org_id, ds_id, user_id);
+    query.query = Set(query_text.to_string());
+    let hash = gen_query_hash(query_text, &json!({}));
+    query.query_hash = Set(hash.clone());
+    query.api_key = Set(unique("extra-query-key"));
+    let query = query.insert(db).await.expect("insert query");
+    (query.id, hash)
+}
+
+/// Write the object for `(ds_id, query_hash)` and insert a `query_results` row pointing at it
+/// with `last_used_at` set `age_hours` in the past.
+async fn seed_object_row(
+    app: &common::TestApp,
+    org_id: i64,
+    ds_id: i64,
+    query_hash: &str,
+    query_text: &str,
+    age_hours: i64,
+) -> i64 {
+    let storage = app
+        .state
+        .storage
+        .resolve(&app.db, org_id)
+        .await
+        .expect("resolve storage");
+    arcodash_core::result_store::save_result(
+        &storage,
+        ds_id,
+        query_hash,
+        &json!({
+            "columns": [{"name": "c", "friendly_type": "string"}],
+            "rows": [{"c": "from-object"}],
+        }),
+    )
+    .await
+    .expect("save result object");
+    let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
+    let used = now - chrono::Duration::hours(age_hours);
+    query_result::ActiveModel {
+        id: NotSet,
+        org_id: Set(org_id),
+        data_source_id: Set(ds_id),
+        query_hash: Set(query_hash.to_string()),
+        query: Set(query_text.to_string()),
+        data: Set(None),
+        data_location: Set(Some(arcodash_core::result_store::result_rel_key(
+            ds_id, query_hash,
+        ))),
+        data_size_bytes: Set(Some(1)),
+        runtime: Set(Some(0.01)),
+        retrieved_at: Set(now),
+        last_used_at: Set(used),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&app.db)
+    .await
+    .expect("seed object-backed query_result")
+    .id
+}
+
+#[tokio::test]
+async fn query_results_connector_two_queries_sharing_a_result_both_resolve() {
+    let app = skip_if_none!(spawn_app().await);
+    let sql = "SELECT 'shared' AS c";
+    let (org_id, ds_id, query_a, hash, owner_id) =
+        seed_org_and_query(&app.db, "qrds-shared", sql).await;
+    let (query_b, hash_b) = insert_query(&app.db, org_id, ds_id, owner_id, sql).await;
+    assert_eq!(hash, hash_b);
+    seed_object_row(&app, org_id, ds_id, &hash, sql, 0).await;
+
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
+    let opts = json!({ "org_id": org_id, "user_id": owner_id });
+
+    let names: Vec<String> = connector
+        .get_schema(&opts)
+        .await
+        .expect("get_schema")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(names.contains(&format!("query_{query_a}")), "{names:?}");
+    assert!(names.contains(&format!("query_{query_b}")), "{names:?}");
+
+    for id in [query_a, query_b] {
+        let out = connector
+            .run_query(&opts, &format!("SELECT c FROM query_{id}"))
+            .await
+            .expect("query over shared result");
+        assert_eq!(out.rows.len(), 1, "query_{id}");
+        assert_eq!(out.rows[0]["c"], "from-object");
+    }
+}
+
+#[tokio::test]
+async fn query_results_connector_run_loads_only_referenced_results() {
+    let app = skip_if_none!(spawn_app().await);
+    let sql_a = "SELECT 'a' AS c";
+    let sql_b = "SELECT 'b' AS c";
+    let (org_id, ds_id, query_a, hash_a, owner_id) =
+        seed_org_and_query(&app.db, "qrds-only", sql_a).await;
+    let (_query_b, hash_b) = insert_query(&app.db, org_id, ds_id, owner_id, sql_b).await;
+    seed_object_row(&app, org_id, ds_id, &hash_a, sql_a, 0).await;
+    let result_b = seed_object_row(&app, org_id, ds_id, &hash_b, sql_b, 2).await;
+
+    let before = query_result::Entity::find_by_id(result_b)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .expect("result b")
+        .last_used_at;
+
+    let connector = QueryResultsConnector::new(app.db.clone(), app.state.storage.clone());
+    let opts = json!({ "org_id": org_id, "user_id": owner_id });
+    let out = connector
+        .run_query(&opts, &format!("SELECT c FROM QUERY_{query_a}"))
+        .await
+        .expect("query over one result");
+    assert_eq!(out.rows.len(), 1);
+
+    let after = query_result::Entity::find_by_id(result_b)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .expect("result b")
+        .last_used_at;
+    assert_eq!(before, after, "an unreferenced result must not be touched");
+}
+
+#[tokio::test]
+async fn query_results_connector_unreachable_storage_errors() {
+    let app = skip_if_none!(spawn_app().await);
+    let (org_id, query_id, owner_id) = seed_externalized_result(&app, "qrds-down", false).await;
+    let resolver = Arc::new(test_support::blob::StaticResolver::with_store(
+        arcodash_core::org_storage::StorageMode::ArcoDash,
+        Arc::new(test_support::blob::FailingBlobStore::default()),
+        "org-root",
+    ));
+    let connector = QueryResultsConnector::new(app.db.clone(), resolver);
+    let opts = json!({ "org_id": org_id, "user_id": owner_id });
+
+    let err = connector
+        .run_query(&opts, &format!("SELECT c FROM query_{query_id}"))
+        .await
+        .expect_err("unreachable storage must fail the run, not yield an empty table");
+    assert!(
+        err.to_string()
+            .contains("failed to load stored query results"),
+        "{err:#}"
+    );
 }

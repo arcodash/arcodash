@@ -329,7 +329,9 @@ async fn brief_for(
             readable.insert(w.query.id);
         }
     }
-    let current = narrative::build_digest(&ctx.db, org.id, &widgets, &readable).await?;
+    let current =
+        narrative::build_digest(&ctx.db, &ctx.db, &*ctx.storage, org.id, &widgets, &readable)
+            .await?;
     if current.widgets.is_empty() {
         anyhow::bail!("no readable widgets");
     }
