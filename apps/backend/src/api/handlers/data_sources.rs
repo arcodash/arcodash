@@ -568,13 +568,22 @@ pub async fn ai_profile(
     let supported = state.connectors.get(&ds.r#type).is_some()
         && arcodash_core::connectors::sample_table_sql(&ds.r#type, "t", 1).is_some();
     let phase = arcodash_core::models::ai_profile_phase(&mut state.redis.clone(), id).await;
+    let storage = state.storage.resolve(&state.db, user.org_id).await?;
+    let profile = match arcodash_core::ai::profile_values::load_ai_profile(&storage, &ds).await {
+        Ok(p) => p,
+        Err(e) => {
+            arcodash_core::ai::narrative::report_unreachable(
+                &*state.storage,
+                &state.db,
+                user.org_id,
+                &e,
+            )
+            .await;
+            return Err(e.into());
+        }
+    };
     let last_error = ds.ai_profile_last_error;
     let ds_type = ds.r#type;
-    let profile = ds.ai_profile.and_then(|v| {
-        serde_json::from_value::<arcodash_core::models::DataSourceAiProfile>(v)
-            .map_err(|_| tracing::warn!(data_source_id = id, "stored ai_profile failed to parse"))
-            .ok()
-    });
     Ok(Json(json!({
         "profile": profile,
         "built_at": ds.ai_profile_built_at.map(|t| t.with_timezone(&Utc)),

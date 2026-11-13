@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use arcodash_core::entities::organization;
 
-use crate::api::handlers::ai::context::{build_context, load_recent_queries, usable_profile};
+use crate::api::handlers::ai::context::{build_context, load_recent_queries, load_usable_profile};
 use crate::api::handlers::ai::{
     provider_for, schema_for_ai, AiError, AiProvider, AiProviderKind, SqlGeneration,
     AI_BUSY_MESSAGE,
@@ -128,7 +128,7 @@ pub async fn generate_sql(
     }
 
     // 6. Schema: cached when available. Release the transaction first, since the schema fallback and LLM chain are slow.
-    let profile = usable_profile(&ds);
+    let profile = load_usable_profile(&state, user.org_id, &ds).await?;
     let recent = load_recent_queries(&db, user.org_id, user.id, ds.id).await?;
     let include_samples = include_sample_values(&org.settings);
     scope.detach(db).await?;

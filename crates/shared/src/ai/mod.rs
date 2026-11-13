@@ -14,6 +14,7 @@ pub mod monitor_suggestions;
 pub mod narrative;
 pub mod openai;
 pub mod pricing;
+pub mod profile_values;
 pub mod settings;
 pub mod usage;
 pub mod viz;

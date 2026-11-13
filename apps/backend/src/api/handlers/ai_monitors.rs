@@ -10,7 +10,7 @@ use crate::extract::Json;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
 
-use crate::api::handlers::ai::context::{build_context, load_recent_queries, usable_profile};
+use crate::api::handlers::ai::context::{build_context, load_recent_queries, load_usable_profile};
 use crate::api::handlers::ai::monitor_suggestions::{
     build_response, build_suggest_prompt_from_text, monitor_facts, CoveredTable,
     ExistingMonitorFacts, MonitorSuggestion,
@@ -159,7 +159,7 @@ pub async fn suggest_monitors(
     // it — reject rather than silently drop an unknown entry. The per-request transaction is
     // released first: the fallback path can hit the customer's warehouse and the LLM chain below
     // is slow.
-    let profile = usable_profile(&ds);
+    let profile = load_usable_profile(&state, user.org_id, &ds).await?;
     let recent = load_recent_queries(&db, user.org_id, user.id, ds.id).await?;
     let include_samples = include_sample_values(&org.settings);
     scope.detach(db).await?;
@@ -404,10 +404,11 @@ pub async fn suggest_query_monitors(
             .map(|r| r.iter().take(SAMPLE_ROWS).cloned().collect())
             .unwrap_or_default()
     });
+    let usable = load_usable_profile(&state, user.org_id, &ds).await?;
     let profile_context = cached_schema(&ds).map(|tables| {
         build_context(
             &tables,
-            usable_profile(&ds).as_ref(),
+            usable.as_ref(),
             "",
             Some(&served.query),
             &[],

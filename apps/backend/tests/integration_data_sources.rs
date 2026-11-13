@@ -1923,6 +1923,89 @@ async fn ai_profile_route_null_typed_cross_org_and_absent_from_get() {
     assert!(ds.get("ai_profile_built_at").is_none(), "{ds}");
 }
 
+/// Sampled values live in object storage; the endpoint restores them, and a row still holding
+/// inline values keeps serving them.
+#[tokio::test]
+async fn ai_profile_endpoint_returns_stored_samples() {
+    use arcodash_core::ai::profile_values::{save_profile_values, ColumnValues, ProfileValues};
+    use arcodash_core::entities::data_source;
+    use arcodash_core::org_storage::StorageArea;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+
+    let app = skip_if_none!(
+        common::spawn_app_with_org_resolver(std::sync::Arc::new(HeaderOrgResolver)).await
+    );
+    app.cleanup().await;
+    let org = make_org(&app.db).await;
+    let (user, _) = user_with_role(&app.db, org, &["admin"]).await;
+    let client = api_key_client(&test_api_key(&user.email), org);
+    let resp = client
+        .post(format!("{}/api/data_sources", app.address))
+        .json(&serde_json::json!({ "name": "stored-samples", "type": "pg", "options": {} }))
+        .send()
+        .await
+        .unwrap();
+    let ds_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let url = format!("{}/api/data_sources/{ds_id}/ai_profile", app.address);
+
+    let storage = app.state.storage.resolve(&app.db, org).await.unwrap();
+    let rel = arcodash_core::ai::profile_values::values_rel_key(ds_id);
+    storage.delete(StorageArea::AiProfiles, &rel).await.unwrap();
+    let values = ProfileValues(
+        [(
+            "orders".to_string(),
+            [(
+                "status".to_string(),
+                ColumnValues {
+                    samples: vec!["open".into(), "paid".into()],
+                    min: Some("a".into()),
+                    max: Some("z".into()),
+                },
+            )]
+            .into(),
+        )]
+        .into(),
+    );
+    let location = save_profile_values(&storage, ds_id, &values).await.unwrap();
+
+    let profile = serde_json::json!({
+        "tables": [{ "name": "orders", "sampled_rows": 20, "columns": [{
+            "name": "status", "null_frac": 0.0, "distinct_in_sample": 3, "samples": []
+        }]}],
+        "relationships": [],
+        "schema_refreshed_at_seen": "2026-09-30T00:00:00Z"
+    });
+    let row = data_source::Entity::find_by_id(ds_id)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut active: data_source::ActiveModel = row.into();
+    active.ai_profile = Set(Some(profile.clone()));
+    active.ai_profile_values_location = Set(Some(location));
+    active.update(&app.db).await.unwrap();
+
+    let body: serde_json::Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+    let col = &body["profile"]["tables"][0]["columns"][0];
+    assert_eq!(
+        col["samples"],
+        serde_json::json!(["open", "paid"]),
+        "{body}"
+    );
+    assert_eq!(col["min"], "a", "{body}");
+    assert_eq!(col["max"], "z", "{body}");
+
+    storage.delete(StorageArea::AiProfiles, &rel).await.unwrap();
+    let body: serde_json::Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(
+        body["profile"]["tables"][0]["columns"][0]["samples"],
+        serde_json::json!([]),
+        "{body}"
+    );
+}
+
 /// Rebuild is admin-only and de-duplicated: 202 then 409; non-admin 403 (also on GET); foreign org
 /// 404.
 #[tokio::test]

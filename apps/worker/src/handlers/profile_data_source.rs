@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 
 use arcodash_core::ai::describe::needs_descriptions;
+use arcodash_core::ai::narrative::report_unreachable;
+use arcodash_core::ai::profile_values::{load_ai_profile, save_profile_values, split_profile};
 use arcodash_core::ai_relationships::{merge_relationships, mine_join_pairs, name_heuristic};
 use arcodash_core::config::env_parsed;
 use arcodash_core::connectors::query_results::inject_caller;
@@ -15,6 +17,7 @@ use arcodash_core::models::{
     AiProfileColumn, AiProfileTable, AiRelationship, DataSourceAiProfile, DataSourceSchema,
     ProfileData, RelationshipSource, SchemaTable, AI_PROFILE_PENDING_TTL_SECS,
 };
+use arcodash_core::org_storage::{OrgStorage, StorageError};
 use arcodash_core::queue::{JobMessage, QueueName};
 use redis::AsyncCommands;
 use sea_orm::prelude::DateTimeWithTimeZone;
@@ -144,16 +147,17 @@ async fn run(
     };
     let seen = chrono::Utc::now();
 
-    let mut profile = ds
-        .ai_profile
-        .clone()
-        .and_then(|v| serde_json::from_value::<DataSourceAiProfile>(v).ok())
-        .unwrap_or_else(|| DataSourceAiProfile {
-            tables: vec![],
-            relationships: vec![],
-            schema_refreshed_at_seen: seen,
-            descriptions_used_samples: false,
-        });
+    let storage = ctx.storage.resolve(&ctx.db, org_id).await?;
+    let stored = match load_ai_profile(&storage, &ds).await {
+        Ok(p) => p,
+        Err(e) => return Err(storage_failure(ctx, org_id, e).await.into()),
+    };
+    let mut profile = stored.unwrap_or_else(|| DataSourceAiProfile {
+        tables: vec![],
+        relationships: vec![],
+        schema_refreshed_at_seen: seen,
+        descriptions_used_samples: false,
+    });
     prune_to_schema(&mut profile, &schema);
     // Taken before bare entries are added so a table with no columns still counts as new.
     let profile_before_bare = profile.clone();
@@ -191,11 +195,13 @@ async fn run(
     profile.relationships =
         merge_relationships(fk, mined, name_heuristic(&schema.tables), &schema.tables);
 
+    let (stripped, location) = store_values(ctx, org_id, &storage, ds.id, &profile).await?;
     data_source::ActiveModel {
         id: Set(ds.id),
         schema: Set(Some(serde_json::to_value(&schema)?)),
         schema_refreshed_at: Set(Some(DateTimeWithTimeZone::from(seen))),
-        ai_profile: Set(Some(serde_json::to_value(&profile)?)),
+        ai_profile: Set(Some(stripped)),
+        ai_profile_values_location: Set(Some(location)),
         ai_profile_built_at: Set(Some(DateTimeWithTimeZone::from(seen))),
         ..Default::default()
     }
@@ -288,9 +294,11 @@ async fn run(
         merge_sampled(&mut profile, fresh);
     }
 
+    let (stripped, location) = store_values(ctx, org_id, &storage, ds.id, &profile).await?;
     data_source::ActiveModel {
         id: Set(ds.id),
-        ai_profile: Set(Some(serde_json::to_value(&profile)?)),
+        ai_profile: Set(Some(stripped)),
+        ai_profile_values_location: Set(Some(location)),
         ai_profile_built_at: Set(Some(DateTimeWithTimeZone::from(chrono::Utc::now()))),
         ai_profile_last_error: Set(None),
         ..Default::default()
@@ -307,6 +315,33 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Reports an unreachable store to the resolver; the error carries provider detail only.
+async fn storage_failure(
+    ctx: &ExecuteQueryContext,
+    org_id: i64,
+    err: StorageError,
+) -> StorageError {
+    report_unreachable(&*ctx.storage, &ctx.db, org_id, &err).await;
+    err
+}
+
+/// Writes the profile's sampled values to storage and returns the value-free profile JSON with the
+/// values' location. The row is only updated after this succeeds.
+async fn store_values(
+    ctx: &ExecuteQueryContext,
+    org_id: i64,
+    storage: &OrgStorage,
+    data_source_id: i64,
+    profile: &DataSourceAiProfile,
+) -> anyhow::Result<(Value, String)> {
+    let (stripped, values) = split_profile(profile);
+    let location = match save_profile_values(storage, data_source_id, &values).await {
+        Ok(l) => l,
+        Err(e) => return Err(storage_failure(ctx, org_id, e).await.into()),
+    };
+    Ok((serde_json::to_value(&stripped)?, location))
 }
 
 /// One column-less entry per schema table the profile lacks; uncapped so profile coverage matches
@@ -734,6 +769,87 @@ mod tests {
             serde_json::from_value(e.load().await.schema.unwrap()).unwrap();
         assert!(!schema.tables.iter().any(|x| x.name == t));
         assert!(!e.profile().await.tables.iter().any(|x| x.name == t));
+    }
+
+    async fn seed_values_table(e: &Env) -> String {
+        let t = uniq("prof_vals");
+        e.sql(&format!("CREATE TABLE {t} (label text, n int)"))
+            .await;
+        e.sql(&format!(
+            "INSERT INTO {t} VALUES ('alpha_secret_91', 5), ('beta_secret_91', 40)"
+        ))
+        .await;
+        t
+    }
+
+    #[tokio::test]
+    async fn ai_profile_values_split_out_of_postgres() {
+        use arcodash_core::ai::profile_values::ProfileValues;
+        use arcodash_core::org_storage::StorageArea;
+        let Some(e) = env().await else { return };
+        let t = seed_values_table(&e).await;
+        e.run().await;
+        e.sql(&format!("DROP TABLE {t}")).await;
+
+        let ds = e.load().await;
+        let raw = ds.ai_profile.clone().unwrap();
+        assert!(!raw.to_string().contains("secret_91"));
+        let p: DataSourceAiProfile = serde_json::from_value(raw).unwrap();
+        for c in p.tables.iter().flat_map(|t| &t.columns) {
+            assert!(c.samples.is_empty() && c.min.is_none() && c.max.is_none());
+        }
+        let loc = format!("{}.json", e.ds.id);
+        assert_eq!(ds.ai_profile_values_location.as_deref(), Some(loc.as_str()));
+
+        let storage = e.ctx.storage.resolve(&e.db, e.ds.org_id).await.unwrap();
+        let bytes = storage.get(StorageArea::AiProfiles, &loc).await.unwrap();
+        let values: ProfileValues = serde_json::from_slice(&bytes).unwrap();
+        let cols = &values.0[&t];
+        assert!(cols["label"]
+            .samples
+            .contains(&"alpha_secret_91".to_string()));
+        assert_eq!(cols["n"].min.as_deref(), Some("5"));
+        assert_eq!(cols["n"].max.as_deref(), Some("40"));
+    }
+
+    #[tokio::test]
+    async fn profile_job_storage_failure_keeps_previous_profile() {
+        use arcodash_core::test_support::blob::{FailingBlobStore, StaticResolver};
+        let Some(mut e) = env().await else { return };
+        let t = seed_values_table(&e).await;
+        let good = e.ctx.storage.clone();
+        e.ctx.storage = std::sync::Arc::new(StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            std::sync::Arc::new(FailingBlobStore::default()),
+            "org-root",
+        ));
+
+        // No previous profile: the failed values write leaves the row untouched.
+        e.run().await;
+        let ds = e.load().await;
+        assert!(ds.ai_profile.is_none() && ds.ai_profile_values_location.is_none());
+        let err = ds.ai_profile_last_error.unwrap();
+        assert!(err.starts_with("profiling failed"), "{err}");
+        assert!(!err.contains("secret_91"));
+
+        e.ctx.storage = good;
+        e.run().await;
+        let before = e.load().await;
+        assert!(before.ai_profile.is_some());
+        e.ctx.storage = std::sync::Arc::new(StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            std::sync::Arc::new(FailingBlobStore::default()),
+            "org-root",
+        ));
+        e.run().await;
+        e.sql(&format!("DROP TABLE {t}")).await;
+        let after = e.load().await;
+        assert_eq!(after.ai_profile, before.ai_profile);
+        assert_eq!(
+            after.ai_profile_values_location,
+            before.ai_profile_values_location
+        );
+        assert_eq!(after.ai_profile_built_at, before.ai_profile_built_at);
     }
 
     #[tokio::test]

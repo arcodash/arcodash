@@ -26,7 +26,7 @@ use arcodash_core::models::{
 use arcodash_core::queue::{self, enqueue_profile, JobStatus, Queue};
 use redis::aio::ConnectionManager;
 
-use crate::api::handlers::ai::context::{build_context, load_recent_queries, usable_profile};
+use crate::api::handlers::ai::context::{build_context, load_recent_queries, load_usable_profile};
 use crate::api::handlers::ai::{
     is_read_only_sql, provider_for, schema_for_ai, AiProvider, AiProviderKind, SqlGeneration,
 };
@@ -609,7 +609,7 @@ pub(crate) async fn prepare_ask(
         )));
     }
 
-    let profile = usable_profile(&ds);
+    let profile = load_usable_profile(state, user.org_id, &ds).await?;
     let recent = load_recent_queries(&db, user.org_id, user.id, ds.id).await?;
     let include_samples = include_sample_values(&org.settings);
     scope.detach(db).await?;

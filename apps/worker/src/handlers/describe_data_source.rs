@@ -8,6 +8,8 @@ use arcodash_core::ai::describe::{
     SchemaDescriptions,
 };
 use arcodash_core::ai::fallback::run_fallback_chain;
+use arcodash_core::ai::narrative::report_unreachable;
+use arcodash_core::ai::profile_values::{load_ai_profile, save_profile_values, split_profile};
 use arcodash_core::ai::settings::{
     fallback_enabled, include_sample_values, resolve_provider_chain, ResolvedProvider,
 };
@@ -15,6 +17,7 @@ use arcodash_core::ai::{AiError, AiProvider, AiProviderKind};
 use arcodash_core::connectors::TableSchema;
 use arcodash_core::entities::{data_source, organization};
 use arcodash_core::models::{ai_profile_describing_key, DataSourceAiProfile, DataSourceSchema};
+use arcodash_core::org_storage::OrgStorage;
 use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
 
 use crate::ai_sink::DbAttemptSink;
@@ -85,8 +88,21 @@ pub async fn describe_if_needed<F>(
     let Some(raw_profile) = &ds.ai_profile else {
         return;
     };
-    let Ok(profile) = serde_json::from_value::<DataSourceAiProfile>(raw_profile.clone()) else {
-        return;
+    let storage = match ctx.storage.resolve(&ctx.db, org.id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(data_source_id = ds.id, error = %e, "describe: storage unavailable");
+            return;
+        }
+    };
+    let profile = match load_ai_profile(&storage, ds).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return,
+        Err(e) => {
+            report_unreachable(&*ctx.storage, &ctx.db, org.id, &e).await;
+            tracing::warn!(data_source_id = ds.id, error = %e, "describe: profile values unavailable");
+            return;
+        }
     };
     let Some(schema) = ds
         .schema
@@ -170,7 +186,7 @@ pub async fn describe_if_needed<F>(
         back_off(ctx, ds.id).await;
         return;
     }
-    if let Err(e) = store(ctx, ds, raw_profile, &merged).await {
+    if let Err(e) = store(ctx, &storage, ds, raw_profile, &merged).await {
         tracing::warn!(data_source_id = ds.id, error = %e, "storing descriptions failed");
     }
 }
@@ -187,18 +203,34 @@ async fn back_off(ctx: &ExecuteQueryContext, data_source_id: i64) {
 /// Compare-and-set on the whole stored profile: a rebuild in the meantime wins.
 async fn store(
     ctx: &ExecuteQueryContext,
+    storage: &OrgStorage,
     ds: &data_source::Model,
     raw_profile: &serde_json::Value,
     merged: &DataSourceAiProfile,
 ) -> anyhow::Result<()> {
-    let new = serde_json::to_value(merged)?;
+    let (stripped, values) = split_profile(merged);
+    // Descriptions never change values, so an existing object is left alone (a concurrent rebuild
+    // may have replaced it); only a row still holding inline values moves them out.
+    let location = match &ds.ai_profile_values_location {
+        Some(l) => l.clone(),
+        None => match save_profile_values(storage, ds.id, &values).await {
+            Ok(l) => l,
+            Err(e) => {
+                report_unreachable(&*ctx.storage, &ctx.db, ds.org_id, &e).await;
+                return Err(e.into());
+            }
+        },
+    };
+    let new = serde_json::to_value(&stripped)?;
     let res = ctx
         .db
         .execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "UPDATE data_sources SET ai_profile = $1 WHERE id = $2 AND org_id = $3 AND ai_profile = $4",
+            "UPDATE data_sources SET ai_profile = $1, ai_profile_values_location = $2 \
+             WHERE id = $3 AND org_id = $4 AND ai_profile = $5",
             [
                 new.into(),
+                location.into(),
                 ds.id.into(),
                 ds.org_id.into(),
                 raw_profile.clone().into(),
@@ -392,6 +424,27 @@ mod tests {
             sent
         }
 
+        async fn row(&self) -> data_source::Model {
+            data_source::Entity::find_by_id(self.ds.id)
+                .one(&self.ctx.db)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn loaded(&self) -> DataSourceAiProfile {
+            let storage = self
+                .ctx
+                .storage
+                .resolve(&self.ctx.db, self.org.id)
+                .await
+                .unwrap();
+            load_ai_profile(&storage, &self.row().await)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
         async fn stored(&self) -> serde_json::Value {
             data_source::Entity::find_by_id(self.ds.id)
                 .one(&self.ctx.db)
@@ -423,7 +476,11 @@ mod tests {
             Some("Fulfilment state of the order")
         );
         assert!(p.descriptions_used_samples);
-        assert_eq!(p.tables[0].columns[0].samples, vec!["zebra_shipped_7781"]);
+        assert!(p.tables[0].columns[0].samples.is_empty());
+        assert_eq!(
+            e.loaded().await.tables[0].columns[0].samples,
+            vec!["zebra_shipped_7781"]
+        );
 
         let usage = ai_usage::Entity::find()
             .filter(ai_usage::Column::OrgId.eq(e.org.id))
@@ -435,6 +492,27 @@ mod tests {
 
         // The guard is still held, so a second job is a no-op.
         assert!(e.describe(one(), false).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn describe_keeps_values_out_of_postgres() {
+        let Some(e) = env().await else { return };
+        assert_eq!(e.describe(one(), false).await.len(), 1);
+
+        let row = e.row().await;
+        let raw = row.ai_profile.unwrap();
+        assert!(!raw.to_string().contains("zebra_shipped_7781"));
+        let loc = format!("{}.json", e.ds.id);
+        assert_eq!(
+            row.ai_profile_values_location.as_deref(),
+            Some(loc.as_str())
+        );
+        let col = &e.loaded().await.tables[0].columns[0];
+        assert_eq!(
+            col.description.as_deref(),
+            Some("Fulfilment state of the order")
+        );
+        assert_eq!(col.samples, vec!["zebra_shipped_7781"]);
     }
 
     #[tokio::test]

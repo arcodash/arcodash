@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use arcodash_core::ai::context::{build_context, usable_profile};
+use arcodash_core::ai::context::{build_context, usable_profile_loaded};
 use arcodash_core::ai::fallback::run_fallback_chain;
 use arcodash_core::ai::is_read_only_sql;
 use arcodash_core::ai::settings::{
@@ -232,7 +232,18 @@ pub async fn ai_gate(
         declined("data source belongs to another org");
         return None;
     }
-    let Some(profile) = usable_profile(&data_source) else {
+    let profile = match ctx.storage.resolve(&ctx.db, org.id).await {
+        Ok(storage) => usable_profile_loaded(&data_source, &storage)
+            .await
+            .map_err(|e| tracing::warn!(monitor_id = monitor.id, error = %e, "ai_gate: profile values unavailable"))
+            .ok()
+            .flatten(),
+        Err(e) => {
+            tracing::warn!(monitor_id = monitor.id, error = %e, "ai_gate: storage unavailable");
+            None
+        }
+    };
+    let Some(profile) = profile else {
         tracing::info!(
             monitor_id = monitor.id,
             "ai_gate: data source has no usable AI profile"
