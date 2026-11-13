@@ -671,8 +671,17 @@ pub mod blob {
 
     /// Resolves every organization to the same store. The returned storage keeps the template's
     /// mode, root and pause flag but carries the requested `org_id`.
+    #[derive(Clone, Copy)]
+    enum ResolveMode {
+        Ready,
+        Switching,
+        Paused,
+        Unreachable,
+    }
+
     pub struct StaticResolver {
         storage: OrgStorage,
+        mode: ResolveMode,
         failures: AtomicUsize,
         missing: AtomicUsize,
     }
@@ -682,6 +691,7 @@ pub mod blob {
         pub const fn new(storage: OrgStorage) -> Self {
             Self {
                 storage,
+                mode: ResolveMode::Ready,
                 failures: AtomicUsize::new(0),
                 missing: AtomicUsize::new(0),
             }
@@ -689,6 +699,27 @@ pub mod blob {
 
         pub fn with_store(mode: StorageMode, store: Arc<dyn BlobStore>, root: &str) -> Self {
             Self::new(OrgStorage::new(0, mode, store, root))
+        }
+
+        /// Every `resolve` fails with `Switching`.
+        #[must_use]
+        pub const fn switching(mut self) -> Self {
+            self.mode = ResolveMode::Switching;
+            self
+        }
+
+        /// Every `resolve` returns storage whose writes are paused.
+        #[must_use]
+        pub const fn paused(mut self) -> Self {
+            self.mode = ResolveMode::Paused;
+            self
+        }
+
+        /// Every `resolve` fails with `Unreachable`.
+        #[must_use]
+        pub const fn unreachable(mut self) -> Self {
+            self.mode = ResolveMode::Unreachable;
+            self
         }
 
         pub fn failures(&self) -> usize {
@@ -709,7 +740,14 @@ pub mod blob {
         ) -> Result<OrgStorage, StorageError> {
             let mut storage = self.storage.clone();
             storage.org_id = org_id;
-            Ok(storage)
+            match self.mode {
+                ResolveMode::Ready => Ok(storage),
+                ResolveMode::Paused => Ok(storage.with_writes_paused()),
+                ResolveMode::Switching => Err(StorageError::Switching),
+                ResolveMode::Unreachable => Err(StorageError::Unreachable {
+                    detail: "bucket unreachable".into(),
+                }),
+            }
         }
 
         async fn report_failure(&self, _: &DatabaseConnection, _: i64, _: &StorageError) {

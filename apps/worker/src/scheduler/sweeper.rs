@@ -191,9 +191,22 @@ pub async fn requeue_stale_pending(ctx: &ExecuteQueryContext) -> usize {
     let mut reclaimed = 0usize;
     for run in rows {
         let id = run.id;
-        if run.enqueued_at.is_some() {
+        if run.enqueued_at.is_none() {
+            // Parked by a deferral: wait out its cooldown (check only; enqueueing re-stamps it).
             let mut conn = ctx.redis.clone();
-            let key = format!("arcodash:requeue-cooldown:run:{id}");
+            match conn
+                .exists::<_, bool>(run_lifecycle::requeue_cooldown_key(id))
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(run_id = id, error = %e, "sweeper: deferral cooldown check failed, re-enqueuing anyway");
+                }
+            }
+        } else {
+            let mut conn = ctx.redis.clone();
+            let key = run_lifecycle::requeue_cooldown_key(id);
             let claimed: Result<Option<String>, _> = conn
                 .set_options(
                     &key,
@@ -391,6 +404,10 @@ async fn stale_fallback_eval(
     waiter_id: i64,
 ) {
     if let Err(e) = stale_fallback_eval_inner(ctx, org_id, monitor_id, waiter_id).await {
+        if crate::handlers::evaluate_monitor::is_storage_switching(&e) {
+            crate::handlers::evaluate_monitor::defer_for_storage_switch(ctx, waiter_id).await;
+            return;
+        }
         tracing::error!(run_id = waiter_id, error = %e, "sweeper: stale-fallback eval failed");
         match run_lifecycle::finalize_run_with_retry(
             ctx,
@@ -845,7 +862,9 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
     };
 
     let now = Utc::now();
-    let mut managed: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
+    // `None`: storage lookup failed or is paused; the org is skipped for the whole sweep.
+    let mut managed: std::collections::HashMap<i64, Option<bool>> =
+        std::collections::HashMap::new();
     for row in rows {
         let Ok(id) = row.try_get::<uuid::Uuid>("", "id") else {
             tracing::error!(
@@ -870,13 +889,21 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
         }
         let manages = match managed.get(&org_id) {
             Some(m) => *m,
-            None => match ctx.storage.resolve(&ctx.db, org_id).await {
-                Ok(s) => *managed.entry(org_id).or_insert(s.manages_retention()),
-                Err(e) => {
-                    tracing::warn!(org_id, error = %e, "sweeper: org storage unavailable, skipping its orphaned uploads");
-                    continue;
-                }
-            },
+            None => {
+                let m = match ctx.storage.resolve(&ctx.db, org_id).await {
+                    Ok(s) if s.writes_paused() => None,
+                    Ok(s) => Some(s.manages_retention()),
+                    Err(e) => {
+                        tracing::warn!(org_id, error = %e, "sweeper: org storage unavailable, skipping its orphaned uploads");
+                        None
+                    }
+                };
+                managed.insert(org_id, m);
+                m
+            }
+        };
+        let Some(manages) = manages else {
+            continue;
         };
         if manages {
             if let Err(e) =
@@ -2150,6 +2177,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_fallback_defers_during_storage_switch() {
+        use arcodash_core::test_support::blob::{MemoryBlobStore, StaticResolver};
+        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let _guard = SWEEP_ENV_LOCK.lock().await;
+        for resolver in [
+            StaticResolver::with_store(
+                arcodash_core::org_storage::StorageMode::ArcoDash,
+                std::sync::Arc::new(MemoryBlobStore::default()),
+                "orgs/test/",
+            )
+            .switching(),
+            StaticResolver::with_store(
+                arcodash_core::org_storage::StorageMode::ArcoDash,
+                std::sync::Arc::new(MemoryBlobStore::default()),
+                "orgs/test/",
+            )
+            .paused(),
+        ] {
+            let suffix = uuid::Uuid::new_v4();
+            let org = seed_org(&db, &format!("org-ceiling-switch-{suffix}")).await;
+            let ds = seed_data_source(&db, org.id).await;
+            let q = seed_published_query(&db, org.id, ds.id).await;
+            let qr = seed_query_result(
+                &db,
+                org.id,
+                ds.id,
+                Utc::now() - chrono::Duration::seconds(500),
+                serde_json::json!({"value": 10.0}),
+            )
+            .await;
+            set_published_latest_query_data(&db, q.id, qr.id).await;
+            let mon = seed_monitor(
+                &db,
+                org.id,
+                q.id,
+                q.user_id,
+                serde_json::json!({"column": "value", "op": ">", "value": 50.0, "max_fresh_wait_secs": 1}),
+            )
+            .await;
+            let target_id = seed_query_run(&db, &q, "running", None).await;
+            let waiter_id =
+                seed_run(&db, org.id, "monitor", mon.id, None, None, "running", None).await;
+            let ctx = ExecuteQueryContext {
+                storage: std::sync::Arc::new(resolver),
+                ..test_ctx(db.clone(), redis.clone())
+            };
+            park_waiter(
+                &db,
+                waiter_id,
+                target_id,
+                Utc::now() - chrono::Duration::seconds(5),
+            )
+            .await;
+
+            sweep_waiting_runs(&ctx).await;
+
+            assert_eq!(
+                run_status(&db, waiter_id).await,
+                "pending",
+                "a storage switch must defer the detached waiter, not fail it"
+            );
+            let deliveries = arcodash_core::entities::notification_delivery::Entity::find()
+                .filter(
+                    arcodash_core::entities::notification_delivery::Column::MonitorId.eq(mon.id),
+                )
+                .count(&db)
+                .await
+                .unwrap();
+            assert_eq!(deliveries, 0);
+            exec_sql(
+                &db,
+                "UPDATE runs SET status = 'success' WHERE id = ANY($1)",
+                [vec![waiter_id, target_id].into()],
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
     async fn sweep_waiting_runs_hard_timeout_fails_an_always_wait_monitor() {
         let Some((db, redis)) = setup().await else {
             eprintln!("skipping: TEST_DATABASE_URL not set");
@@ -3310,6 +3420,40 @@ mod tests {
             ctx.store.get(&linked_key).await.is_ok(),
             "a linked upload's object must never be deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_uploads_skips_paused_orgs() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-orphan-paused-{}", uuid::Uuid::new_v4())).await;
+        let mut ctx = test_ctx(db.clone(), redis.clone());
+        let paused = std::sync::Arc::new(
+            arcodash_core::test_support::blob::StaticResolver::with_store(
+                arcodash_core::org_storage::StorageMode::ArcoDash,
+                std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default()),
+                "orgs/test/",
+            )
+            .paused(),
+        );
+        ctx.storage = paused;
+        let (first, _) = seed_upload(&db, &ctx.store, org.id, None, 25).await;
+        let (second, _) = seed_upload(&db, &ctx.store, org.id, None, 26).await;
+
+        sweep_orphan_uploads(&ctx).await;
+
+        for id in [first, second] {
+            assert!(
+                data_source_upload::Entity::find_by_id(id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a paused org's orphaned uploads must be left for a later sweep"
+            );
+        }
     }
 
     #[tokio::test]

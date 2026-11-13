@@ -1428,6 +1428,7 @@ pub async fn execute(
     }
 
     crate::services::data_source_service::require_not_paused(db, data_source_id).await?;
+    results.ensure_writable(org_id).await?;
 
     let job_id = Uuid::new_v4().to_string();
     arcodash_core::queue::set_job_status(

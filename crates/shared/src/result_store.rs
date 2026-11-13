@@ -92,6 +92,19 @@ async fn touch_last_used(db: &impl ConnectionTrait, ids: &[i64]) {
     }
 }
 
+/// `resolver.resolve` that reports an unreachable bucket to the resolver.
+async fn resolve_reporting(
+    resolver_db: &DatabaseConnection,
+    resolver: &dyn OrgStorageResolver,
+    org_id: i64,
+) -> Result<OrgStorage, StorageError> {
+    let resolved = resolver.resolve(resolver_db, org_id).await;
+    if let Err(e @ StorageError::Unreachable { .. }) = &resolved {
+        resolver.report_failure(resolver_db, org_id, e).await;
+    }
+    resolved
+}
+
 async fn fetch_object(
     resolver_db: &DatabaseConnection,
     resolver: &dyn OrgStorageResolver,
@@ -130,7 +143,7 @@ pub async fn load_result(
     let data = if let Some(inline) = &qr.data {
         inline.clone()
     } else if let Some(location) = &qr.data_location {
-        let storage = resolver.resolve(resolver_db, qr.org_id).await?;
+        let storage = resolve_reporting(resolver_db, resolver, qr.org_id).await?;
         match fetch_object(resolver_db, resolver, &storage, qr.org_id, location).await? {
             Some(v) => v,
             None => return Ok(None),
@@ -161,7 +174,7 @@ pub async fn load_results(
             out.insert(qr.id, inline.clone());
         } else if let Some(location) = &qr.data_location {
             if let Entry::Vacant(e) = storages.entry(qr.org_id) {
-                e.insert(resolver.resolve(resolver_db, qr.org_id).await?);
+                e.insert(resolve_reporting(resolver_db, resolver, qr.org_id).await?);
             }
             pending.push((qr.id, qr.org_id, location.as_str()));
         }

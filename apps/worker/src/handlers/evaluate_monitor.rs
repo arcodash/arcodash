@@ -17,9 +17,10 @@ use arcodash_core::models::{parse_monitor_options, MonitorOptions};
 use arcodash_core::monitor_eval::EvaluateMonitorPayload;
 use arcodash_core::notify::{enqueue_send_notification, SendNotificationParams};
 use arcodash_core::observation_store;
+use arcodash_core::org_storage::StorageError;
 use arcodash_core::schedule_spec::ScheduleSpec;
 
-use crate::handlers::execute_query::ExecuteQueryContext;
+use crate::handlers::execute_query::{ExecuteQueryContext, STORAGE_UNREACHABLE_REASON};
 use crate::handlers::explain_alert;
 use crate::handlers::resume_monitor;
 use crate::handlers::send_notification::{format_number, format_observed_cell};
@@ -61,12 +62,31 @@ pub async fn handle(ctx: &ExecuteQueryContext, org_id: i64, monitor_id: i64, run
     let _heartbeat = run_lifecycle::spawn_heartbeat(ctx.db.clone(), rid);
 
     if let Err(e) = drive_fresh_evaluation(ctx, org_id, monitor_id, rid).await {
+        if is_storage_switching(&e) {
+            defer_for_storage_switch(ctx, rid).await;
+            return;
+        }
         tracing::error!(monitor_id, run_id = rid, error = %e, "evaluate_monitor: freshness protocol failed");
         // Any error escaping the protocol finalizes the run failed so it never stays 'running'.
         if let Err(e) = finalize_terminal(ctx, rid, RunStatus::Failed, Some(format!("{e:#}"))).await
         {
             tracing::error!(monitor_id, run_id = rid, error = %e, "evaluate_monitor: failed to finalize a failed run");
         }
+    }
+}
+
+pub fn is_storage_switching(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<StorageError>(),
+        Some(StorageError::Switching)
+    )
+}
+
+/// Returns the run to `pending` so the stale-pending sweep re-runs the check after the switch.
+pub async fn defer_for_storage_switch(ctx: &ExecuteQueryContext, run_id: i64) {
+    tracing::info!(run_id, "evaluate_monitor: storage switching, run deferred");
+    if let Err(e) = run_lifecycle::defer_run(ctx, run_id).await {
+        tracing::error!(run_id, error = %e, "evaluate_monitor: failed to defer a run during a storage switch");
     }
 }
 
@@ -251,6 +271,12 @@ pub async fn evaluate_and_finalize(
     run_id: i64,
     evaluated: Option<(i64, i64)>,
 ) -> anyhow::Result<()> {
+    // A paused or switching store parks the check; an unreachable one is mapped to `unevaluable`.
+    match ctx.storage.resolve(&ctx.db, org_id).await {
+        Ok(s) if s.writes_paused() => return Err(StorageError::Switching.into()),
+        Err(StorageError::Switching) => return Err(StorageError::Switching.into()),
+        _ => {}
+    }
     let eval = evaluate_state(&ctx.db, &*ctx.storage, monitor, org_id).await?;
     let won = run_lifecycle::finalize_run(
         ctx,
@@ -759,7 +785,8 @@ impl Evaluation {
 ///
 /// # Errors
 ///
-/// Database failure, or the result's storage being unreachable or switching.
+/// Database failure, or the result's storage switching (an unreachable bucket evaluates as
+/// `"unevaluable"`).
 async fn evaluate_state(
     db: &sea_orm::DatabaseConnection,
     resolver: &dyn arcodash_core::org_storage::OrgStorageResolver,
@@ -770,10 +797,22 @@ async fn evaluate_state(
     let Some(qr) = resolve_result_row(db, monitor, org_id).await? else {
         return Ok(Evaluation::new("unknown", None, None, None, None));
     };
-    let Some(data) = arcodash_core::result_store::load_result(db, db, resolver, &qr).await? else {
-        return Ok(Evaluation::new("unknown", None, None, None, None));
-    };
     let qr_id = qr.id;
+    let data = match arcodash_core::result_store::load_result(db, db, resolver, &qr).await {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(Evaluation::new("unknown", None, None, None, None)),
+        // A failed object read was already reported by the result store.
+        Err(StorageError::Unreachable { .. }) => {
+            return Ok(Evaluation::new(
+                "unevaluable",
+                Some(STORAGE_UNREACHABLE_REASON.into()),
+                None,
+                None,
+                Some(qr_id),
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    };
     let unevaluable = |reason: String| -> anyhow::Result<Evaluation> {
         Ok(Evaluation::new(
             "unevaluable",
@@ -1168,7 +1207,7 @@ mod org_scoping_tests {
     }
 
     #[tokio::test]
-    async fn evaluate_state_unreachable_storage_errors() {
+    async fn evaluate_state_unreachable_storage_is_unevaluable() {
         let Some(db) = test_db().await else { return };
         let org = seed_org(&db, &format!("org-down-evalmonitor-{}", Uuid::new_v4())).await;
         let query = seed_query_with_result(&db, org.id, serde_json::json!(100.0)).await;
@@ -1186,9 +1225,12 @@ mod org_scoping_tests {
         );
 
         let monitor = mem_monitor(org.id, query.id, over_50());
-        assert!(evaluate_state(&db, &failing, &monitor, org.id)
+        let eval = evaluate_state(&db, &failing, &monitor, org.id)
             .await
-            .is_err());
+            .unwrap();
+        assert_eq!(eval.state, "unevaluable");
+        assert_eq!(eval.reason.as_deref(), Some(STORAGE_UNREACHABLE_REASON));
+        assert_eq!(failing.failures(), 1);
     }
 
     #[test]
@@ -2858,5 +2900,85 @@ mod entitlement_gate_tests {
             "a blocked run-backed evaluation must finalize skipped, not stay pending"
         );
         assert_eq!(reloaded.error.as_deref(), Some("blocked by test"));
+    }
+}
+
+#[cfg(test)]
+mod storage_error_tests {
+    //! A result that can't be read because the org's storage is unreachable evaluates as
+    //! `unevaluable` and notifies; a storage switch defers the run instead.
+    use super::fixtures::*;
+    use super::*;
+    use crate::scheduler::test_support::*;
+    use arcodash_core::test_support::blob::StaticResolver;
+
+    async fn seed_externalized(db: &sea_orm::DatabaseConnection) -> (i64, monitor::Model, i64) {
+        let (org_id, mon, qr_id) = seed_published_monitor(db, Utc::now(), 100.0, over_50()).await;
+        let mon = set_state(db, mon.id, "ok").await;
+        subscribe(db, org_id, mon.id).await;
+        externalize_result(db, &test_resolver(), qr_id, false).await;
+        let run_id = seed_run(db, org_id, "monitor", mon.id, None, None, "running", None).await;
+        (org_id, mon, run_id)
+    }
+
+    fn ctx_with(
+        db: &sea_orm::DatabaseConnection,
+        redis: &redis::aio::ConnectionManager,
+        resolver: Arc<StaticResolver>,
+    ) -> ExecuteQueryContext {
+        ExecuteQueryContext {
+            storage: resolver,
+            ..test_ctx(db.clone(), redis.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_monitor_goes_to_unevaluable_and_notifies() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let (org_id, mon, run_id) = seed_externalized(&db).await;
+        let ctx = ctx_with(&db, &redis, Arc::new(test_resolver().unreachable()));
+
+        evaluate_and_finalize(&ctx, org_id, &mon, run_id, None)
+            .await
+            .unwrap();
+
+        let reloaded = reload(&db, mon.id).await;
+        assert_eq!(reloaded.state, "unevaluable");
+        assert_eq!(
+            reloaded.unevaluable_reason.as_deref(),
+            Some("Can't reach your storage bucket")
+        );
+        assert_eq!(delivery_count(&db, mon.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn switching_defers_monitor_check_without_failing_it() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        for resolver in [test_resolver().switching(), test_resolver().paused()] {
+            let (org_id, mon, run_id) = seed_externalized(&db).await;
+            let ctx = ctx_with(&db, &redis, Arc::new(resolver));
+
+            let err = evaluate_and_finalize(&ctx, org_id, &mon, run_id, None)
+                .await
+                .unwrap_err();
+            assert!(is_storage_switching(&err));
+            defer_for_storage_switch(&ctx, run_id).await;
+
+            let r = run::Entity::find_by_id(run_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(r.status, "pending");
+            assert!(r.finished_at.is_none());
+            assert_eq!(reload(&db, mon.id).await.state, "ok");
+            assert_eq!(delivery_count(&db, mon.id).await, 0);
+        }
     }
 }

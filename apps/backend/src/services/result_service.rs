@@ -166,6 +166,25 @@ pub struct ResultReader<'a> {
 }
 
 impl ResultReader<'_> {
+    /// Refuses new work that would write a result while the org's storage is switching or
+    /// unreachable; cached reads are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// `storage_switching` (409) or `storage_unreachable` (503, also reported to the resolver).
+    pub async fn ensure_writable(&self, org_id: i64) -> Result<(), ApiError> {
+        match self.resolver.resolve(self.pool, org_id).await {
+            Ok(storage) if storage.writes_paused() => Err(StorageError::Switching.into()),
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if matches!(e, StorageError::Unreachable { .. }) {
+                    self.resolver.report_failure(self.pool, org_id, &e).await;
+                }
+                Err(e.into())
+            }
+        }
+    }
+
     /// `None` when the result's object is gone.
     ///
     /// # Errors

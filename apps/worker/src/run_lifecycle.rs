@@ -93,6 +93,45 @@ pub async fn claim_pending_run(db: &impl ConnectionTrait, run_id: i64) -> anyhow
     Ok(false)
 }
 
+/// Delay before a run deferred by a storage switch is eligible for re-enqueue.
+pub const STORAGE_DEFER_SECS: u64 = 60;
+
+/// Redis key gating re-pushes of an already-enqueued `pending` run.
+pub fn requeue_cooldown_key(run_id: i64) -> String {
+    format!("arcodash:requeue-cooldown:run:{run_id}")
+}
+
+/// Return a `running` run to `pending` without finalizing it (no failure counted, schedule
+/// untouched). The run is parked (`enqueued_at` cleared, so it neither counts against its data
+/// source's concurrency cap nor ages toward the abandoned-pending timeout); the requeue cooldown
+/// keeps the stale-pending sweep from re-enqueuing it sooner than [`STORAGE_DEFER_SECS`] later.
+/// `Ok(false)`: the run was no longer `running`.
+pub async fn defer_run(ctx: &ExecuteQueryContext, run_id: i64) -> anyhow::Result<bool> {
+    let mut conn = ctx.redis.clone();
+    if let Err(e) = redis::AsyncCommands::set_ex::<_, _, ()>(
+        &mut conn,
+        requeue_cooldown_key(run_id),
+        Utc::now().to_rfc3339(),
+        STORAGE_DEFER_SECS,
+    )
+    .await
+    {
+        tracing::warn!(run_id, error = %e, "run_lifecycle: failed to arm the deferral cooldown");
+    }
+    let res = ctx
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE runs \
+             SET status = 'pending', started_at = NULL, worker_id = NULL, \
+                 lease_expires_at = NULL, waiting_on_run_id = NULL, enqueued_at = NULL \
+             WHERE id = $1 AND status = 'running'",
+            [run_id.into()],
+        ))
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// Spawn a heartbeat guard extending `lease_expires_at` every `run_lease_secs/3` while the run
 /// stays `running`; dropping the guard stops renewal.
 pub fn spawn_heartbeat(db: DatabaseConnection, run_id: i64) -> arcodash_conveyor::HeartbeatGuard {

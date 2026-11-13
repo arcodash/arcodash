@@ -285,6 +285,9 @@ sequenceDiagram
 - **One exit.** Every run ends in a single conditional update, so a worker racing the sweeper is
   harmless. Failures back off exponentially (up to 1 h) and a schedule auto-pauses after
   `AUTO_PAUSE_THRESHOLD` (default 10) consecutive failures.
+- **Storage moves.** While an org's storage is switching, runs and monitor checks are parked as
+  `pending` and resume afterwards; a monitor waiting on a parked query run is still bounded by
+  `MONITOR_WAIT_TIMEOUT`.
 - **Sweeper.** Every 60 s it fails runs whose lease expired, times out runs nobody claimed,
   re-enqueues stale pending runs and notification deliveries, and resumes monitor checks whose
   wake-up was lost.

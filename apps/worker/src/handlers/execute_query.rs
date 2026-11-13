@@ -27,6 +27,7 @@ use arcodash_core::entitlements::WorkGate;
 use arcodash_core::events::record_event;
 use arcodash_core::hash::gen_query_hash;
 use arcodash_core::mailer::Mailer;
+use arcodash_core::org_storage::StorageError;
 use arcodash_core::query_exec::ExecuteQueryPayload;
 use arcodash_core::queue::{self, JobStatus, Queue};
 use arcodash_core::result_store::save_result;
@@ -249,13 +250,25 @@ async fn handle_inner(
             }
         }
         Err(failure) => {
+            let storage_err = match &failure {
+                RunFailure::Error(e) => e.downcast_ref::<StorageError>(),
+                RunFailure::Timeout(_) => None,
+            };
+            if matches!(storage_err, Some(StorageError::Switching)) {
+                return defer_for_storage_switch(ctx, job, heartbeat).await;
+            }
             // `format_error_chain` keeps the full context chain so the FAILURE `error` is
-            // actionable.
-            let (message, status) = match &failure {
-                RunFailure::Timeout(secs) => {
+            // actionable; a storage outage gets a fixed reason, the provider detail goes only to
+            // the resolver.
+            let (message, status) = match (&failure, storage_err) {
+                (_, Some(err @ StorageError::Unreachable { .. })) => {
+                    ctx.storage.report_failure(&ctx.db, job.org_id, err).await;
+                    (STORAGE_UNREACHABLE_REASON.to_string(), RunStatus::Failed)
+                }
+                (RunFailure::Timeout(secs), _) => {
                     (format!("run exceeded {secs}s timeout"), RunStatus::TimedOut)
                 }
-                RunFailure::Error(e) => (format_error_chain(e), RunStatus::Failed),
+                (RunFailure::Error(e), _) => (format_error_chain(e), RunStatus::Failed),
             };
             // A timeout is an expected operational outcome, not a defect worth `error!` volume.
             if status == RunStatus::TimedOut {
@@ -332,6 +345,42 @@ async fn handle_inner(
         }
     }
 
+    Ok(HandleOutcome::Completed)
+}
+
+/// Stored reason when the org's storage bucket can't be reached.
+pub const STORAGE_UNREACHABLE_REASON: &str = "Can't reach your storage bucket";
+
+/// User-facing message for interactive work refused during a storage switch.
+pub const STORAGE_SWITCHING_MESSAGE: &str = "Storage switch in progress";
+
+/// A run-backed execution goes back to `pending` (retried by the stale-pending sweep, never
+/// finalized); an interactive one fails with a message.
+async fn defer_for_storage_switch(
+    ctx: &ExecuteQueryContext,
+    job: &ExecuteQueryPayload,
+    heartbeat: Option<arcodash_conveyor::HeartbeatGuard>,
+) -> anyhow::Result<HandleOutcome> {
+    drop(heartbeat);
+    if let Some(run_id) = job.run_id {
+        tracing::info!(
+            run_id,
+            org_id = job.org_id,
+            "execute_query: storage switching, run deferred"
+        );
+        if run_lifecycle::defer_run(ctx, run_id).await? {
+            set_job_status(ctx, job, JobStatus::Pending, None, None).await?;
+        }
+    } else {
+        set_job_status(
+            ctx,
+            job,
+            JobStatus::Failure,
+            None,
+            Some(STORAGE_SWITCHING_MESSAGE.to_string()),
+        )
+        .await?;
+    }
     Ok(HandleOutcome::Completed)
 }
 
@@ -535,6 +584,9 @@ async fn run_query(
 
     // Resolved before querying so a warehouse run is never spent on a result that can't be stored.
     let storage = ctx.storage.resolve(&ctx.db, job.org_id).await?;
+    if storage.writes_paused() {
+        return Err(StorageError::Switching.into());
+    }
 
     let effective_max_rows = job
         .max_rows
@@ -3300,5 +3352,309 @@ mod write_guard_tests {
             Some(second.query_result_id),
             "a normal sequential rerun must still repoint the query at the latest result"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_error_tests {
+    //! Storage outages in the run lifecycle: a switch defers run-backed work, an unreachable bucket
+    //! fails it with a fixed reason; the connector is never called either way.
+    use super::test_helpers::{test_job, StubConnector};
+    use super::*;
+    use crate::scheduler::test_support::setup;
+    use crate::scheduler::test_support::*;
+    use arcodash_core::entities::{run, schedule};
+    use arcodash_core::test_support::blob::{MemoryBlobStore, StaticResolver};
+    use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Statement};
+    use std::sync::Mutex;
+
+    fn resolver(build: impl FnOnce(StaticResolver) -> StaticResolver) -> Arc<StaticResolver> {
+        Arc::new(build(StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            Arc::new(MemoryBlobStore::default()),
+            "orgs/test/",
+        )))
+    }
+
+    struct Fixture {
+        ctx: ExecuteQueryContext,
+        job: ExecuteQueryPayload,
+        run_id: i64,
+        schedule_id: i64,
+        seen_query: Arc<Mutex<Option<String>>>,
+    }
+
+    async fn fixture(
+        db: &sea_orm::DatabaseConnection,
+        redis: &redis::aio::ConnectionManager,
+        storage: Arc<StaticResolver>,
+        run_backed: bool,
+    ) -> Fixture {
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(db, &format!("org-storage-err-{suffix}")).await;
+        let ds = seed_data_source(db, org.id).await;
+        let q = seed_query(db, org.id, ds.id).await;
+        let schedule = seed_schedule(
+            db,
+            org.id,
+            "query",
+            q.id,
+            serde_json::json!({"kind": "interval", "every_secs": 300}),
+            "skip",
+            chrono::Utc::now() - chrono::Duration::seconds(30),
+            2,
+        )
+        .await;
+        let run_id = seed_run(
+            db,
+            org.id,
+            "query",
+            q.id,
+            Some(schedule.id),
+            Some(ds.id),
+            "pending",
+            None,
+        )
+        .await;
+        let stub = StubConnector::new("pg", 1);
+        let seen_query = stub.seen_query.clone();
+        let mut registry = ConnectorRegistry::new();
+        registry.register(Arc::new(stub));
+        let ctx = ExecuteQueryContext {
+            connectors: Arc::new(registry),
+            storage,
+            ..test_ctx(db.clone(), redis.clone())
+        };
+        let job = ExecuteQueryPayload {
+            query_id: Some(q.id),
+            scheduled: run_backed,
+            run_id: run_backed.then_some(run_id),
+            ..test_job(format!("storage-err-{suffix}"), org.id, ds.id)
+        };
+        Fixture {
+            ctx,
+            job,
+            run_id,
+            schedule_id: schedule.id,
+            seen_query,
+        }
+    }
+
+    async fn load_run(db: &sea_orm::DatabaseConnection, id: i64) -> run::Model {
+        run::Entity::find_by_id(id).one(db).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn switching_defers_scheduled_run_without_running_connector() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        for storage in [
+            resolver(StaticResolver::switching),
+            resolver(StaticResolver::paused),
+        ] {
+            let f = fixture(&db, &redis, storage, true).await;
+            let before = schedule::Entity::find_by_id(f.schedule_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+
+            handle_inner(&f.ctx, &f.job).await.unwrap();
+
+            let r = load_run(&db, f.run_id).await;
+            assert_eq!(r.status, "pending", "a deferred run must return to pending");
+            assert!(r.finished_at.is_none(), "a deferred run is never finalized");
+            assert!(r.error.is_none());
+            assert!(r.started_at.is_none() && r.worker_id.is_none());
+            assert!(r.lease_expires_at.is_none());
+            assert!(
+                f.seen_query.lock().unwrap().is_none(),
+                "the connector must not be called during a switch"
+            );
+            let after = schedule::Entity::find_by_id(f.schedule_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.consecutive_failures, before.consecutive_failures);
+            assert_eq!(after.next_run_at, before.next_run_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_deferred_run_is_requeued_after_the_delay() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let f = fixture(&db, &redis, resolver(StaticResolver::switching), true).await;
+        handle_inner(&f.ctx, &f.job).await.unwrap();
+        // Old enough for the stale-pending sweep to consider it; only the delay holds it back.
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE runs SET created_at = now() - interval '10 minutes', \
+                 job_id = COALESCE(job_id, 'deferred-' || id) WHERE id = $1",
+            [f.run_id.into()],
+        ))
+        .await
+        .unwrap();
+
+        let key = run_lifecycle::requeue_cooldown_key(f.run_id);
+        let mut conn = redis.clone();
+        let ttl = |mut c: redis::aio::ConnectionManager, k: String| async move {
+            let t: i64 = redis::cmd("TTL").arg(k).query_async(&mut c).await.unwrap();
+            t
+        };
+
+        crate::scheduler::sweeper::requeue_stale_pending(&f.ctx).await;
+        let held = ttl(conn.clone(), key.clone()).await;
+        assert!(
+            (1..=run_lifecycle::STORAGE_DEFER_SECS as i64).contains(&held),
+            "within the delay the cooldown must stay armed and untouched, ttl={held}"
+        );
+        let parked = load_run(&db, f.run_id).await;
+        assert_eq!(parked.status, "pending");
+        assert!(
+            parked.enqueued_at.is_none(),
+            "within the delay the run stays parked"
+        );
+
+        let _: () = redis::AsyncCommands::del(&mut conn, &key).await.unwrap();
+        crate::scheduler::sweeper::requeue_stale_pending(&f.ctx).await;
+        let r = load_run(&db, f.run_id).await;
+        assert_eq!(r.status, "pending");
+        assert!(r.enqueued_at.is_some(), "the sweep must re-enqueue the run");
+        let _: () = redis::AsyncCommands::del(&mut conn, &key).await.unwrap();
+    }
+
+    async fn age_run(db: &sea_orm::DatabaseConnection, run_id: i64) {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE runs SET created_at = now() - interval '10 hours', \
+                 job_id = COALESCE(job_id, 'deferred-' || id) WHERE id = $1",
+            [run_id.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_runs_do_not_starve_the_data_source_cap() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let f = fixture(&db, &redis, resolver(StaticResolver::switching), true).await;
+        let ds_id = f.job.data_source_id;
+        let q2 = seed_query(&db, f.job.org_id, ds_id).await;
+        let run2 = seed_run(
+            &db,
+            f.job.org_id,
+            "query",
+            q2.id,
+            None,
+            Some(ds_id),
+            "pending",
+            None,
+        )
+        .await;
+        let job2 = ExecuteQueryPayload {
+            job_id: format!("storage-err-{}", uuid::Uuid::new_v4()),
+            query_id: Some(q2.id),
+            run_id: Some(run2),
+            ..f.job.clone()
+        };
+        set_max_concurrent_runs(&db, ds_id, 1).await;
+
+        handle_inner(&f.ctx, &f.job).await.unwrap();
+        handle_inner(&f.ctx, &job2).await.unwrap();
+
+        let mut conn = redis.clone();
+        for id in [f.run_id, run2] {
+            age_run(&db, id).await;
+            let _: () =
+                redis::AsyncCommands::del(&mut conn, run_lifecycle::requeue_cooldown_key(id))
+                    .await
+                    .unwrap();
+        }
+        crate::scheduler::sweeper::requeue_stale_pending(&f.ctx).await;
+
+        let enqueued = [f.run_id, run2];
+        let mut count = 0;
+        for id in enqueued {
+            let r = load_run(&db, id).await;
+            assert_eq!(r.status, "pending");
+            count += i32::from(r.enqueued_at.is_some());
+            let _: () =
+                redis::AsyncCommands::del(&mut conn, run_lifecycle::requeue_cooldown_key(id))
+                    .await
+                    .unwrap();
+        }
+        assert!(
+            count >= 1,
+            "deferred runs must not count against the cap, so one is re-enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_pending_sweep_keeps_deferred_runs() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let f = fixture(&db, &redis, resolver(StaticResolver::switching), true).await;
+        handle_inner(&f.ctx, &f.job).await.unwrap();
+        age_run(&db, f.run_id).await;
+
+        crate::scheduler::sweeper::fail_abandoned_pending(&f.ctx).await;
+
+        let r = load_run(&db, f.run_id).await;
+        assert_eq!(r.status, "pending");
+        assert!(r.enqueued_at.is_none());
+        let mut conn = redis.clone();
+        let _: () =
+            redis::AsyncCommands::del(&mut conn, run_lifecycle::requeue_cooldown_key(f.run_id))
+                .await
+                .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreachable_fails_run_with_storage_reason() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let storage = resolver(StaticResolver::unreachable);
+        let f = fixture(&db, &redis, storage.clone(), true).await;
+
+        handle_inner(&f.ctx, &f.job).await.unwrap();
+
+        let r = load_run(&db, f.run_id).await;
+        assert_eq!(r.status, "failed");
+        assert_eq!(r.error.as_deref(), Some("Can't reach your storage bucket"));
+        assert_eq!(storage.failures(), 1, "report_failure must be called once");
+        assert!(f.seen_query.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn interactive_run_during_switch_reports_storage_switch_in_progress() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let f = fixture(&db, &redis, resolver(StaticResolver::switching), false).await;
+
+        handle_inner(&f.ctx, &f.job).await.unwrap();
+
+        let status = queue::get_job_status(&redis, &f.job.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, JobStatus::Failure);
+        assert_eq!(status.error.as_deref(), Some("Storage switch in progress"));
+        assert!(f.seen_query.lock().unwrap().is_none());
+        assert_eq!(load_run(&db, f.run_id).await.status, "pending");
     }
 }

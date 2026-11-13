@@ -646,6 +646,7 @@ pub async fn run(
         ));
     }
     query_service::ensure_run_data_source_access(&db, &user, resolved.data_source_id, id).await?;
+    state.result_reader().ensure_writable(user.org_id).await?;
     let (run, already) = run_service::run_now(
         &db,
         state.queue.clone(),
