@@ -79,11 +79,19 @@ test("Explain dashboard: summary panel, body widget link, previous-vs-current pr
     await expect(page.locator(`[data-widget-id="${widget.id}"]`)).toBeFocused();
 
     // Change the cached value in place (no execution), explain again: the prompt carries both.
-    await queryRows(
-      `UPDATE query_results SET data = jsonb_set(data, '{rows}', '[{"orders_total": 7373}]')
-       WHERE id = (SELECT COALESCE(published_latest_query_data_id, latest_query_data_id) FROM queries WHERE id = $1)`,
-      [q.id],
-    );
+    const cachedId = (
+      await queryRows<{ id: number }>(
+        "SELECT COALESCE(published_latest_query_data_id, latest_query_data_id) AS id FROM queries WHERE id = $1",
+        [q.id],
+      )
+    )[0].id;
+    const { query_result: cached } = await api.rawFetch<{
+      query_result: { data: { columns: unknown[]; rows: unknown[] } };
+    }>(`/api/query_results/${cachedId}`);
+    await queryRows("UPDATE query_results SET data = $2::jsonb WHERE id = $1", [
+      cachedId,
+      JSON.stringify({ ...cached.data, rows: [{ orders_total: 7373 }] }),
+    ]);
     await page.reload();
     await expect(page.locator("td").filter({ hasText: /^7,?373$/ })).toBeVisible({ timeout: 15_000 });
     await page.getByRole("button", { name: "Explain" }).click();

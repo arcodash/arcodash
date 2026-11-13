@@ -344,11 +344,10 @@ test.describe("monitor freshness: attach-or-trigger + resume", () => {
       expect(Number(finalRun.data_age_secs)).toBeLessThan(10);
 
       // Evaluated the NEW result (n=1), not the stale seed.
-      const qr = await queryRows<{ data: { rows: { n: number }[] } }>(
-        "SELECT data FROM query_results WHERE id = $1",
-        [finalRun.query_result_id],
-      );
-      expect(qr[0].data.rows[0].n).toBe(1);
+      const { query_result } = await api.rawFetch<{
+        query_result: { data: { rows: { n: number }[] } };
+      }>(`/api/query_results/${finalRun.query_result_id}`);
+      expect(query_result.data.rows[0].n).toBe(1);
 
       const monitorRow = await queryRows<{ state: string }>(
         "SELECT state FROM monitors WHERE id = $1",

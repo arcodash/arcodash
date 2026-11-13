@@ -4,7 +4,7 @@
  * Valkey :6380. */
 import { test, expect, type Page, type Locator } from "@playwright/test";
 import { adminContext } from "./helpers/auth";
-import { loginAsAdmin, executeAndWait, TARGET_DS_OPTIONS } from "./helpers/api";
+import { loginAsAdmin, executeAndWait, E2EApiClient, TARGET_DS_OPTIONS } from "./helpers/api";
 import { queryRows } from "./helpers/db";
 import { publishWake } from "./helpers/valkey";
 import { enterEditMode } from "./helpers/actions";
@@ -40,6 +40,7 @@ async function evaluateAndWait(monitorId: number, expected: string): Promise<voi
 /** Force a re-evaluation and poll until the newest terminal run's observed cell for `column` equals
  * expected; needed when state doesn't flip, so the state poll can't prove a fresh run. */
 async function waitForObserved(
+  api: E2EApiClient,
   monitorId: number,
   column: string,
   expected: string,
@@ -48,15 +49,21 @@ async function waitForObserved(
   await expect
     .poll(
       async () => {
-        const r = await queryRows<{ v: string | null }>(
-          `SELECT (qr.data->'rows'->0->>$2) AS v
-           FROM runs r JOIN query_results qr ON qr.id = r.query_result_id
+        const r = await queryRows<{ qr: number | null }>(
+          `SELECT r.query_result_id AS qr
+           FROM runs r
            WHERE r.entity_type = 'monitor' AND r.entity_id = $1
              AND r.status IN ('success','failed','timed_out','cancelled','skipped')
            ORDER BY r.id DESC LIMIT 1`,
-          [monitorId, column],
+          [monitorId],
         );
-        return r[0]?.v ?? null;
+        const qrId = r[0]?.qr;
+        if (qrId == null) return null;
+        const { query_result } = await api.rawFetch<{
+          query_result: { data: { rows: Record<string, unknown>[] } };
+        }>(`/api/query_results/${qrId}`);
+        const v = query_result.data.rows[0]?.[column];
+        return v == null ? null : String(v);
       },
       { timeout: 90_000, intervals: [2000] },
     )
@@ -181,7 +188,7 @@ test("monitor widget: create via UI, flip a monitor state for real, then read it
       await executeAndWait(api, q.id);
       await evaluateAndWait(monitorA.id, "triggered");
       // B's state doesn't flip and its 900s schedule never fires; force + wait for its run.
-      await waitForObserved(monitorB.id, "count", "10");
+      await waitForObserved(api, monitorB.id, "count", "10");
 
       // Long monitor names truncate in a 1-col card; hover reveals the full title.
       const longName = `e2e-mw-long-${stamp}-${"very-long-monitor-name-".repeat(3)}`;
