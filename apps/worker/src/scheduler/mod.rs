@@ -25,6 +25,7 @@ const LEADER_LOCK_KEY_DIGEST: &str = "arcodash:scheduler:leader:digest";
 const LEADER_LOCK_KEY_UPLOAD_SWEEP: &str = "arcodash:scheduler:leader:upload_sweep";
 const LEADER_LOCK_KEY_RESULT_SWEEP: &str = "arcodash:scheduler:leader:result_sweep";
 const LEADER_LOCK_KEY_SCHEMA_DAILY: &str = "arcodash:scheduler:leader:schema_daily";
+const LEADER_LOCK_KEY_STORAGE_BACKFILL: &str = "arcodash:scheduler:leader:storage_backfill";
 /// TTL for the once-per-user-per-day digest idempotence guard; two days so the key outlives the day
 /// it names.
 const DIGEST_SENT_GUARD_TTL_SECS: u64 = 172_800;
@@ -71,6 +72,22 @@ fn upload_sweep_secs() -> u64 {
 /// Default interval for the expired-result sweep (1 hour); floored at 60s.
 const RESULT_SWEEP_SECS_DEFAULT: u64 = 3600;
 const RESULT_SWEEP_SECS_MIN: u64 = 60;
+
+const STORAGE_BACKFILL_SECS_DEFAULT: u64 = 60;
+const STORAGE_BACKFILL_SECS_MIN: u64 = 10;
+const STORAGE_BACKFILL_BATCH_DEFAULT: i64 = 200;
+
+/// `STORAGE_BACKFILL_SECS`: interval of the inline-data backfill, floored at 10s.
+fn storage_backfill_secs() -> u64 {
+    arcodash_core::config::env_parsed("STORAGE_BACKFILL_SECS", STORAGE_BACKFILL_SECS_DEFAULT)
+        .max(STORAGE_BACKFILL_SECS_MIN)
+}
+
+/// `STORAGE_BACKFILL_BATCH`: rows per area per backfill tick; at least 1.
+fn storage_backfill_batch() -> i64 {
+    arcodash_core::config::env_parsed("STORAGE_BACKFILL_BATCH", STORAGE_BACKFILL_BATCH_DEFAULT)
+        .max(1)
+}
 
 fn result_sweep_secs() -> u64 {
     let configured: u64 =
@@ -187,6 +204,32 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
         ),
     ));
     jobs.push((
+        "storage backfill",
+        Job::new_repeated_async(
+            Duration::from_secs(storage_backfill_secs()),
+            leader_tick(
+                &ctx,
+                &lock_id,
+                LEADER_LOCK_KEY_STORAGE_BACKFILL,
+                |ctx| async move {
+                    match crate::storage_backfill::backfill_batch(&ctx, storage_backfill_batch())
+                        .await
+                    {
+                        Ok(stats) if !stats.is_empty() => {
+                            tracing::info!(
+                                results = stats.results,
+                                observations = stats.observations,
+                                "storage backfill: copied inline data"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(error = %e, "storage backfill failed"),
+                    }
+                },
+            ),
+        ),
+    ));
+    jobs.push((
         "daily schema",
         Job::new_async(
             "0 17 * * * *",
@@ -239,6 +282,7 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
         LEADER_LOCK_KEY_UPLOAD_SWEEP,
         LEADER_LOCK_KEY_RESULT_SWEEP,
         LEADER_LOCK_KEY_SCHEMA_DAILY,
+        LEADER_LOCK_KEY_STORAGE_BACKFILL,
     ] {
         release_leader_lock(&ctx.redis, key, &lock_id).await;
     }

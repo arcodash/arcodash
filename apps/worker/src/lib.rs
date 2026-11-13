@@ -7,6 +7,7 @@ mod health;
 mod heartbeat;
 mod run_lifecycle;
 mod scheduler;
+mod storage_backfill;
 
 use std::sync::Arc;
 

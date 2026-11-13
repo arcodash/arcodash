@@ -117,6 +117,33 @@ pub async fn append_observation(
     .await
 }
 
+/// Merges one line by id: an existing line keeps its stored fields except those `v` supplies
+/// (`value` or `explanation` when `Some`); an absent line is appended as given.
+///
+/// # Errors
+///
+/// Database or storage failure.
+pub async fn upsert_observation(
+    db: &DatabaseConnection,
+    storage: &OrgStorage,
+    monitor_id: i64,
+    v: &ObservationValues,
+) -> Result<(), StorageError> {
+    modify_month(db, storage, monitor_id, v.observed_at, |items| {
+        if let Some(item) = items.iter_mut().find(|i| i.id == v.id) {
+            if v.value.is_some() {
+                item.value = v.value;
+            }
+            if v.explanation.is_some() {
+                item.explanation.clone_from(&v.explanation);
+            }
+        } else {
+            items.push(v.clone());
+        }
+    })
+    .await
+}
+
 /// Every month file overlapping `[from, to]`; a missing file is a gap, not an error.
 ///
 /// # Errors
@@ -325,6 +352,38 @@ mod tests {
     async fn month_lines(mem: &MemoryBlobStore, key: &str) -> Vec<ObservationValues> {
         use crate::org_storage::BlobStore;
         parse_lines(&mem.get(key).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn upsert_observation_merges_without_duplicating() {
+        let Some(db) = db().await else { return };
+        let (s, mem) = storage();
+        let at = ts(2026, 4, 5);
+        set_explanation(&db, &s, 902, 7, at, "stored why")
+            .await
+            .unwrap();
+        upsert_observation(&db, &s, 902, &obs(7, at, 4.0))
+            .await
+            .unwrap();
+        let key = "orgs/1/monitors/902/observations/2026-04.jsonl";
+        let lines = month_lines(&mem, key).await;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].value, Some(4.0));
+        assert_eq!(lines[0].explanation.as_deref(), Some("stored why"));
+
+        let with_why = ObservationValues {
+            explanation: Some("new why".into()),
+            ..obs(7, at, 5.0)
+        };
+        upsert_observation(&db, &s, 902, &with_why).await.unwrap();
+        upsert_observation(&db, &s, 902, &obs(8, at, 1.0))
+            .await
+            .unwrap();
+        let lines = month_lines(&mem, key).await;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].value, Some(5.0));
+        assert_eq!(lines[0].explanation.as_deref(), Some("new why"));
+        assert_eq!(lines[1].id, 8);
     }
 
     #[tokio::test]

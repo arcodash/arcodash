@@ -669,8 +669,6 @@ pub mod blob {
         }
     }
 
-    /// Resolves every organization to the same store. The returned storage keeps the template's
-    /// mode, root and pause flag but carries the requested `org_id`.
     #[derive(Clone, Copy)]
     enum ResolveMode {
         Ready,
@@ -679,6 +677,8 @@ pub mod blob {
         Unreachable,
     }
 
+    /// Resolves every organization to the same store. The returned storage keeps the template's
+    /// mode, root and pause flag but carries the requested `org_id`.
     pub struct StaticResolver {
         storage: OrgStorage,
         mode: ResolveMode,

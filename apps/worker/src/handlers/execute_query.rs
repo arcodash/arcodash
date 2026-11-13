@@ -3593,8 +3593,8 @@ mod storage_error_tests {
                     .unwrap();
         }
         assert!(
-            count >= 1,
-            "deferred runs must not count against the cap, so one is re-enqueued"
+            count == 1,
+            "deferred runs must not count against the cap: exactly one is enqueued, the other waits"
         );
     }
 

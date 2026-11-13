@@ -166,7 +166,8 @@ const REQUEUE_COOLDOWN_SECS: u64 = 300;
 
 /// Retries `pending` runs older than [`STALE_PENDING_SECS`] via `try_enqueue_run`, which re-checks
 /// the concurrency cap. Already-enqueued rows are gated behind [`REQUEUE_COOLDOWN_SECS`] in Redis
-/// to avoid duplicate envelopes; never-enqueued rows retry every sweep.
+/// to avoid duplicate envelopes; deferred rows wait out their cooldown, and other never-enqueued
+/// rows retry every sweep.
 pub async fn requeue_stale_pending(ctx: &ExecuteQueryContext) -> usize {
     let rows: Vec<run::Model> = match run::Entity::find()
         .from_raw_sql(Statement::from_sql_and_values(
