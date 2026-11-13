@@ -21,6 +21,13 @@ export interface AppExtension {
   sidebarFooterSlot?: ComponentType<{ collapsed: boolean }>;
   /** Wraps login/signup/verify/invite-accept content; default centered layout otherwise. */
   authShellSlot?: ComponentType<{ children: ReactNode }>;
+  /** Rendered next to a query result's meta line (query editor) and in dashboard widget footers;
+   * `publicView` is true on public/embedded dashboards. */
+  resultFootnoteSlot?: ComponentType<{
+    retrievedAt?: string;
+    placement: "editor" | "widget";
+    publicView?: boolean;
+  }>;
   /** Called after `logout()` clears its state so an extension can drop session-scoped state before
    * the next login. */
   onLogout?: () => void;

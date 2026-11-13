@@ -6,6 +6,7 @@ import type * as ReactRouterModule from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { server } from "./msw-server";
+import { extensions } from "@/extensions";
 import { AuthProvider } from "@/lib/auth";
 import { PERMISSION_KEYS } from "@/lib/permissions";
 
@@ -2478,5 +2479,66 @@ describe("QueryEditorPage tags + description", () => {
       );
       expect(values).toEqual(["revenue", "ops"]);
     });
+  });
+});
+
+describe("QueryEditorPage result footnote slot", () => {
+  const RETRIEVED_AT = new Date(Date.now() - 9 * 60_000).toISOString();
+
+  beforeEach(() => {
+    server.use(
+      http.get(`${BASE}/api/data_sources`, () => HttpResponse.json({ data_sources: [DS], can_create: true })),
+      http.get(`${BASE}/api/data_sources/1/schema`, () => HttpResponse.json({ schema: [] })),
+      http.get(`${BASE}/api/query_snippets`, () => HttpResponse.json([])),
+      http.get(`${BASE}/api/queries/42`, () => HttpResponse.json({ ...QUERY, latest_query_data_id: 99 })),
+      http.get(`${BASE}/api/queries/42/results`, () =>
+        HttpResponse.json({
+          query_result: {
+            id: 99,
+            data_source_id: 1,
+            query_hash: "h",
+            query: "SELECT 1",
+            data: {
+              columns: [{ name: "count", type: "integer", friendly_name: "count" }],
+              rows: [{ count: 1 }],
+              runtime_seconds: 0.01,
+            },
+            runtime: 0.01,
+            retrieved_at: RETRIEVED_AT,
+          },
+        }),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    extensions.length = 0;
+  });
+
+  it("renders_result_footnote_slot_when_provided", async () => {
+    extensions.push({
+      navItems: [],
+      routes: [],
+      resultFootnoteSlot: (p) => (
+        <span data-testid="ext-footnote">
+          {p.placement}|{p.retrievedAt}|{String(p.publicView)}
+        </span>
+      ),
+    });
+
+    renderEditor("/queries/42");
+
+    const note = await screen.findByTestId("ext-footnote");
+    expect(note).toHaveTextContent(`editor|${RETRIEVED_AT}|undefined`);
+    expect(note.closest("p")).toHaveTextContent(/Updated 9 min ago/);
+  });
+
+  it("renders_nothing_without_extension", async () => {
+    renderEditor("/queries/42");
+
+    const meta = (await screen.findByText(/Updated 9 min ago/i)).closest("p");
+    expect(meta).not.toBeNull();
+    expect(meta).not.toHaveTextContent("·  ·");
+    expect(meta?.textContent?.trim().endsWith("Updated 9 min ago")).toBe(true);
   });
 });

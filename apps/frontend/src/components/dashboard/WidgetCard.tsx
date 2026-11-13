@@ -10,6 +10,7 @@ import { ApiError, api, apiErrorMessage } from "@/lib/api";
 import { usePollJob } from "@/lib/jobs";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { getViz, toVizData } from "@/components/visualizations/registry";
+import { ResultFootnote, hasResultFootnote } from "@/components/ResultFootnote";
 import { TileFreshnessDot } from "./TileFreshnessDot";
 import { MonitorWidget, computeMonitorCardMeta, type MonitorCardMeta } from "./MonitorWidget";
 import type { Widget, ResultData, ParamValue } from "@/types/api";
@@ -366,6 +367,18 @@ export const WidgetCard = memo(function WidgetCard({
           <TextWidget text={widget.text} />
         )}
       </div>
+      {!editMode && widget.visualization_id != null && hasResultFootnote() && (
+        <div
+          data-testid="widget-result-footnote"
+          className="min-w-0 truncate px-3 pb-2 text-xs text-muted-foreground"
+        >
+          <ResultFootnote
+            retrievedAt={widget.freshness?.retrieved_at}
+            placement="widget"
+            publicView={publicView}
+          />
+        </div>
+      )}
     </div>
   );
 });

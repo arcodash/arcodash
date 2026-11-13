@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { ResultFootnote, hasResultFootnote } from "@/components/ResultFootnote";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -1672,6 +1673,12 @@ export function QueryEditorPage() {
                       {result.data.rows.length} row{result.data.rows.length === 1 ? "" : "s"} ·{" "}
                       {(result.data.runtime_seconds ?? result.runtime).toFixed(3)}s · Updated{" "}
                       {timeAgo(Date.parse(result.retrieved_at), now)}
+                      {hasResultFootnote() && (
+                        <>
+                          <span aria-hidden>·</span>
+                          <ResultFootnote retrievedAt={result.retrieved_at} placement="editor" />
+                        </>
+                      )}
                     </p>
                     <div className="flex items-center gap-2">
                       {queryId != null &&

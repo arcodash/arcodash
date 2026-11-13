@@ -3,6 +3,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { extensions } from "@/extensions";
 import { WidgetCard } from "../WidgetCard";
 import type { Widget } from "@/types/api";
 
@@ -229,5 +230,37 @@ describe("WidgetCard drag affordances", () => {
     expect(c.querySelector("[data-testid='widget-title-group']")).not.toBeInTheDocument();
     expect(c.querySelector(".select-none")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Remove / })).toBeInTheDocument();
+  });
+});
+
+describe("WidgetCard result footnote slot", () => {
+  afterEach(() => {
+    extensions.length = 0;
+  });
+
+  it("renders_result_footnote_slot_when_provided", () => {
+    const widget = vizWidget(3600);
+    extensions.push({
+      navItems: [],
+      routes: [],
+      resultFootnoteSlot: (p) => (
+        <span data-testid="ext-footnote">
+          {p.placement}|{p.retrievedAt}|{String(p.publicView)}
+        </span>
+      ),
+    });
+
+    renderCard(widget, { publicView: true });
+
+    expect(screen.getByTestId("ext-footnote")).toHaveTextContent(
+      `widget|${widget.freshness!.retrieved_at}|true`,
+    );
+    expect(screen.getByTestId("widget-result-footnote")).toContainElement(screen.getByTestId("ext-footnote"));
+  });
+
+  it("renders_nothing_without_extension", () => {
+    renderCard(vizWidget(3600));
+
+    expect(screen.queryByTestId("widget-result-footnote")).not.toBeInTheDocument();
   });
 });
