@@ -925,10 +925,12 @@ mod tests {
             .await
             .unwrap();
         let mut ctx = test_ctx(db.clone(), redis.clone());
+        ctx.storage = std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            ctx.store.clone(),
+        ));
         ctx.connectors = std::sync::Arc::new(
             arcodash_core::connectors::registry::ConnectorRegistry::with_db(
                 db.clone(),
-                ctx.store.clone(),
                 ctx.storage.clone(),
             ),
         );

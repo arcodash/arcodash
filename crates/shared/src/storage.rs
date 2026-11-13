@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use sea_orm::DatabaseConnection;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::connectors::http_connectors::percent_encode;
+use crate::org_storage::{OrgStorageResolver, StorageArea, StorageError};
 
 const METADATA_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
@@ -427,14 +429,99 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Object key for an uploaded file, including the connector type so uploads never collide on
-/// `upload_id` alone.
+/// Legacy absolute object key for an uploaded file (`orgs/<org>/uploads/...`). Such keys are read
+/// as `orgs/<org>/uploads/<rest>` -> `<rest>` in the Uploads area.
 #[must_use]
 pub fn object_key(org_id: i64, connector_type: &str, upload_id: Uuid, filename: &str) -> String {
     format!(
         "orgs/{org_id}/uploads/{connector_type}/{upload_id}/{}",
         sanitize_filename(filename)
     )
+}
+
+/// Key of an uploaded file relative to [`StorageArea::Uploads`], including the connector type so
+/// uploads never collide on `upload_id` alone. This is what `data_source_uploads.object_key` holds.
+#[must_use]
+pub fn upload_rel_key(connector_type: &str, upload_id: Uuid, filename: &str) -> String {
+    format!(
+        "{connector_type}/{upload_id}/{}",
+        sanitize_filename(filename)
+    )
+}
+
+/// Maps a stored upload key to its key in the org's Uploads area. Absolute keys
+/// (`orgs/<org>/uploads/<rest>`) name `<rest>` there; relative keys pass through unchanged.
+fn upload_area_key(org_id: i64, object_key: &str) -> Result<&str, StorageError> {
+    if !object_key.starts_with("orgs/") {
+        return Ok(object_key);
+    }
+    object_key
+        .strip_prefix(format!("orgs/{org_id}/uploads/").as_str())
+        .ok_or_else(|| {
+            StorageError::Other(anyhow::anyhow!(
+                "upload key outside the organization's storage"
+            ))
+        })
+}
+
+/// Reads an uploaded file through the org's storage.
+///
+/// # Errors
+/// [`StorageError::NotFound`] when the object is gone; otherwise the storage failure.
+pub async fn get_upload(
+    resolver: &dyn OrgStorageResolver,
+    db: &DatabaseConnection,
+    org_id: i64,
+    object_key: &str,
+) -> Result<Bytes, StorageError> {
+    let area_key = upload_area_key(org_id, object_key)?;
+    let result = match resolver.resolve(db, org_id).await {
+        Ok(storage) => storage.get(StorageArea::Uploads, area_key).await,
+        Err(e) => Err(e),
+    };
+    match &result {
+        Err(e @ StorageError::Unreachable { .. }) => resolver.report_failure(db, org_id, e).await,
+        Err(StorageError::NotFound) => resolver.report_missing(db, org_id).await,
+        _ => {}
+    }
+    result
+}
+
+/// Deletes an uploaded file with the same key routing as [`get_upload`]; a missing object is Ok.
+///
+/// # Errors
+/// The storage failure, if any.
+pub async fn delete_upload(
+    resolver: &dyn OrgStorageResolver,
+    db: &DatabaseConnection,
+    org_id: i64,
+    object_key: &str,
+) -> Result<(), StorageError> {
+    let area_key = upload_area_key(org_id, object_key)?;
+    let result = match resolver.resolve(db, org_id).await {
+        Ok(storage) => storage.delete(StorageArea::Uploads, area_key).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Err(StorageError::NotFound) => Ok(()),
+        Err(e) => {
+            if matches!(e, StorageError::Unreachable { .. }) {
+                resolver.report_failure(db, org_id, &e).await;
+            }
+            Err(e)
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
+/// Connector-facing error for a failed upload read; carries no object keys or values.
+#[must_use]
+pub fn upload_read_error(err: StorageError, what: &str) -> anyhow::Error {
+    match err {
+        StorageError::NotFound => anyhow::anyhow!("file unavailable, upload again"),
+        StorageError::Other(e) => e.context(format!("failed to fetch {what}")),
+        e => anyhow::anyhow!("{e}"),
+    }
 }
 
 /// 60s total timeout covers `put` too (the 25MB upload cap needs ~440KB/s). No redirects: GCS's
@@ -490,6 +577,88 @@ mod tests {
         let id = Uuid::nil();
         let key = object_key(42, "csv", id, "../evil.csv");
         assert_eq!(key, format!("orgs/42/uploads/csv/{id}/_evil.csv"));
+    }
+
+    #[test]
+    fn upload_rel_key_sanitizes_filename() {
+        let id = Uuid::nil();
+        assert_eq!(
+            upload_rel_key("csv", id, "../evil name.csv"),
+            format!("csv/{id}/_evil_name.csv")
+        );
+        let rel = upload_rel_key("csv", id, "a.csv");
+        assert_eq!(upload_area_key(1, &rel).unwrap(), rel);
+        assert_eq!(
+            upload_area_key(1, &object_key(1, "csv", id, "a.csv")).unwrap(),
+            rel
+        );
+    }
+
+    fn upload_test_resolver() -> (
+        Arc<crate::test_support::blob::MemoryBlobStore>,
+        crate::test_support::blob::StaticResolver,
+    ) {
+        use crate::test_support::blob::{MemoryBlobStore, StaticResolver};
+        let mem = Arc::new(MemoryBlobStore::default());
+        let resolver = StaticResolver::with_store(
+            crate::org_storage::StorageMode::Customer,
+            mem.clone(),
+            "acme/",
+        );
+        (mem, resolver)
+    }
+
+    #[tokio::test]
+    async fn legacy_upload_key_reads_through_org_storage() {
+        use crate::org_storage::BlobStore;
+        let (mem, resolver) = upload_test_resolver();
+        let id = Uuid::new_v4();
+        mem.put(
+            &format!("acme/uploads/csv/{id}/data.csv"),
+            Bytes::from_static(b"a,b\n1,2\n"),
+            "text/csv",
+        )
+        .await
+        .unwrap();
+        let db = DatabaseConnection::default();
+        let got = get_upload(
+            &resolver,
+            &db,
+            7,
+            &format!("orgs/7/uploads/csv/{id}/data.csv"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&got[..], b"a,b\n1,2\n");
+    }
+
+    #[tokio::test]
+    async fn legacy_upload_key_of_another_org_is_rejected() {
+        let (mem, resolver) = upload_test_resolver();
+        let db = DatabaseConnection::default();
+        let key = format!("orgs/8/uploads/csv/{}/data.csv", Uuid::new_v4());
+        let got = get_upload(&resolver, &db, 7, &key).await;
+        assert!(matches!(got, Err(StorageError::Other(_))), "got: {got:?}");
+        let del = delete_upload(&resolver, &db, 7, &key).await;
+        assert!(matches!(del, Err(StorageError::Other(_))));
+        assert_eq!(mem.gets(), 0);
+        assert_eq!(mem.deletes(), 0);
+        assert_eq!(resolver.missing(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_upload_missing_reports_missing_once() {
+        let (_mem, resolver) = upload_test_resolver();
+        let db = DatabaseConnection::default();
+        let got = get_upload(&resolver, &db, 7, "csv/none/data.csv").await;
+        assert!(matches!(got, Err(StorageError::NotFound)));
+        assert_eq!(resolver.missing(), 1);
+    }
+
+    #[test]
+    fn upload_read_error_not_found_message() {
+        let e = upload_read_error(StorageError::NotFound, "uploaded CSV");
+        assert_eq!(e.to_string(), "file unavailable, upload again");
     }
 
     #[test]

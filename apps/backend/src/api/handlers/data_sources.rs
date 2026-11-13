@@ -6,6 +6,7 @@
 //!
 //! Responses never include `encrypted_options` or decrypted secrets.
 
+use arcodash_core::org_storage::{StorageArea, StorageError};
 use axum::extract::{Multipart, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -884,12 +885,29 @@ pub async fn upload(
     };
 
     let upload_id = Uuid::new_v4();
-    let object_key = storage::object_key(user.org_id, &type_name, upload_id, &filename);
-    state
-        .store
-        .put(&object_key, bytes.clone(), &content_type)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to store upload: {e:#}")))?;
+    let object_key = storage::upload_rel_key(&type_name, upload_id, &filename);
+    let stored = match state.storage.resolve(&state.db, user.org_id).await {
+        Ok(org_storage) => {
+            org_storage
+                .put(
+                    StorageArea::Uploads,
+                    &object_key,
+                    bytes.clone(),
+                    &content_type,
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = stored {
+        if matches!(e, StorageError::Unreachable { .. }) {
+            state
+                .storage
+                .report_failure(&state.db, user.org_id, &e)
+                .await;
+        }
+        return Err(e.into());
+    }
 
     #[allow(
         clippy::cast_possible_wrap,

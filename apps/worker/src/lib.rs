@@ -131,14 +131,11 @@ pub async fn run(ext: WorkerExtensions) -> anyhow::Result<()> {
         ))
     });
     let ctx = Arc::new(ExecuteQueryContext {
-        connectors: Arc::new(ConnectorRegistry::with_db(
-            db.clone(),
-            store.clone(),
-            storage.clone(),
-        )),
+        connectors: Arc::new(ConnectorRegistry::with_db(db.clone(), storage.clone())),
         queue: Arc::new(ValkeyQueue::new(redis.clone())),
         db,
         redis,
+        #[cfg(test)]
         store,
         encryption_key,
         mailer: build_mailer(&config),

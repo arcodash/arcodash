@@ -85,11 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let storage: Arc<dyn arcodash_core::org_storage::OrgStorageResolver> = Arc::new(
         arcodash_core::org_storage::DefaultStorageResolver::new(store.clone()),
     );
-    let connectors = Arc::new(ConnectorRegistry::with_db(
-        db.clone(),
-        store.clone(),
-        storage.clone(),
-    ));
+    let connectors = Arc::new(ConnectorRegistry::with_db(db.clone(), storage.clone()));
     let queue = build_queue(&config, redis.clone()).context("failed to build job queue")?;
     // Producer-only: this process never registers a handler or consumes a tier (that's
     // `apps/worker`'s job) — it only ever calls `enqueue()`/`status()`. Built unconditionally on

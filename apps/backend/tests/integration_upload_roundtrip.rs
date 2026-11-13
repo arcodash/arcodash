@@ -12,7 +12,13 @@ use common::spawn_app;
 
 use arcodash_core::connectors::http_connectors::CsvConnector;
 use arcodash_core::connectors::QueryRunner;
-use arcodash_core::storage::ObjectStore;
+use arcodash_core::org_storage::{DefaultStorageResolver, OrgStorageResolver};
+use arcodash_core::storage::{upload_rel_key, ObjectStore};
+use std::sync::Arc;
+
+fn default_resolver(store: &Arc<ObjectStore>) -> Arc<dyn OrgStorageResolver> {
+    Arc::new(DefaultStorageResolver::new(store.clone()))
+}
 
 const SAMPLE_CSV: &[u8] = b"name,age\nalice,30\nbob,40\n";
 const AGG_CSV: &[u8] =
@@ -84,8 +90,15 @@ async fn csv_upload_create_schema_and_query_round_trip() {
     );
 
     let store = ObjectStore::from_env().expect("object store from env");
+    assert_eq!(
+        upload_row.object_key,
+        upload_rel_key("csv", upload_uuid, "data.csv")
+    );
     let stored_bytes = store
-        .get(&upload_row.object_key)
+        .get(&format!(
+            "orgs/{}/uploads/{}",
+            upload_row.org_id, upload_row.object_key
+        ))
         .await
         .expect("uploaded object must be fetchable from the object store");
     assert_eq!(
@@ -162,7 +175,7 @@ async fn csv_upload_create_schema_and_query_round_trip() {
     // `integration_query_results_connector.rs`'s direct-connector proofs.
     // `org_id` mirrors what `query_results::inject_caller` adds to `opts` before any real caller
     // invokes this connector — the org filter added to `CsvConnector::fetch` requires it.
-    let connector = CsvConnector::new(app.db.clone(), store.clone());
+    let connector = CsvConnector::new(app.db.clone(), default_resolver(&store));
     let org_id = upload_row.org_id;
     let opts = serde_json::json!({ "upload_id": upload_id, "delimiter": ",", "org_id": org_id });
 
@@ -337,7 +350,7 @@ async fn a_materialization_failure_leaves_no_temp_file_behind() {
         .org_id;
 
     let store = ObjectStore::from_env().expect("object store from env");
-    let connector = CsvConnector::new(app.db.clone(), store);
+    let connector = CsvConnector::new(app.db.clone(), default_resolver(&store));
     let opts = serde_json::json!({ "upload_id": upload_id, "delimiter": ",", "org_id": org_id });
     connector
         .run_query(&opts, "SELECT 1")
@@ -361,4 +374,167 @@ async fn a_materialization_failure_leaves_no_temp_file_behind() {
         leftover.is_empty(),
         "a failed materialization must not leave a temp file behind: {leftover:?}"
     );
+}
+
+#[tokio::test]
+async fn new_upload_uses_relative_key() {
+    use arcodash_core::entities::data_source_upload;
+    use sea_orm::EntityTrait;
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let resp = upload_csv(&client, &app.address, "data.csv").await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let upload_id = body["upload_id"].as_str().unwrap().to_string();
+    let uuid = uuid::Uuid::parse_str(&upload_id).unwrap();
+    let row = data_source_upload::Entity::find_by_id(uuid)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.object_key, upload_rel_key("csv", uuid, "data.csv"));
+    assert!(!row.object_key.starts_with("orgs/"));
+
+    let store = ObjectStore::from_env().expect("object store from env");
+    let abs = format!("orgs/{}/uploads/{}", row.org_id, row.object_key);
+    assert_eq!(store.get(&abs).await.unwrap().as_ref(), SAMPLE_CSV);
+
+    let connector = CsvConnector::new(app.db.clone(), default_resolver(&store));
+    let opts =
+        serde_json::json!({ "upload_id": upload_id, "delimiter": ",", "org_id": row.org_id });
+    let res = connector
+        .run_query(&opts, "SELECT name FROM data ORDER BY name")
+        .await
+        .expect("query over relative-key upload");
+    assert_eq!(res.rows.len(), 2);
+    assert_eq!(res.rows[0]["name"], "alice");
+    let _ = store.delete(&abs).await;
+}
+
+#[tokio::test]
+async fn legacy_absolute_upload_key_still_reads() {
+    use arcodash_core::entities::data_source_upload;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let resp = upload_csv(&client, &app.address, "data.csv").await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let seed_id = uuid::Uuid::parse_str(body["upload_id"].as_str().unwrap()).unwrap();
+    let seed = data_source_upload::Entity::find_by_id(seed_id)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let store = ObjectStore::from_env().expect("object store from env");
+    let id = uuid::Uuid::new_v4();
+    let key = format!("orgs/{}/uploads/csv/{id}/data.csv", seed.org_id);
+    store
+        .put(&key, SAMPLE_CSV.to_vec().into(), "text/csv")
+        .await
+        .unwrap();
+    data_source_upload::ActiveModel {
+        id: Set(id),
+        org_id: Set(seed.org_id),
+        object_key: Set(key.clone()),
+        filename: Set("data.csv".to_string()),
+        byte_size: Set(SAMPLE_CSV.len() as i64),
+        content_type: Set("text/csv".to_string()),
+        created_by: Set(None),
+        data_source_id: Set(None),
+        created_at: Set(chrono::Utc::now().into()),
+    }
+    .insert(&app.db)
+    .await
+    .unwrap();
+
+    let connector = CsvConnector::new(app.db.clone(), default_resolver(&store));
+    let opts =
+        serde_json::json!({ "upload_id": id.to_string(), "delimiter": ",", "org_id": seed.org_id });
+    let res = connector
+        .run_query(&opts, "SELECT count(*) AS n FROM data")
+        .await
+        .expect("legacy key must read");
+    assert_eq!(res.rows[0]["n"], 2);
+    let _ = store.delete(&key).await;
+}
+
+#[tokio::test]
+async fn missing_upload_reports_file_unavailable() {
+    use arcodash_core::entities::data_source_upload;
+    use sea_orm::EntityTrait;
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let resp = upload_csv(&client, &app.address, "gone.csv").await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let upload_id = body["upload_id"].as_str().unwrap().to_string();
+    let uuid = uuid::Uuid::parse_str(&upload_id).unwrap();
+    let row = data_source_upload::Entity::find_by_id(uuid)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = ObjectStore::from_env().expect("object store from env");
+    store
+        .delete(&format!("orgs/{}/uploads/{}", row.org_id, row.object_key))
+        .await
+        .unwrap();
+
+    let connector = CsvConnector::new(app.db.clone(), default_resolver(&store));
+    let opts =
+        serde_json::json!({ "upload_id": upload_id, "delimiter": ",", "org_id": row.org_id });
+    let err = connector.run_query(&opts, "SELECT 1").await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("file unavailable, upload again"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn upload_put_failure_returns_storage_error() {
+    use arcodash_core::entities::data_source_upload;
+    use arcodash_core::org_storage::StorageMode;
+    use arcodash_core::test_support::blob::{FailingBlobStore, StaticResolver};
+    use sea_orm::{EntityTrait, PaginatorTrait};
+    let failing = Arc::new(FailingBlobStore::default());
+    let resolver = Arc::new(StaticResolver::with_store(
+        StorageMode::ArcoDash,
+        failing.clone(),
+        "orgs/x/",
+    ));
+    let app = skip_if_none!(common::spawn_app_with_storage(resolver.clone()).await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let before = data_source_upload::Entity::find()
+        .count(&app.db)
+        .await
+        .unwrap();
+    let resp = upload_csv(&client, &app.address, "fail.csv").await;
+    assert_eq!(resp.status().as_u16(), 503);
+    assert_eq!(failing.puts(), 1);
+    assert_eq!(resolver.failures(), 1);
+    let after = data_source_upload::Entity::find()
+        .count(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "no upload row may be written");
+}
+
+async fn upload_csv(client: &reqwest::Client, address: &str, name: &str) -> reqwest::Response {
+    let form = reqwest::multipart::Form::new().text("type", "csv").part(
+        "file",
+        reqwest::multipart::Part::bytes(SAMPLE_CSV.to_vec())
+            .file_name(name.to_string())
+            .mime_str("text/csv")
+            .unwrap(),
+    );
+    client
+        .post(format!("{address}/api/data_sources/uploads"))
+        .multipart(form)
+        .send()
+        .await
+        .expect("upload request failed")
 }

@@ -21,7 +21,8 @@ use sqlx::{Column, Row, TypeInfo, ValueRef};
 use uuid::Uuid;
 
 use crate::entities::data_source_upload;
-use crate::storage::ObjectStore;
+use crate::org_storage::OrgStorageResolver;
+use crate::storage::{get_upload, upload_read_error};
 
 use super::{
     friendly_type_from_json_sample, ColumnMeta, ColumnSchema, NetworkTarget, QueryExecutionResult,
@@ -35,7 +36,7 @@ pub struct SqliteOptions {
 
 pub struct SqliteConnector {
     db: DatabaseConnection,
-    store: Arc<ObjectStore>,
+    storage: Arc<dyn OrgStorageResolver>,
     cache_dir: PathBuf,
 }
 
@@ -105,10 +106,10 @@ fn cache_filename(uuid: &Uuid, object_key: &str) -> String {
 }
 
 impl SqliteConnector {
-    pub fn new(db: DatabaseConnection, store: Arc<ObjectStore>) -> Self {
+    pub fn new(db: DatabaseConnection, storage: Arc<dyn OrgStorageResolver>) -> Self {
         Self {
             db,
-            store,
+            storage,
             cache_dir: upload_cache_dir(),
         }
     }
@@ -134,11 +135,9 @@ impl SqliteConnector {
             .context("failed to create upload cache dir")?;
         // Only on a miss: cheap at that frequency, wasteful on the hot hit path.
         prune_stale_cache_files(&self.cache_dir, upload_cache_max_age()).await;
-        let bytes = self
-            .store
-            .get(&row.object_key)
+        let bytes = get_upload(&*self.storage, &self.db, org_id, &row.object_key)
             .await
-            .context("failed to fetch uploaded SQLite database")?;
+            .map_err(|e| upload_read_error(e, "uploaded SQLite database"))?;
         let tmp = self
             .cache_dir
             .join(format!("{uuid}.tmp.{}", Uuid::new_v4()));

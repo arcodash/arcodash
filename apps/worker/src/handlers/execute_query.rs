@@ -42,7 +42,8 @@ pub struct ExecuteQueryContext {
     pub db: DatabaseConnection,
     pub redis: ConnectionManager,
     pub connectors: Arc<ConnectorRegistry>,
-    /// Shared with `ConnectorRegistry::with_db` so the orphan-upload sweep reuses the client.
+    /// Direct object access for tests that seed and inspect stored bytes.
+    #[cfg(test)]
     pub store: Arc<arcodash_core::storage::ObjectStore>,
     pub encryption_key: [u8; 32],
     pub queue: Arc<dyn Queue>,

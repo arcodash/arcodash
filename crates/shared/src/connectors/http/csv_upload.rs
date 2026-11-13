@@ -1,7 +1,7 @@
 //! CSV connector over an uploaded file only, never a server-local path (that would let any
 //! data-source editor read arbitrary files off the backend's disk).
 //!
-//! `upload_id` resolves through `data_source_upload` to the object key in `ObjectStore`.
+//! `upload_id` resolves through `data_source_upload` to an object key in the org's upload storage.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -20,19 +20,20 @@ use crate::connectors::{
     ColumnSchema, NetworkTarget, QueryExecutionResult, QueryRunner, TableSchema,
 };
 use crate::entities::data_source_upload;
-use crate::storage::ObjectStore;
+use crate::org_storage::OrgStorageResolver;
+use crate::storage::{get_upload, upload_read_error};
 
 pub struct CsvConnector {
     db: DatabaseConnection,
-    store: Arc<ObjectStore>,
+    storage: Arc<dyn OrgStorageResolver>,
     cache_dir: PathBuf,
 }
 
 impl CsvConnector {
-    pub fn new(db: DatabaseConnection, store: Arc<ObjectStore>) -> Self {
+    pub fn new(db: DatabaseConnection, storage: Arc<dyn OrgStorageResolver>) -> Self {
         Self {
             db,
-            store,
+            storage,
             cache_dir: upload_cache_dir(),
         }
     }
@@ -61,11 +62,9 @@ impl CsvConnector {
         tokio::fs::create_dir_all(&self.cache_dir)
             .await
             .context("failed to create upload cache dir")?;
-        let bytes = self
-            .store
-            .get(&row.object_key)
+        let bytes = get_upload(&*self.storage, &self.db, org_id, &row.object_key)
             .await
-            .context("failed to fetch uploaded CSV")?;
+            .map_err(|e| upload_read_error(e, "uploaded CSV"))?;
         let tmp = self
             .cache_dir
             .join(format!("{uuid}.tmp.{}", Uuid::new_v4()));
@@ -86,11 +85,9 @@ impl CsvConnector {
         upload_id: &str,
     ) -> Result<(data_source_upload::Model, bytes::Bytes)> {
         let (_, row) = find_upload(&self.db, org_id, upload_id).await?;
-        let bytes = self
-            .store
-            .get(&row.object_key)
+        let bytes = get_upload(&*self.storage, &self.db, org_id, &row.object_key)
             .await
-            .context("failed to fetch uploaded CSV")?;
+            .map_err(|e| upload_read_error(e, "uploaded CSV"))?;
         Ok((row, bytes))
     }
 }

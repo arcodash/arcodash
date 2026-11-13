@@ -831,7 +831,7 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
         &ctx.db,
         Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id, object_key, data_source_id, created_at FROM data_source_uploads \
+            "SELECT id, org_id, object_key, data_source_id, created_at FROM data_source_uploads \
              WHERE data_source_id IS NULL \
                AND created_at < now() - ($1 || ' seconds')::interval",
             [ORPHAN_UPLOAD_AGE_SECS.into()],
@@ -851,7 +851,8 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
             );
             continue;
         };
-        let (Ok(object_key), Ok(data_source_id), Ok(created_at)) = (
+        let (Ok(org_id), Ok(object_key), Ok(data_source_id), Ok(created_at)) = (
+            row.try_get::<i64>("", "org_id"),
             row.try_get::<String>("", "object_key"),
             row.try_get::<Option<i64>>("", "data_source_id"),
             row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "created_at"),
@@ -865,8 +866,14 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
             tracing::error!(upload_id = %id, "sweeper: orphaned-upload query returned a non-orphan row, skipping");
             continue;
         }
-        if let Err(e) = ctx.store.delete(&object_key).await {
-            tracing::error!(upload_id = %id, error = %e, "sweeper: failed to delete orphaned upload object, leaving row for retry");
+        if let Err(e) =
+            arcodash_core::storage::delete_upload(&*ctx.storage, &ctx.db, org_id, &object_key).await
+        {
+            if matches!(e, arcodash_core::org_storage::StorageError::Switching) {
+                tracing::info!(upload_id = %id, "sweeper: org storage is switching, leaving orphaned upload for retry");
+            } else {
+                tracing::error!(upload_id = %id, error = %e, "sweeper: failed to delete orphaned upload object, leaving row for retry");
+            }
             continue;
         }
         if let Err(e) = data_source_upload::Entity::delete_by_id(id)
@@ -3236,7 +3243,10 @@ mod tests {
         let suffix = uuid::Uuid::new_v4();
         let org = seed_org(&db, &format!("org-orphan-sweep-{suffix}")).await;
         let ds = seed_data_source(&db, org.id).await;
-        let ctx = test_ctx(db.clone(), redis.clone());
+        let mut ctx = test_ctx(db.clone(), redis.clone());
+        ctx.storage = std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            ctx.store.clone(),
+        ));
 
         // (a) unlinked, older than the 24h cutoff — must be swept.
         let (orphan_id, orphan_key) = seed_upload(&db, &ctx.store, org.id, None, 25).await;
@@ -3285,6 +3295,71 @@ mod tests {
             ctx.store.get(&linked_key).await.is_ok(),
             "a linked upload's object must never be deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_uploads_deletes_relative_key_objects() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-orphan-rel-{}", uuid::Uuid::new_v4())).await;
+        let (ctx, mem) = ctx_with_mem_store(
+            test_ctx(db.clone(), redis),
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+        );
+        let id = uuid::Uuid::new_v4();
+        let rel = arcodash_core::storage::upload_rel_key("csv", id, "data.csv");
+        let abs = format!("orgs/test/uploads/{rel}");
+        arcodash_core::org_storage::BlobStore::put(
+            &*mem,
+            &abs,
+            bytes::Bytes::from_static(b"a\n1\n"),
+            "text/csv",
+        )
+        .await
+        .unwrap();
+        // A same-named object in the default store must never be touched for a relative key.
+        let decoy = format!("orgs/{}/uploads/{rel}", org.id);
+        ctx.store.ensure_bucket().await.expect("ensure test bucket");
+        ctx.store
+            .put(&decoy, bytes::Bytes::from_static(b"a\n1\n"), "text/csv")
+            .await
+            .unwrap();
+        data_source_upload::ActiveModel {
+            id: Set(id),
+            org_id: Set(org.id),
+            object_key: Set(rel),
+            filename: Set("data.csv".to_string()),
+            byte_size: Set(4),
+            content_type: Set("text/csv".to_string()),
+            created_by: Set(None),
+            data_source_id: Set(None),
+            created_at: Set((chrono::Utc::now() - chrono::Duration::hours(25)).into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        sweep_orphan_uploads(&ctx).await;
+
+        assert!(
+            mem.keys().is_empty(),
+            "object must be deleted via org storage"
+        );
+        assert!(
+            data_source_upload::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "row must be swept"
+        );
+        assert!(
+            ctx.store.get(&decoy).await.is_ok(),
+            "the default store must not be touched for a relative key"
+        );
+        ctx.store.delete(&decoy).await.unwrap();
     }
 
     #[tokio::test]

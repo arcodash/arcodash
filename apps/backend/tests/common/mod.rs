@@ -187,6 +187,16 @@ pub async fn spawn_app_with_org_resolver(
     Some(spawn_with_state(state, serialization_lock).await)
 }
 
+/// Like `spawn_app`, but routes org storage through `resolver`.
+#[allow(dead_code)]
+pub async fn spawn_app_with_storage(
+    resolver: std::sync::Arc<dyn arcodash_core::org_storage::OrgStorageResolver>,
+) -> Option<TestApp> {
+    let (mut state, serialization_lock) = build_test_state(|_| {}).await?;
+    state.storage = resolver;
+    Some(spawn_with_state(state, serialization_lock).await)
+}
+
 /// Entitlements that deny AI features and block scheduled work.
 #[allow(dead_code)]
 pub struct DenyAll;
@@ -274,7 +284,6 @@ async fn build_test_state(
     let connectors = Arc::new(
         arcodash_core::connectors::registry::ConnectorRegistry::with_db(
             db.clone(),
-            store.clone(),
             std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
                 store.clone(),
             )),
