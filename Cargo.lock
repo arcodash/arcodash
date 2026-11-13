@@ -301,6 +301,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dotenvy",
+ "futures",
  "lettre",
  "redis",
  "reqwest",

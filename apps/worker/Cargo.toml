@@ -33,3 +33,4 @@ tokio-stream = { version = "0.1.19", default-features = false }
 arcodash-core = { path = "../../crates/shared", features = ["test-support"] }
 # Inline `#[cfg(test)]` sweep tests build `ObjectStore::put` payloads directly.
 bytes = { workspace = true }
+futures = { workspace = true }

@@ -2875,3 +2875,30 @@ async fn embed_serves_empty_state_when_object_missing() {
         .unwrap();
     assert_eq!(runs, 0, "serving an embed must never start a run");
 }
+
+/// An embed response keeps its full handler-set header set under the `/api` no-store default.
+#[tokio::test]
+async fn embed_response_keeps_its_full_header_set() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let (_dash_id, token) = create_dashboard_embed_fixture(&app, &client).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api/embed/{token}", app.address))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let h = resp.headers();
+    let get = |k: &str| {
+        h.get_all(k)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(get("cache-control"), vec!["no-store"]);
+    assert_eq!(get("x-robots-tag"), vec!["noindex, nofollow"]);
+    assert_eq!(get("referrer-policy"), vec!["no-referrer"]);
+    assert_eq!(get("content-security-policy").len(), 1);
+}

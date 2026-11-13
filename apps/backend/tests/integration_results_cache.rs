@@ -1133,3 +1133,60 @@ async fn run_result_csv_reads_externalized_object_and_404s_when_gone() {
         .unwrap()
         .contains("result no longer retained"));
 }
+
+/// Every `/api` response (data, errors, session) defaults to `Cache-Control: no-store`.
+#[tokio::test]
+async fn api_responses_default_to_no_store() {
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let org_id = default_org_id(&app.db).await;
+
+    let ds_id = create_ds(&client, &app.address, "no-store-ds").await;
+    let sql = "SELECT 1";
+    let (_query_id, hash) = create_query(&client, &app.address, ds_id, "No Store", sql).await;
+    let result_id = seed_result(&app.db, org_id, ds_id, &hash, sql, sample_data()).await;
+
+    let no_store = |resp: &reqwest::Response| {
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    let result = client
+        .get(format!("{}/api/query_results/{result_id}", app.address))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status().as_u16(), 200);
+    assert_eq!(no_store(&result).as_deref(), Some("no-store"));
+
+    let csv = client
+        .get(format!("{}/api/query_results/{result_id}.csv", app.address))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csv.status().as_u16(), 200);
+    assert_eq!(no_store(&csv).as_deref(), Some("no-store"));
+
+    let session = client
+        .get(format!("{}/api/session", app.address))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session.status().as_u16(), 200);
+    assert_eq!(no_store(&session).as_deref(), Some("no-store"));
+
+    let missing = client
+        .get(format!(
+            "{}/api/query_results/{}",
+            app.address,
+            result_id + 1_000_000
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status().as_u16(), 404);
+    assert_eq!(no_store(&missing).as_deref(), Some("no-store"));
+}

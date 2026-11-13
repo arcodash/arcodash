@@ -461,7 +461,7 @@ fn process_schema_rows(rows: Vec<Value>, default_schema: &str) -> Vec<TableSchem
 /// SQL, since the statements API has no parameterized queries.
 fn introspection_db(opts: &SnowflakeOptions) -> Result<&str> {
     let db = opts.database.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("Snowflake schema introspection requires a database. Please edit the connection and specify a 'Database'.")
+        anyhow::anyhow!("Snowflake schema introspection requires a database. Please edit the connection and specify a \"Database\".")
     })?;
     super::http_connectors::validate_identifier(db, "database")?;
     if let Some(schema) = &opts.schema {

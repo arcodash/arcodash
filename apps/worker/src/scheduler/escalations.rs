@@ -249,6 +249,7 @@ mod tests {
     use arcodash_core::entities::{escalation_step, notification_destination, organization};
     use arcodash_core::entitlements::{OrgEntitlements, Unrestricted};
     use arcodash_core::queue::ValkeyQueue;
+    use futures::FutureExt;
     use redis::AsyncCommands;
     use sea_orm::ActiveModelTrait;
     use std::sync::Arc;
@@ -781,7 +782,9 @@ mod tests {
         )
         .await;
 
-        tick(&db, &redis).await;
+        let r = std::panic::AssertUnwindSafe(tick(&db, &redis))
+            .catch_unwind()
+            .await;
 
         exec_sql(
             &db,
@@ -790,6 +793,9 @@ mod tests {
         )
         .await;
         exec_sql(&db, &format!("DROP FUNCTION IF EXISTS {fn_name}()"), []).await;
+        if let Err(p) = r {
+            std::panic::resume_unwind(p);
+        }
 
         let reloaded = reload(&db, mon.id).await;
         assert_eq!(

@@ -126,6 +126,7 @@ and invitation links are logged. The local compose adds Mailpit to catch mail.
 ### 4.1 Requests, authentication and permissions
 
 `build_app` mounts `/health`, `/ping` and `/metrics` at the root and everything else under `/api`.
+Every `/api` response defaults to `Cache-Control: no-store` unless the handler sets its own.
 A request passes these layers from the outside in:
 
 ```mermaid

@@ -135,7 +135,9 @@ impl SendMailHandler {
         task: &TaskContext,
         org_id: i64,
     ) -> Result<String, TaskOutcome> {
-        let failed = |error: String| TaskOutcome::Failed { error };
+        let failed = |error: String| TaskOutcome::Failed {
+            error: arcodash_core::scrub::scrub_error_values(&error),
+        };
         let Some(id) = task.entity_id else {
             return Err(failed("send_mail task has no delivery id".to_string()));
         };
