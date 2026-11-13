@@ -337,7 +337,11 @@ async fn write_health_from_test(
             "UPDATE data_sources SET health_state = 'failing', health_error = $1, \
              health_checked_at = $2 WHERE id = $3 \
              AND (health_checked_at IS NULL OR health_checked_at <= $2)",
-            [e.message.clone().into(), checked_at.into(), ds_id.into()],
+            [
+                arcodash_core::scrub::scrub_error_values(&e.message).into(),
+                checked_at.into(),
+                ds_id.into(),
+            ],
         ),
     };
     if let Err(e) = db.execute_raw(update).await {

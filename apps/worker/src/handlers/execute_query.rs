@@ -301,7 +301,11 @@ async fn handle_inner(
                         "UPDATE queries SET last_execution_status = 'Failed', \
                          last_execution_at = $1, last_execution_error = $2 \
                          WHERE id = $3 AND (last_execution_at IS NULL OR last_execution_at <= $1)",
-                        [Utc::now().into(), message.clone().into(), query_id.into()],
+                        [
+                            Utc::now().into(),
+                            arcodash_core::scrub::scrub_error_values(&message).into(),
+                            query_id.into(),
+                        ],
                     ))
                     .await?;
             }
@@ -312,7 +316,7 @@ async fn handle_inner(
                 "execute_query_failed",
                 Some("query"),
                 job.query_id,
-                serde_json::json!({ "job_id": job.job_id, "error": message }),
+                serde_json::json!({ "job_id": job.job_id, "error": arcodash_core::scrub::scrub_error_values(&message) }),
             )
             .await;
 
@@ -350,7 +354,7 @@ async fn write_data_source_health(
              AND (health_checked_at IS NULL OR health_checked_at <= $3)",
             [
                 state.into(),
-                error.map(std::string::ToString::to_string).into(),
+                error.map(arcodash_core::scrub::scrub_error_values).into(),
                 checked_at.into(),
                 data_source_id.into(),
                 org_id.into(),
@@ -479,7 +483,7 @@ impl arcodash_conveyor::TypedTaskHandler for ExecuteQueryHandler {
             }
             Ok(HandleOutcome::Cancelled) => Ok(arcodash_conveyor::TaskOutcome::Cancelled),
             Err(e) => Ok(arcodash_conveyor::TaskOutcome::Failed {
-                error: format!("{e:#}"),
+                error: arcodash_core::scrub::scrub_error_values(&format!("{e:#}")),
             }),
         }
     }
@@ -759,6 +763,7 @@ mod test_helpers {
         pub auto_limit: bool,
         pub delay_ms: u64,
         pub fail: Option<ConnectorErrorKind>,
+        pub fail_message: Option<&'static str>,
         pub seen_query: Arc<Mutex<Option<String>>>,
         pub seen_opts: Arc<Mutex<Option<Value>>>,
     }
@@ -771,6 +776,7 @@ mod test_helpers {
                 auto_limit: true,
                 delay_ms: 0,
                 fail: None,
+                fail_message: None,
                 seen_query: Default::default(),
                 seen_opts: Default::default(),
             }
@@ -808,6 +814,13 @@ mod test_helpers {
             *self.seen_opts.lock().unwrap() = Some(opts.clone());
             if self.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            if let Some(msg) = self.fail_message {
+                let e = anyhow::anyhow!(msg);
+                return Err(match self.fail {
+                    Some(ConnectorErrorKind::Connect) => connect_err(e),
+                    _ => e,
+                });
             }
             match self.fail {
                 Some(ConnectorErrorKind::Connect) => {
@@ -2294,6 +2307,78 @@ mod auto_limit_truncation_tests {
         assert!(updated.last_execution_at.is_some());
         assert_eq!(updated.row_count, Some(2));
         assert!(updated.last_execution_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn failure_error_text_is_scrubbed_everywhere_it_is_stored() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("scrub-failure-{}", uuid::Uuid::new_v4())).await;
+        let mut registry = ConnectorRegistry::new();
+        registry.register(Arc::new(StubConnector {
+            fail_message: Some("Key (email)=(bob@x.com) already exists."),
+            ..StubConnector::new("scrub-failure-stub", 0)
+        }));
+        let ds = seed_data_source_of_type(&db, org.id, "scrub-failure-stub").await;
+        let q = seed_query(&db, org.id, ds.id, 1).await;
+        let ctx = ctx_with_registry(db.clone(), redis.clone(), registry, 100);
+
+        let mut bound = job(org.id, ds.id);
+        bound.query_id = Some(q.id);
+        let job_id = bound.job_id.clone();
+        handle_inner(&ctx, &bound).await.unwrap();
+
+        let updated = query::Entity::find_by_id(q.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.last_execution_error.as_deref(),
+            Some("Key (email)=(…) already exists.")
+        );
+        let status = queue::get_job_status(&redis, &job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = status.error.unwrap();
+        assert!(err.contains("(…)") && !err.contains("bob@x.com"), "{err}");
+
+        let events = arcodash_core::entities::event::Entity::find()
+            .filter(arcodash_core::entities::event::Column::OrgId.eq(org.id))
+            .filter(arcodash_core::entities::event::Column::Action.eq("execute_query_failed"))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].additional_properties["error"].as_str(),
+            Some("Key (email)=(…) already exists.")
+        );
+    }
+
+    #[tokio::test]
+    async fn health_error_is_scrubbed() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("health-scrub-{}", uuid::Uuid::new_v4())).await;
+        let mut registry = ConnectorRegistry::new();
+        registry.register(Arc::new(StubConnector {
+            fail_message: Some("role 'bob@x.com' does not exist"),
+            fail: Some(arcodash_core::connectors::ConnectorErrorKind::Connect),
+            ..StubConnector::new("health-scrub-stub", 0)
+        }));
+        let ds = seed_data_source_of_type(&db, org.id, "health-scrub-stub").await;
+        let ctx = ctx_with_registry(db.clone(), redis, registry, 100);
+
+        handle_inner(&ctx, &job(org.id, ds.id)).await.unwrap();
+        let (_, error) = ds_health(&db, ds.id).await;
+        assert!(error.is_some());
+        assert!(!error.unwrap().contains("bob@x.com"));
     }
 
     /// A bound job that fails sets `Failed`, the error and `last_execution_at` without moving

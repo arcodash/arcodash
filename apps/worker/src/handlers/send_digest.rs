@@ -75,7 +75,7 @@ impl TypedTaskHandler for SendDigestHandler {
             match deliver(&self.ctx, p.org_id, p.user_id, task.entity_id).await {
                 Ok(()) => TaskOutcome::Success { result_ref: None },
                 Err(e) => TaskOutcome::Failed {
-                    error: format!("{e:#}"),
+                    error: arcodash_core::scrub::scrub_error_values(&format!("{e:#}")),
                 },
             },
         )

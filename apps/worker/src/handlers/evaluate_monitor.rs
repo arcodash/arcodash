@@ -873,7 +873,7 @@ impl TypedTaskHandler for EvaluateMonitorHandler {
             match handle_inner(&self.ctx, p.org_id, p.monitor_id).await {
                 Ok(()) => TaskOutcome::Success { result_ref: None },
                 Err(e) => TaskOutcome::Failed {
-                    error: format!("{e:#}"),
+                    error: arcodash_core::scrub::scrub_error_values(&format!("{e:#}")),
                 },
             },
         )

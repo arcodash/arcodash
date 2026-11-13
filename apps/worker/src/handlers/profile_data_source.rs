@@ -83,7 +83,25 @@ async fn find_owned(
 
 /// Connector errors can be arbitrarily long; bound anything stored or shown.
 fn cap_error(msg: &str) -> String {
-    msg.chars().take(MAX_ERROR_CHARS).collect()
+    arcodash_core::scrub::scrub_error_values(msg)
+        .chars()
+        .take(MAX_ERROR_CHARS)
+        .collect()
+}
+
+/// The profile entry for a table whose sample failed; its error text carries no quoted values.
+fn failed_table(t: &SchemaTable, e: &anyhow::Error) -> AiProfileTable {
+    AiProfileTable {
+        name: t.name.clone(),
+        sampled_rows: 0,
+        columns: t
+            .columns
+            .iter()
+            .map(|c| column_stats(&[], &c.name, "string"))
+            .collect(),
+        data_profiled_at: None,
+        error: Some(cap_error(&format!("{e:#}"))),
+    }
 }
 
 async fn set_last_error(ctx: &ExecuteQueryContext, data_source_id: i64, err: Option<String>) {
@@ -276,18 +294,9 @@ async fn run(
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(data_source_id, table = %t.name, error = %e, "profile sample failed");
-                    fresh.push(AiProfileTable {
-                        name: t.name.clone(),
-                        sampled_rows: 0,
-                        columns: t
-                            .columns
-                            .iter()
-                            .map(|c| column_stats(&[], &c.name, "string"))
-                            .collect(),
-                        data_profiled_at: None,
-                        error: Some(cap_error(&format!("{e:#}"))),
-                    });
+                    let failed = failed_table(t, &e);
+                    tracing::warn!(data_source_id, table = %t.name, error = ?failed.error, "profile sample failed");
+                    fresh.push(failed);
                 }
             }
         }
@@ -605,6 +614,17 @@ mod tests {
         assert!(select_tables(ProfileData::None, "pg", &p, &schema, &[]).is_empty());
         assert!(select_tables(ProfileData::Changed, "bigquery", &p, &schema, &[]).is_empty());
         assert!(!select_tables(ProfileData::Changed, "pg", &p, &schema, &[]).is_empty());
+    }
+
+    #[test]
+    fn profile_table_error_is_scrubbed() {
+        let err = anyhow::anyhow!("Key (email)=(bob@x.com) already exists.");
+        let table = failed_table(&st("users"), &err);
+        let json = serde_json::to_string(&table).unwrap();
+        assert!(
+            json.contains("(…)") && !json.contains("bob@x.com"),
+            "{json}"
+        );
     }
 
     #[test]

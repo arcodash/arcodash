@@ -207,7 +207,11 @@ async fn finalize_run_matching(
             [
                 outcome.status.as_db_str().into(),
                 outcome.row_count.into(),
-                outcome.error.clone().into(),
+                outcome
+                    .error
+                    .as_deref()
+                    .map(arcodash_core::scrub::scrub_error_values)
+                    .into(),
                 outcome.query_result_id.into(),
                 outcome.data_age_secs.into(),
                 outcome.condition_met.into(),
@@ -1309,6 +1313,39 @@ mod tests {
             status.status,
             JobStatus::Cancelled,
             "Skipped's lossy mapping to Cancelled (the closest non-error terminal status)"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_run_stores_scrubbed_error() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let (_q, run_id) = seed_query_run(&db, "finalize-scrub", "running").await;
+        let job_id = format!("finalize-scrub-{}", uuid::Uuid::new_v4());
+        set_job_id(&db, run_id, &job_id).await;
+
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let raw = "Key (email)=(bob@x.com) already exists.";
+        finalize_run(
+            &ctx,
+            run_id,
+            RunOutcome::terminal(RunStatus::Failed, Some(raw.to_string())),
+        )
+        .await
+        .unwrap();
+
+        let row = query_row(&db, "SELECT error FROM runs WHERE id = $1", [run_id.into()]).await;
+        let error: String = row.try_get("", "error").unwrap();
+        assert_eq!(error, "Key (email)=(…) already exists.");
+        let job = queue::get_job_status(&redis, &job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.error.as_deref(),
+            Some("Key (email)=(…) already exists.")
         );
     }
 

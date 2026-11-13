@@ -122,7 +122,7 @@ impl TypedTaskHandler for SendMailHandler {
         Ok(match result {
             Ok(()) => TaskOutcome::Success { result_ref: None },
             Err(e) => TaskOutcome::Failed {
-                error: format!("{e:#}"),
+                error: arcodash_core::scrub::scrub_error_values(&format!("{e:#}")),
             },
         })
     }

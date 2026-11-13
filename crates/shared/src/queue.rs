@@ -339,7 +339,7 @@ pub async fn set_job_status(
         user_id,
         status,
         query_result_id,
-        error,
+        error: error.map(|e| crate::scrub::scrub_error_values(&e)),
         updated_at: Utc::now(),
     };
     let payload = serde_json::to_string(&record)?;

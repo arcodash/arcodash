@@ -29,6 +29,7 @@ pub mod query_exec;
 pub mod queue;
 pub mod redis_util;
 pub mod result_store;
+pub mod scrub;
 pub mod secrets;
 pub mod shutdown;
 pub mod storage;

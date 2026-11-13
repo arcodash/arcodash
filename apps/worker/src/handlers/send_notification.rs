@@ -191,7 +191,7 @@ async fn record_delivery_failed_event(
             "destination_id": (destination_id != -1).then_some(destination_id),
             "destination_name": destination_name,
             "state": state,
-            "error": error,
+            "error": error.map(arcodash_core::scrub::scrub_error_values),
             "attempt": attempt,
         }),
     )
@@ -407,7 +407,9 @@ async fn handle_inner(
                             tracing::warn!(
                                 "send_notification: missing 'to' address for email destination"
                             );
-                            Outcome::failed_permanent("email destination is missing a 'to' address")
+                            Outcome::failed_permanent(
+                                "email destination is missing a \"to\" address",
+                            )
                         }
                     }
                     Ok(opts) => {
@@ -488,7 +490,10 @@ async fn handle_inner(
             destination_id: Set((destination_id != -1).then_some(destination_id)),
             state: Set(new_state.clone()),
             status: Set(recorded_status.to_string()),
-            error: Set(outcome.error),
+            error: Set(outcome
+                .error
+                .as_deref()
+                .map(arcodash_core::scrub::scrub_error_values)),
             attempt_number: Set(attempt as i32),
             // No evaluation run id is available on the fallback path.
             run_id: Set(None),
@@ -640,7 +645,7 @@ impl TypedTaskHandler for SendNotificationHandler {
         Ok(match result {
             Ok(_) => TaskOutcome::Success { result_ref: None },
             Err(e) => TaskOutcome::Failed {
-                error: format!("{e:#}"),
+                error: arcodash_core::scrub::scrub_error_values(&format!("{e:#}")),
             },
         })
     }
@@ -2495,7 +2500,7 @@ mod retry_tests {
         assert_eq!(rows[0].attempt_number, 1);
         assert_eq!(
             rows[0].error.as_deref(),
-            Some("email destination is missing a 'to' address")
+            Some("email destination is missing a \"to\" address")
         );
     }
 
@@ -2936,6 +2941,43 @@ mod delivery_failed_audit_event_tests {
             .await
             .unwrap()
             .len()
+    }
+
+    #[tokio::test]
+    async fn failed_event_error_is_scrubbed() {
+        let Some((db, _redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(
+            &db,
+            &format!("org-failed-event-scrub-{}", uuid::Uuid::new_v4()),
+        )
+        .await;
+        let (monitor_model, _) = seed_org_with_monitor(&db, org.id).await;
+        record_delivery_failed_event(
+            &db,
+            org.id,
+            monitor_model.id,
+            -1,
+            "dest",
+            "failed",
+            Some("Key (email)=(bob@x.com) already exists."),
+            3,
+        )
+        .await;
+        let ev = event::Entity::find()
+            .filter(event::Column::OrgId.eq(org.id))
+            .filter(event::Column::Action.eq("notification_delivery_failed"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = ev.additional_properties["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(err, "Key (email)=(…) already exists.");
     }
 
     #[tokio::test]

@@ -26,7 +26,10 @@ async fn mark_enqueue_failed(db: &impl ConnectionTrait, id: i64, error: &anyhow:
             DbBackend::Postgres,
             "UPDATE mail_deliveries SET status = 'failed', finished_at = now(), error = $2 \
              WHERE id = $1 AND status = 'pending'",
-            [id.into(), format!("{error:#}").into()],
+            [
+                id.into(),
+                crate::scrub::scrub_error_values(&format!("{error:#}")).into(),
+            ],
         ))
         .await;
     if let Err(e) = result {
@@ -384,6 +387,43 @@ mod tests {
         assert_eq!(row.body_html, None);
         assert_eq!(row.body_location, None);
         assert!(!row.error.unwrap_or_default().contains("secret body"));
+    }
+
+    #[tokio::test]
+    async fn mail_enqueue_failure_error_is_scrubbed() {
+        let Some((db, org_id)) = db_with_org("org-mail-enqueue-scrub").await else {
+            return;
+        };
+        let storage = OrgStorage::new(
+            org_id,
+            crate::org_storage::StorageMode::ArcoDash,
+            std::sync::Arc::new(crate::test_support::blob::FailingBlobStore::new(
+                "Key (email)=(bob@x.com) already exists.",
+            )),
+            "orgs/x/",
+        );
+        enqueue_send_mail(
+            &db,
+            &storage,
+            &RecordingQueue::default(),
+            None,
+            org_id,
+            "to@test.local".to_string(),
+            "subject".to_string(),
+            "<p>body</p>".to_string(),
+        )
+        .await
+        .unwrap_err();
+        let row = mail_delivery::Entity::find()
+            .filter(mail_delivery::Column::OrgId.eq(org_id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.error.as_deref(),
+            Some("storage unreachable: Key (email)=(…) already exists.")
+        );
     }
 
     #[tokio::test]
