@@ -23,7 +23,7 @@ function textWidget(text: string): Widget {
   };
 }
 
-function renderCard(widget: Widget, props: { publicView?: boolean } = {}) {
+function renderCard(widget: Widget, props: { publicView?: boolean; editMode?: boolean } = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter>
@@ -256,6 +256,19 @@ describe("WidgetCard result footnote slot", () => {
       `widget|${widget.freshness!.retrieved_at}|true`,
     );
     expect(screen.getByTestId("widget-result-footnote")).toContainElement(screen.getByTestId("ext-footnote"));
+  });
+
+  it("does_not_render_slot_in_edit_mode", () => {
+    extensions.push({
+      navItems: [],
+      routes: [],
+      resultFootnoteSlot: () => <span data-testid="ext-footnote">note</span>,
+    });
+
+    renderCard(vizWidget(3600), { editMode: true });
+
+    expect(screen.queryByTestId("ext-footnote")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("widget-result-footnote")).not.toBeInTheDocument();
   });
 
   it("renders_nothing_without_extension", () => {

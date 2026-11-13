@@ -2533,6 +2533,15 @@ describe("QueryEditorPage result footnote slot", () => {
     expect(note.closest("p")).toHaveTextContent(/Updated 9 min ago/);
   });
 
+  it("leaves_no_separator_when_slot_renders_nothing", async () => {
+    extensions.push({ navItems: [], routes: [], resultFootnoteSlot: () => null });
+
+    renderEditor("/queries/42");
+
+    const meta = (await screen.findByText(/Updated 9 min ago/i)).closest("p");
+    expect(meta?.textContent?.trim().endsWith("Updated 9 min ago")).toBe(true);
+  });
+
   it("renders_nothing_without_extension", async () => {
     renderEditor("/queries/42");
 

@@ -1658,7 +1658,7 @@ export function QueryEditorPage() {
                 >
                   <div className="flex items-center justify-between">
                     <p
-                      className="flex items-center gap-2 text-sm text-muted-foreground"
+                      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground"
                       title={exactTs(Date.parse(result.retrieved_at))}
                     >
                       {isStale && (
@@ -1674,10 +1674,7 @@ export function QueryEditorPage() {
                       {(result.data.runtime_seconds ?? result.runtime).toFixed(3)}s · Updated{" "}
                       {timeAgo(Date.parse(result.retrieved_at), now)}
                       {hasResultFootnote() && (
-                        <>
-                          <span aria-hidden>·</span>
-                          <ResultFootnote retrievedAt={result.retrieved_at} placement="editor" />
-                        </>
+                        <ResultFootnote retrievedAt={result.retrieved_at} placement="editor" />
                       )}
                     </p>
                     <div className="flex items-center gap-2">

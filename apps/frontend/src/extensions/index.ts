@@ -22,7 +22,8 @@ export interface AppExtension {
   /** Wraps login/signup/verify/invite-accept content; default centered layout otherwise. */
   authShellSlot?: ComponentType<{ children: ReactNode }>;
   /** Rendered next to a query result's meta line (query editor) and in dashboard widget footers;
-   * `publicView` is true on public/embedded dashboards. */
+   * `publicView` is true on public/embedded dashboards. The slot owns its leading separator and,
+   * in the editor, must render inline-only content (it sits inside a `<p>`). */
   resultFootnoteSlot?: ComponentType<{
     retrievedAt?: string;
     placement: "editor" | "widget";
