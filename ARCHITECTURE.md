@@ -105,6 +105,14 @@ object is a cache miss. The client speaks the Google Cloud Storage JSON API. The
 compose files run a bundled store and set `STORAGE_EMULATOR_HOST`; without it the client calls
 Google Cloud Storage with credentials from the GCP metadata server.
 
+**Upgrading existing data.** Data held inline in Postgres by earlier versions is copied to object
+storage by a background worker job and verified: results that readers still reach (current or
+published results of a query, results of recent runs, each monitor's latest), all monitor
+observations, all dashboard narratives, recent or pending mail bodies, and AI profile sample
+values. The inline copies stay until an admin runs `arcodash-worker clear-inline-data` (a dry run
+that only counts; `--confirm` clears the rows whose copy re-verifies). Results nothing references
+stay inline until cleared or the data is removed.
+
 **Mail.** Backend (invitations, password resets) and worker (alerts, digests) share one SMTP
 mailer (`crates/shared/src/mailer.rs`). Without `SMTP_HOST`, mail is skipped and recorded as such,
 and invitation links are logged. The local compose adds Mailpit to catch mail.

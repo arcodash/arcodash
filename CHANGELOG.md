@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `arcodash-worker clear-inline-data [--confirm] [--batch N]`: re-verifies each inline copy against
+  object storage and clears it. A dry run by default; only verified rows are touched.
+- A background backfill copies data held inline in Postgres to object storage and verifies it
+  (referenced results, monitor observations, dashboard narratives, recent mail bodies, AI profile
+  values).
+- `RESULT_RETENTION_DAYS` (default 7): stored results unused for that long are deleted.
+- `STORAGE_BACKFILL_RETRY_SECS` (default 3600): wait before a backfill pass with skipped rows repeats.
+
+### Changed
+
+- Query results and other data produced by running queries (monitor observations, dashboard
+  narratives, mail bodies, AI profile sample values) are stored in the object store
+  (`UPLOAD_BUCKET`) instead of Postgres.
+- Upgrade: after the backfill has copied existing data, run `arcodash-worker clear-inline-data`,
+  then `--confirm`, to free the inline copies.
+- API responses carry `Cache-Control: no-store` by default.
+- Error text stored or returned to clients has customer values scrubbed.
+
 ## [0.1.0] - 2026-11-08
 
 Initial open-source release.

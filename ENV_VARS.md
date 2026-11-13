@@ -180,6 +180,7 @@ Uploaded CSV and SQLite files live in an object store that speaks the Google Clo
 | `RESULT_SWEEP_SECS` | `3600` | no | worker | Interval of the expired-result sweep. Floored at 60. |
 | `STORAGE_BACKFILL_SECS` | `60` | no | worker | Interval of the job that copies customer data still held inline in the database into object storage. Inline data is copied, never removed. Floored at 10. |
 | `STORAGE_BACKFILL_BATCH` | `200` | no | worker | Rows copied per area on each backfill tick. Floored at 1. |
+| `STORAGE_BACKFILL_RETRY_SECS` | `3600` | no | worker | Minimum wait before a backfill pass that skipped rows (storage unreachable, paused or a copy that did not verify) starts over. |
 | `DATA_SOURCE_UPLOAD_RATE_LIMIT_PER_MIN` | `10` | no | backend | Per-user cap on `POST /data_sources/uploads`. See [Rate limits](#rate-limits). |
 
 ## AI (bring your own key)

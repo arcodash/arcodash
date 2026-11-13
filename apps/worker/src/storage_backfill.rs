@@ -7,7 +7,16 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    Statement, TransactionTrait,
+};
+
+use arcodash_core::ai::narrative::{load_narrative_content, NarrativeContent};
+use arcodash_core::ai::profile_values::{save_profile_values, split_profile, ProfileValues};
+use arcodash_core::entities::dashboard_narrative;
+use arcodash_core::mail_notify::mail_body_key;
+use arcodash_core::models::DataSourceAiProfile;
 
 use arcodash_core::observation_store::{load_observations, upsert_observation, ObservationValues};
 use arcodash_core::org_storage::{OrgStorage, StorageArea};
@@ -15,22 +24,68 @@ use arcodash_core::result_store::{decode_result, save_result};
 
 use crate::handlers::execute_query::ExecuteQueryContext;
 
-const OBSERVATION_CURSOR_KEY: &str = "arcodash:storage_backfill:observations:cursor";
-/// Set when a pass skipped rows, so the cursor restarts from 0 once the pass completes.
-const OBSERVATION_RETRY_KEY: &str = "arcodash:storage_backfill:observations:retry";
-const RESULT_CURSOR_KEY: &str = "arcodash:storage_backfill:results:cursor";
-const RESULT_RETRY_KEY: &str = "arcodash:storage_backfill:results:retry";
+const RETRY_SECS_DEFAULT: i64 = 3600;
+
+/// `STORAGE_BACKFILL_RETRY_SECS`: minimum wait before a pass that skipped rows is repeated.
+fn retry_secs() -> i64 {
+    arcodash_core::config::env_parsed("STORAGE_BACKFILL_RETRY_SECS", RETRY_SECS_DEFAULT).max(0)
+}
+
+/// Valkey keys of one area's pass state.
+struct Keys {
+    area: &'static str,
+    cursor: String,
+    /// Set when a pass skipped rows, so the cursor restarts from 0 after the retry wait.
+    retry: String,
+    /// Epoch seconds before which a flagged pass is not restarted.
+    reset_at: String,
+    /// Set once the completion of a clean pass has been logged.
+    complete: String,
+}
+
+impl Keys {
+    fn new(area: &'static str) -> Self {
+        let k = |suffix: &str| format!("arcodash:storage_backfill:{area}:{suffix}");
+        Self {
+            area,
+            cursor: k("cursor"),
+            retry: k("retry"),
+            reset_at: k("reset_at"),
+            complete: k("complete"),
+        }
+    }
+
+    fn all(&self) -> [&str; 4] {
+        [&self.cursor, &self.retry, &self.reset_at, &self.complete]
+    }
+}
+
+#[cfg(test)]
+const AREAS: [&str; 5] = [
+    "results",
+    "observations",
+    "narratives",
+    "mail",
+    "ai_profiles",
+];
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub struct BackfillStats {
     pub results: usize,
     pub observations: usize,
+    pub narratives: usize,
+    pub mail: usize,
+    pub ai_profiles: usize,
 }
 
 impl BackfillStats {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.results == 0 && self.observations == 0
+        self.results == 0
+            && self.observations == 0
+            && self.narratives == 0
+            && self.mail == 0
+            && self.ai_profiles == 0
     }
 }
 
@@ -68,33 +123,64 @@ impl<'a> OrgCache<'a> {
     }
 }
 
-/// Ends a pass that found no rows: a flagged pass restarts from 0 on the next batch.
-async fn finish_pass(
-    conn: &mut redis::aio::ConnectionManager,
-    cursor_key: &str,
-    retry_key: &str,
-) -> anyhow::Result<()> {
-    if conn
-        .del::<_, i64>(retry_key)
+async fn read_cursor(conn: &mut redis::aio::ConnectionManager, keys: &Keys) -> anyhow::Result<i64> {
+    Ok(conn
+        .get::<_, Option<i64>>(&keys.cursor)
         .await
-        .context("clear retry flag")?
-        > 0
+        .context("read cursor")?
+        .unwrap_or(0))
+}
+
+/// Ends a pass that found no rows. A clean pass is logged once; a flagged pass waits out the
+/// retry interval, then restarts from 0.
+async fn finish_pass(conn: &mut redis::aio::ConnectionManager, keys: &Keys) -> anyhow::Result<()> {
+    let now = Utc::now().timestamp();
+    if conn
+        .exists::<_, bool>(&keys.retry)
+        .await
+        .context("read retry flag")?
     {
-        let _: () = conn.del(cursor_key).await.context("reset cursor")?;
+        let due: Option<i64> = conn.get(&keys.reset_at).await.context("read reset time")?;
+        match due {
+            None => {
+                let _: () = conn
+                    .set(&keys.reset_at, now + retry_secs())
+                    .await
+                    .context("set reset time")?;
+            }
+            Some(at) if at <= now => {
+                let _: () = conn.del(&keys.all()[..]).await.context("reset pass")?;
+            }
+            Some(_) => {}
+        }
+        return Ok(());
+    }
+    let first: bool = conn
+        .set_nx(&keys.complete, 1)
+        .await
+        .context("mark pass complete")?;
+    if first {
+        tracing::info!(area = keys.area, "storage backfill: pass complete");
     }
     Ok(())
 }
 
 async fn save_cursor(
     conn: &mut redis::aio::ConnectionManager,
-    cursor_key: &str,
-    retry_key: &str,
+    keys: &Keys,
     cursor: i64,
     skipped: bool,
 ) -> anyhow::Result<()> {
-    let _: () = conn.set(cursor_key, cursor).await.context("save cursor")?;
+    let _: () = conn
+        .set(&keys.cursor, cursor)
+        .await
+        .context("save cursor")?;
+    let _: () = conn
+        .del(&keys.complete)
+        .await
+        .context("clear completion mark")?;
     if skipped {
-        let _: () = conn.set(retry_key, 1).await.context("set retry flag")?;
+        let _: () = conn.set(&keys.retry, 1).await.context("set retry flag")?;
     }
     Ok(())
 }
@@ -111,9 +197,15 @@ pub async fn backfill_batch(
     let mut orgs = OrgCache::new(ctx);
     let results = backfill_results(ctx, &mut orgs, limit).await?;
     let observations = backfill_observations(ctx, &mut orgs, limit).await?;
+    let narratives = backfill_narratives(ctx, &mut orgs, limit).await?;
+    let mail = backfill_mail(ctx, &mut orgs, limit).await?;
+    let ai_profiles = backfill_ai_profiles(ctx, &mut orgs, limit).await?;
     Ok(BackfillStats {
         results,
         observations,
+        narratives,
+        mail,
+        ai_profiles,
     })
 }
 
@@ -143,9 +235,11 @@ async fn select_referenced_results(
                  WHERE published_latest_query_data_id > $2 \
                UNION SELECT query_result_id FROM runs \
                  WHERE query_result_id > $2 AND created_at > now() - interval '7 days' \
-               UNION SELECT n.query_result_id FROM ( \
-                 SELECT DISTINCT ON (monitor_id) query_result_id FROM monitor_observations \
-                 ORDER BY monitor_id, id DESC) n \
+               UNION SELECT n.query_result_id FROM monitors m \
+                 CROSS JOIN LATERAL ( \
+                   SELECT o.query_result_id FROM monitor_observations o \
+                   WHERE o.monitor_id = m.id \
+                   ORDER BY o.observed_at DESC, o.id DESC LIMIT 1) n \
                  WHERE n.query_result_id > $2) \
              SELECT qr.id, qr.org_id, qr.data_source_id, qr.query_hash, \
                     EXISTS (SELECT 1 FROM query_results o \
@@ -178,14 +272,11 @@ async fn backfill_results(
     limit: i64,
 ) -> anyhow::Result<usize> {
     let mut conn = ctx.redis.clone();
-    let cursor: i64 = conn
-        .get::<_, Option<i64>>(RESULT_CURSOR_KEY)
-        .await
-        .context("read result cursor")?
-        .unwrap_or(0);
+    let keys = Keys::new("results");
+    let cursor = read_cursor(&mut conn, &keys).await?;
     let rows = select_referenced_results(ctx, limit, cursor).await?;
     if rows.is_empty() {
-        finish_pass(&mut conn, RESULT_CURSOR_KEY, RESULT_RETRY_KEY).await?;
+        finish_pass(&mut conn, &keys).await?;
         return Ok(0);
     }
     let mut copied = 0usize;
@@ -205,8 +296,9 @@ async fn backfill_results(
             continue;
         };
         match copy_result(ctx, storage, &row).await {
-            Ok(true) => copied += 1,
-            Ok(false) => {}
+            Ok(Copy::Copied) => copied += 1,
+            Ok(Copy::Gone) => {}
+            Ok(Copy::Unverified) => skipped = true,
             Err(e) => {
                 skipped = true;
                 orgs.fail(row.org_id);
@@ -214,25 +306,26 @@ async fn backfill_results(
             }
         }
     }
-    save_cursor(
-        &mut conn,
-        RESULT_CURSOR_KEY,
-        RESULT_RETRY_KEY,
-        max_id,
-        skipped,
-    )
-    .await?;
+    save_cursor(&mut conn, &keys, max_id, skipped).await?;
     Ok(copied)
 }
 
+/// Outcome of copying one row.
+enum Copy {
+    Copied,
+    /// The row changed or vanished since it was selected.
+    Gone,
+    /// The stored object did not match the inline data.
+    Unverified,
+}
+
 /// Copies one result under the writers' key lock, then re-reads the object and sets the pointer
-/// only when it decodes to the inline JSON. `Ok(false)` when the row changed or the object did
-/// not verify.
+/// only when it decodes to the inline JSON.
 async fn copy_result(
     ctx: &ExecuteQueryContext,
     storage: &OrgStorage,
     row: &ResultRow,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Copy> {
     let txn = ctx.db.begin().await?;
     txn.execute_raw(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -251,7 +344,7 @@ async fn copy_result(
         .transpose()?
         .flatten();
     let Some(inline) = inline else {
-        return Ok(false);
+        return Ok(Copy::Gone);
     };
     let stored = save_result(storage, row.data_source_id, &row.query_hash, &inline).await?;
     let bytes = storage
@@ -265,7 +358,7 @@ async fn copy_result(
             "storage backfill: stored object does not match the inline data, leaving the row"
         );
         txn.rollback().await?;
-        return Ok(false);
+        return Ok(Copy::Unverified);
     }
     let updated = txn
         .execute_raw(Statement::from_sql_and_values(
@@ -281,10 +374,10 @@ async fn copy_result(
         .await?;
     if updated.rows_affected() != 1 {
         txn.rollback().await?;
-        return Ok(false);
+        return Ok(Copy::Gone);
     }
     txn.commit().await?;
-    Ok(true)
+    Ok(Copy::Copied)
 }
 
 struct ObservationRow {
@@ -302,11 +395,8 @@ async fn backfill_observations(
     limit: i64,
 ) -> anyhow::Result<usize> {
     let mut conn = ctx.redis.clone();
-    let cursor: i64 = conn
-        .get::<_, Option<i64>>(OBSERVATION_CURSOR_KEY)
-        .await
-        .context("read observation cursor")?
-        .unwrap_or(0);
+    let keys = Keys::new("observations");
+    let cursor = read_cursor(&mut conn, &keys).await?;
     let rows = ctx
         .db
         .query_all_raw(Statement::from_sql_and_values(
@@ -320,7 +410,7 @@ async fn backfill_observations(
         .await
         .context("select inline observations")?;
     if rows.is_empty() {
-        finish_pass(&mut conn, OBSERVATION_CURSOR_KEY, OBSERVATION_RETRY_KEY).await?;
+        finish_pass(&mut conn, &keys).await?;
         return Ok(0);
     }
     let mut by_monitor: BTreeMap<(i64, i64), Vec<ObservationRow>> = BTreeMap::new();
@@ -356,21 +446,19 @@ async fn backfill_observations(
             }
         }
     }
-    save_cursor(
-        &mut conn,
-        OBSERVATION_CURSOR_KEY,
-        OBSERVATION_RETRY_KEY,
-        max_id,
-        skipped,
-    )
-    .await?;
+    save_cursor(&mut conn, &keys, max_id, skipped).await?;
     Ok(written)
 }
 
-fn line_matches(stored: Option<&ObservationValues>, row: &ObservationRow) -> bool {
+/// Whether the stored line carries every value the inline row holds.
+pub(crate) fn line_matches(
+    stored: Option<&ObservationValues>,
+    value: Option<f64>,
+    explanation: Option<&str>,
+) -> bool {
     stored.is_some_and(|s| {
-        (row.value.is_none() || s.value == row.value)
-            && (row.explanation.is_none() || s.explanation == row.explanation)
+        (value.is_none() || s.value == value)
+            && (explanation.is_none() || s.explanation.as_deref() == explanation)
     })
 }
 
@@ -391,7 +479,7 @@ async fn copy_observations(
     let mut written = 0usize;
     for row in &sorted {
         let stored = existing.get(&row.id);
-        if line_matches(stored, row) {
+        if line_matches(stored, row.value, row.explanation.as_deref()) {
             continue;
         }
         let values = ObservationValues {
@@ -407,7 +495,7 @@ async fn copy_observations(
         let after = load_observations(storage, monitor_id, from, to).await?;
         for row in &sorted {
             anyhow::ensure!(
-                line_matches(after.get(&row.id), row),
+                line_matches(after.get(&row.id), row.value, row.explanation.as_deref()),
                 "observation {} did not verify after writing",
                 row.id
             );
@@ -416,8 +504,306 @@ async fn copy_observations(
     Ok(written)
 }
 
+/// Whether the stored object equals `expected`.
+async fn object_equals(
+    storage: &OrgStorage,
+    area: StorageArea,
+    rel: &str,
+    expected: &[u8],
+) -> anyhow::Result<bool> {
+    let got = storage.get(area, rel).await.context("re-read object")?;
+    Ok(got.as_ref() == expected)
+}
+
+fn narrative_rel_key(dashboard_id: i64, id: i64) -> String {
+    format!("{dashboard_id}/{id}.json")
+}
+
+async fn backfill_narratives(
+    ctx: &ExecuteQueryContext,
+    orgs: &mut OrgCache<'_>,
+    limit: i64,
+) -> anyhow::Result<usize> {
+    let mut conn = ctx.redis.clone();
+    let keys = Keys::new("narratives");
+    let cursor = read_cursor(&mut conn, &keys).await?;
+    let rows = dashboard_narrative::Entity::find()
+        .filter(dashboard_narrative::Column::Id.gt(cursor))
+        .filter(dashboard_narrative::Column::Summary.is_not_null())
+        .filter(dashboard_narrative::Column::DataLocation.is_null())
+        .order_by_asc(dashboard_narrative::Column::Id)
+        .limit(u64::try_from(limit).unwrap_or(1))
+        .all(&ctx.db)
+        .await
+        .context("select inline narratives")?;
+    if rows.is_empty() {
+        finish_pass(&mut conn, &keys).await?;
+        return Ok(0);
+    }
+    let (mut copied, mut skipped, mut max_id) = (0usize, false, cursor);
+    for row in rows {
+        max_id = max_id.max(row.id);
+        let Some(storage) = orgs.writable(row.org_id).await else {
+            skipped = true;
+            continue;
+        };
+        match copy_narrative(ctx, storage, &row).await {
+            Ok(Copy::Copied) => copied += 1,
+            Ok(Copy::Gone) => {}
+            Ok(Copy::Unverified) => skipped = true,
+            Err(e) => {
+                skipped = true;
+                orgs.fail(row.org_id);
+                tracing::warn!(narrative_id = row.id, error = %e, "storage backfill: narrative copy failed");
+            }
+        }
+    }
+    save_cursor(&mut conn, &keys, max_id, skipped).await?;
+    Ok(copied)
+}
+
+async fn copy_narrative(
+    ctx: &ExecuteQueryContext,
+    storage: &OrgStorage,
+    row: &dashboard_narrative::Model,
+) -> anyhow::Result<Copy> {
+    let Some(content) = load_narrative_content(storage, row).await? else {
+        return Ok(Copy::Gone);
+    };
+    let rel = narrative_rel_key(row.dashboard_id, row.id);
+    let bytes = serde_json::to_vec(&content)?;
+    storage
+        .put(
+            StorageArea::Narratives,
+            &rel,
+            bytes.clone().into(),
+            "application/json",
+        )
+        .await?;
+    let stored = storage
+        .get(StorageArea::Narratives, &rel)
+        .await
+        .context("re-read stored narrative")?;
+    if serde_json::from_slice::<NarrativeContent>(&stored)
+        .ok()
+        .as_ref()
+        != Some(&content)
+    {
+        tracing::warn!(
+            narrative_id = row.id,
+            "storage backfill: stored object does not match the inline data, leaving the row"
+        );
+        return Ok(Copy::Unverified);
+    }
+    let updated = ctx
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE dashboard_narratives SET data_location = $2 \
+             WHERE id = $1 AND data_location IS NULL",
+            [row.id.into(), rel.into()],
+        ))
+        .await?;
+    Ok(if updated.rows_affected() == 1 {
+        Copy::Copied
+    } else {
+        Copy::Gone
+    })
+}
+
+async fn backfill_mail(
+    ctx: &ExecuteQueryContext,
+    orgs: &mut OrgCache<'_>,
+    limit: i64,
+) -> anyhow::Result<usize> {
+    let mut conn = ctx.redis.clone();
+    let keys = Keys::new("mail");
+    let cursor = read_cursor(&mut conn, &keys).await?;
+    let rows = ctx
+        .db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, org_id, body_html FROM mail_deliveries \
+             WHERE id > $1 AND body_html IS NOT NULL AND body_location IS NULL \
+               AND (status IN ('pending', 'retrying') \
+                    OR created_at > now() - interval '7 days') \
+             ORDER BY id LIMIT $2",
+            [cursor.into(), limit.into()],
+        ))
+        .await
+        .context("select inline mail bodies")?;
+    if rows.is_empty() {
+        finish_pass(&mut conn, &keys).await?;
+        return Ok(0);
+    }
+    let (mut copied, mut skipped, mut max_id) = (0usize, false, cursor);
+    for r in rows {
+        let id: i64 = r.try_get("", "id")?;
+        let org_id: i64 = r.try_get("", "org_id")?;
+        let body: String = r.try_get("", "body_html")?;
+        max_id = max_id.max(id);
+        let Some(storage) = orgs.writable(org_id).await else {
+            skipped = true;
+            continue;
+        };
+        match copy_mail(ctx, storage, id, &body).await {
+            Ok(Copy::Copied) => copied += 1,
+            Ok(Copy::Gone) => {}
+            Ok(Copy::Unverified) => skipped = true,
+            Err(e) => {
+                skipped = true;
+                orgs.fail(org_id);
+                tracing::warn!(delivery_id = id, error = %e, "storage backfill: mail body copy failed");
+            }
+        }
+    }
+    save_cursor(&mut conn, &keys, max_id, skipped).await?;
+    Ok(copied)
+}
+
+async fn copy_mail(
+    ctx: &ExecuteQueryContext,
+    storage: &OrgStorage,
+    id: i64,
+    body: &str,
+) -> anyhow::Result<Copy> {
+    let rel = mail_body_key(id);
+    storage
+        .put(
+            StorageArea::Emails,
+            &rel,
+            body.as_bytes().to_vec().into(),
+            "text/html; charset=utf-8",
+        )
+        .await?;
+    if !object_equals(storage, StorageArea::Emails, &rel, body.as_bytes()).await? {
+        tracing::warn!(
+            delivery_id = id,
+            "storage backfill: stored object does not match the inline data, leaving the row"
+        );
+        return Ok(Copy::Unverified);
+    }
+    let updated = ctx
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE mail_deliveries SET body_location = $2 \
+             WHERE id = $1 AND body_location IS NULL",
+            [id.into(), rel.into()],
+        ))
+        .await?;
+    Ok(if updated.rows_affected() == 1 {
+        Copy::Copied
+    } else {
+        Copy::Gone
+    })
+}
+
+async fn backfill_ai_profiles(
+    ctx: &ExecuteQueryContext,
+    orgs: &mut OrgCache<'_>,
+    limit: i64,
+) -> anyhow::Result<usize> {
+    let mut conn = ctx.redis.clone();
+    let keys = Keys::new("ai_profiles");
+    let cursor = read_cursor(&mut conn, &keys).await?;
+    let rows = ctx
+        .db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, org_id FROM data_sources \
+             WHERE id > $1 AND ai_profile IS NOT NULL AND ai_profile_values_location IS NULL \
+             ORDER BY id LIMIT $2",
+            [cursor.into(), limit.into()],
+        ))
+        .await
+        .context("select inline AI profiles")?;
+    if rows.is_empty() {
+        finish_pass(&mut conn, &keys).await?;
+        return Ok(0);
+    }
+    let (mut copied, mut skipped, mut max_id) = (0usize, false, cursor);
+    for r in rows {
+        let id: i64 = r.try_get("", "id")?;
+        let org_id: i64 = r.try_get("", "org_id")?;
+        max_id = max_id.max(id);
+        let Some(storage) = orgs.writable(org_id).await else {
+            skipped = true;
+            continue;
+        };
+        match copy_ai_profile(ctx, storage, id).await {
+            Ok(Copy::Copied) => copied += 1,
+            Ok(Copy::Gone) => {}
+            Ok(Copy::Unverified) => skipped = true,
+            Err(e) => {
+                skipped = true;
+                orgs.fail(org_id);
+                tracing::warn!(data_source_id = id, error = %e, "storage backfill: AI profile copy failed");
+            }
+        }
+    }
+    save_cursor(&mut conn, &keys, max_id, skipped).await?;
+    Ok(copied)
+}
+
+/// Copies the sampled values of one data source's inline profile; the row stays locked so a
+/// concurrent profile write waits for the pointer.
+async fn copy_ai_profile(
+    ctx: &ExecuteQueryContext,
+    storage: &OrgStorage,
+    id: i64,
+) -> anyhow::Result<Copy> {
+    let txn = ctx.db.begin().await?;
+    let raw: Option<serde_json::Value> = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT ai_profile FROM data_sources \
+             WHERE id = $1 AND ai_profile_values_location IS NULL FOR UPDATE",
+            [id.into()],
+        ))
+        .await?
+        .map(|r| r.try_get("", "ai_profile"))
+        .transpose()?
+        .flatten();
+    let Some(raw) = raw else {
+        return Ok(Copy::Gone);
+    };
+    let Ok(profile) = serde_json::from_value::<DataSourceAiProfile>(raw) else {
+        return Ok(Copy::Gone);
+    };
+    let (_, values) = split_profile(&profile);
+    if values.0.is_empty() {
+        return Ok(Copy::Gone);
+    }
+    let location = save_profile_values(storage, id, &values).await?;
+    let stored = storage
+        .get(StorageArea::AiProfiles, &location)
+        .await
+        .context("re-read stored profile values")?;
+    if serde_json::from_slice::<ProfileValues>(&stored)
+        .ok()
+        .as_ref()
+        != Some(&values)
+    {
+        tracing::warn!(
+            data_source_id = id,
+            "storage backfill: stored object does not match the inline data, leaving the row"
+        );
+        txn.rollback().await?;
+        return Ok(Copy::Unverified);
+    }
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE data_sources SET ai_profile_values_location = $2 WHERE id = $1",
+        [id.into(), location.into()],
+    ))
+    .await?;
+    txn.commit().await?;
+    Ok(Copy::Copied)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use arcodash_core::observation_store::set_explanation;
@@ -433,10 +819,10 @@ mod tests {
     use crate::scheduler::test_support::*;
 
     /// Resolves only `org_id`; every other org is unreachable so a whole-DB pass skips it.
-    struct ScopedResolver {
-        org_id: i64,
-        store: Arc<dyn BlobStore>,
-        paused: bool,
+    pub(crate) struct ScopedResolver {
+        pub org_id: i64,
+        pub store: Arc<dyn BlobStore>,
+        pub paused: bool,
     }
 
     #[async_trait]
@@ -461,7 +847,7 @@ mod tests {
     }
 
     /// Serves different bytes than were written.
-    struct TamperedStore(MemoryBlobStore);
+    pub(crate) struct TamperedStore(pub MemoryBlobStore);
 
     #[async_trait]
     impl BlobStore for TamperedStore {
@@ -480,26 +866,20 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        ctx: ExecuteQueryContext,
-        org_id: i64,
-        ds_id: i64,
-        query_id: i64,
-        user_id: i64,
+    pub(crate) struct Fixture {
+        pub ctx: ExecuteQueryContext,
+        pub org_id: i64,
+        pub ds_id: i64,
+        pub query_id: i64,
+        pub user_id: i64,
     }
 
-    async fn fixture(store: Arc<dyn BlobStore>, paused: bool) -> Option<Fixture> {
+    pub(crate) async fn fixture(store: Arc<dyn BlobStore>, paused: bool) -> Option<Fixture> {
         let (db, redis) = setup().await?;
         let mut conn = redis.clone();
-        let _: () = conn
-            .del(&[
-                OBSERVATION_CURSOR_KEY,
-                OBSERVATION_RETRY_KEY,
-                RESULT_CURSOR_KEY,
-                RESULT_RETRY_KEY,
-            ])
-            .await
-            .unwrap();
+        for area in AREAS {
+            let _: () = conn.del(&Keys::new(area).all()[..]).await.unwrap();
+        }
         let org = seed_org(&db, &format!("backfill-{}", uuid::Uuid::new_v4())).await;
         let ds = seed_data_source(&db, org.id).await;
         let q = seed_query(&db, org.id, ds.id).await;
@@ -520,7 +900,10 @@ mod tests {
         })
     }
 
-    async fn pointer(db: &DatabaseConnection, id: i64) -> (Option<String>, serde_json::Value) {
+    pub(crate) async fn pointer(
+        db: &DatabaseConnection,
+        id: i64,
+    ) -> (Option<String>, serde_json::Value) {
         let r = query_row(
             db,
             "SELECT data_location, data FROM query_results WHERE id = $1",
@@ -533,7 +916,7 @@ mod tests {
         )
     }
 
-    async fn seed_observation(
+    pub(crate) async fn seed_observation(
         f: &Fixture,
         monitor_id: i64,
         value: Option<f64>,
@@ -915,5 +1298,292 @@ mod tests {
         assert!(pointer(db, a.id).await.0.is_none());
         assert!(pointer(db, b.id).await.0.is_none());
         assert!(pointer(db, c.id).await.0.is_some());
+    }
+
+    pub(crate) const PROFILE_JSON: &str = r#"{"tables":[{"name":"t","sampled_rows":3,"columns":[{"name":"c","null_frac":0.0,"distinct_in_sample":2,"samples":["a","b"],"min":"a","max":"b","description":null}]}],"relationships":[],"schema_refreshed_at_seen":"2026-01-01T00:00:00Z","descriptions_used_samples":false}"#;
+
+    pub(crate) async fn seed_narrative(f: &Fixture, summary: &str) -> i64 {
+        let dash: i64 = query_row(
+            &f.ctx.db,
+            "INSERT INTO dashboards (org_id, slug, name, user_id) VALUES ($1, $2, 'd', $3) \
+             RETURNING id",
+            [
+                f.org_id.into(),
+                format!("d-{}", uuid::Uuid::new_v4()).into(),
+                f.user_id.into(),
+            ],
+        )
+        .await
+        .try_get("", "id")
+        .unwrap();
+        let r = query_row(
+            &f.ctx.db,
+            "INSERT INTO dashboard_narratives \
+             (org_id, dashboard_id, user_id, source, summary, highlights, body, digest, \
+              confidence, model) \
+             VALUES ($1, $2, $3, 'manual', $4, '[{\"widget_id\":1,\"text\":\"h\"}]'::jsonb, \
+                     'body text', '{\"widgets\":[]}'::jsonb, 'low', 'm') RETURNING id",
+            [
+                f.org_id.into(),
+                dash.into(),
+                f.user_id.into(),
+                summary.to_string().into(),
+            ],
+        )
+        .await;
+        r.try_get("", "id").unwrap()
+    }
+
+    pub(crate) async fn seed_mail(f: &Fixture, body: &str, status: &str, age_days: i64) -> i64 {
+        let r = query_row(
+            &f.ctx.db,
+            "INSERT INTO mail_deliveries \
+             (org_id, task_type, to_email, subject, body_html, status, created_at) \
+             VALUES ($1, 'send_mail', 'a@example.test', 's', $2, $3, \
+                     now() - ($4 || ' days')::interval) RETURNING id",
+            [
+                f.org_id.into(),
+                body.to_string().into(),
+                status.to_string().into(),
+                age_days.to_string().into(),
+            ],
+        )
+        .await;
+        r.try_get("", "id").unwrap()
+    }
+
+    pub(crate) async fn seed_profile(f: &Fixture, ds_id: i64) {
+        exec_sql(
+            &f.ctx.db,
+            "UPDATE data_sources SET ai_profile = $2::jsonb WHERE id = $1",
+            [ds_id.into(), PROFILE_JSON.to_string().into()],
+        )
+        .await;
+    }
+
+    pub(crate) fn json_of(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn backfill_copies_narratives_mail_and_profiles() {
+        let store = Arc::new(MemoryBlobStore::default());
+        let Some(f) = fixture(store, false).await else {
+            return;
+        };
+        let narrative = seed_narrative(&f, "sum").await;
+        let mail = seed_mail(&f, "<p>hi</p>", "sent", 1).await;
+        seed_profile(&f, f.ds_id).await;
+
+        let stats = backfill_batch(&f.ctx, 10_000).await.unwrap();
+        assert_eq!((stats.narratives, stats.mail, stats.ai_profiles), (1, 1, 1));
+        let storage = f.ctx.storage.resolve(&f.ctx.db, f.org_id).await.unwrap();
+
+        let r = query_row(
+            &f.ctx.db,
+            "SELECT dashboard_id, summary, body, data_location FROM dashboard_narratives \
+             WHERE id = $1",
+            [narrative.into()],
+        )
+        .await;
+        let rel: String = r
+            .try_get::<Option<String>>("", "data_location")
+            .unwrap()
+            .unwrap();
+        let dash: i64 = r.try_get("", "dashboard_id").unwrap();
+        assert_eq!(rel, format!("{dash}/{narrative}.json"));
+        assert_eq!(r.try_get::<String>("", "summary").unwrap(), "sum");
+        assert_eq!(
+            r.try_get::<Option<String>>("", "body").unwrap().as_deref(),
+            Some("body text")
+        );
+        let obj = storage.get(StorageArea::Narratives, &rel).await.unwrap();
+        let content: NarrativeContent = serde_json::from_slice(&obj).unwrap();
+        assert_eq!(content.summary, "sum");
+        assert_eq!(content.body.as_deref(), Some("body text"));
+        assert_eq!(content.digest, json!({"widgets": []}));
+
+        let r = query_row(
+            &f.ctx.db,
+            "SELECT body_html, body_location FROM mail_deliveries WHERE id = $1",
+            [mail.into()],
+        )
+        .await;
+        assert_eq!(
+            r.try_get::<Option<String>>("", "body_location").unwrap(),
+            Some(format!("{mail}.html"))
+        );
+        assert_eq!(
+            r.try_get::<Option<String>>("", "body_html")
+                .unwrap()
+                .as_deref(),
+            Some("<p>hi</p>")
+        );
+        let obj = storage
+            .get(StorageArea::Emails, &format!("{mail}.html"))
+            .await
+            .unwrap();
+        assert_eq!(obj.as_ref(), b"<p>hi</p>");
+
+        let r = query_row(
+            &f.ctx.db,
+            "SELECT ai_profile, ai_profile_values_location FROM data_sources WHERE id = $1",
+            [f.ds_id.into()],
+        )
+        .await;
+        assert_eq!(
+            r.try_get::<Option<String>>("", "ai_profile_values_location")
+                .unwrap(),
+            Some(format!("{}.json", f.ds_id))
+        );
+        assert_eq!(
+            r.try_get::<serde_json::Value>("", "ai_profile").unwrap(),
+            json_of(PROFILE_JSON)
+        );
+        let obj = storage
+            .get(StorageArea::AiProfiles, &format!("{}.json", f.ds_id))
+            .await
+            .unwrap();
+        let values: ProfileValues = serde_json::from_slice(&obj).unwrap();
+        assert_eq!(values.0["t"]["c"].samples, vec!["a", "b"]);
+        assert_eq!(values.0["t"]["c"].max.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn backfill_mail_skips_old_sent_rows() {
+        let store = Arc::new(MemoryBlobStore::default());
+        let Some(f) = fixture(store, false).await else {
+            return;
+        };
+        let old_sent = seed_mail(&f, "old", "sent", 10).await;
+        let recent_sent = seed_mail(&f, "recent", "sent", 1).await;
+        let old_pending = seed_mail(&f, "pending", "pending", 10).await;
+        let old_retrying = seed_mail(&f, "retrying", "retrying", 10).await;
+
+        let stats = backfill_batch(&f.ctx, 10_000).await.unwrap();
+        assert_eq!(stats.mail, 3);
+
+        for (id, copied) in [
+            (old_sent, false),
+            (recent_sent, true),
+            (old_pending, true),
+            (old_retrying, true),
+        ] {
+            let loc: Option<String> = query_row(
+                &f.ctx.db,
+                "SELECT body_location FROM mail_deliveries WHERE id = $1",
+                [id.into()],
+            )
+            .await
+            .try_get("", "body_location")
+            .unwrap();
+            assert_eq!(loc.is_some(), copied, "mail {id}");
+        }
+    }
+
+    async fn retry_flag(f: &Fixture, area: &'static str) -> bool {
+        let mut conn = f.ctx.redis.clone();
+        conn.exists(&Keys::new(area).retry).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn backfill_mismatch_sets_retry() {
+        let store = Arc::new(TamperedStore(MemoryBlobStore::default()));
+        let Some(f) = fixture(store, false).await else {
+            return;
+        };
+        let (referenced, _) = seed_referenced_and_unreferenced(&f).await;
+        let narrative = seed_narrative(&f, "sum").await;
+        let mail = seed_mail(&f, "<p>hi</p>", "pending", 0).await;
+        seed_profile(&f, f.ds_id).await;
+        let storage = f.ctx.storage.resolve(&f.ctx.db, f.org_id).await.unwrap();
+
+        let r = query_row(
+            &f.ctx.db,
+            "SELECT id, org_id, data_source_id, query_hash FROM query_results WHERE id = $1",
+            [referenced.into()],
+        )
+        .await;
+        let row = ResultRow {
+            id: referenced,
+            org_id: f.org_id,
+            data_source_id: f.ds_id,
+            query_hash: r.try_get("", "query_hash").unwrap(),
+            has_sibling: false,
+        };
+        assert!(matches!(
+            copy_result(&f.ctx, &storage, &row).await.unwrap(),
+            Copy::Unverified
+        ));
+        let n = dashboard_narrative::Entity::find_by_id(narrative)
+            .one(&f.ctx.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            copy_narrative(&f.ctx, &storage, &n).await.unwrap(),
+            Copy::Unverified
+        ));
+        assert!(matches!(
+            copy_mail(&f.ctx, &storage, mail, "<p>hi</p>")
+                .await
+                .unwrap(),
+            Copy::Unverified
+        ));
+        assert!(matches!(
+            copy_ai_profile(&f.ctx, &storage, f.ds_id).await.unwrap(),
+            Copy::Unverified
+        ));
+
+        backfill_batch(&f.ctx, 10_000).await.unwrap();
+        for area in ["results", "narratives", "mail", "ai_profiles"] {
+            assert!(retry_flag(&f, area).await, "{area}");
+        }
+        assert!(pointer(&f.ctx.db, referenced).await.0.is_none());
+    }
+
+    #[tokio::test]
+    async fn backfill_retry_pass_backs_off() {
+        let store = Arc::new(MemoryBlobStore::default());
+        let Some(f) = fixture(store.clone(), true).await else {
+            return;
+        };
+        let (referenced, _) = seed_referenced_and_unreferenced(&f).await;
+        let keys = Keys::new("results");
+        let mut conn = f.ctx.redis.clone();
+
+        backfill_batch(&f.ctx, 10_000).await.unwrap();
+        assert!(retry_flag(&f, "results").await);
+        assert!(conn.exists::<_, bool>(&keys.cursor).await.unwrap());
+
+        backfill_batch(&f.ctx, 10_000).await.unwrap();
+        let now = Utc::now().timestamp();
+        let at: i64 = conn.get(&keys.reset_at).await.unwrap();
+        assert!((now + RETRY_SECS_DEFAULT - 60..=now + RETRY_SECS_DEFAULT + 60).contains(&at));
+        assert!(conn.exists::<_, bool>(&keys.cursor).await.unwrap());
+
+        let open = ExecuteQueryContext {
+            storage: Arc::new(ScopedResolver {
+                org_id: f.org_id,
+                store,
+                paused: false,
+            }),
+            ..test_ctx(f.ctx.db.clone(), f.ctx.redis.clone())
+        };
+        backfill_batch(&open, 10_000).await.unwrap();
+        assert!(
+            pointer(&f.ctx.db, referenced).await.0.is_none(),
+            "the pass is not restarted before the wait is over"
+        );
+        assert!(conn.exists::<_, bool>(&keys.cursor).await.unwrap());
+
+        let _: () = conn.set(&keys.reset_at, now - 1).await.unwrap();
+        backfill_batch(&open, 10_000).await.unwrap();
+        assert!(!conn.exists::<_, bool>(&keys.cursor).await.unwrap());
+        assert!(!conn.exists::<_, bool>(&keys.reset_at).await.unwrap());
+
+        let stats = backfill_batch(&open, 10_000).await.unwrap();
+        assert_eq!(stats.results, 1);
+        assert!(pointer(&f.ctx.db, referenced).await.0.is_some());
     }
 }

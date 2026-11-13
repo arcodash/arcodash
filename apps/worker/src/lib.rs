@@ -1,4 +1,5 @@
 mod ai_sink;
+mod clear_inline;
 mod consumer;
 mod conveyor_schedules;
 mod delivery_lifecycle;
@@ -78,6 +79,25 @@ impl Default for WorkerExtensions {
             entitlements: Arc::new(Unrestricted),
             storage_resolver: None,
         }
+    }
+}
+
+pub use clear_inline::{clear_inline_data, parse_clear_args, AreaReport, ClearArgs, ClearReport};
+
+/// Entry point of the worker binary: `clear-inline-data [--confirm] [--batch N]` runs the admin
+/// command, no argument runs the worker.
+///
+/// # Errors
+///
+/// Unknown command, or the failure of the command or worker.
+pub async fn run_cli(ext: WorkerExtensions) -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.split_first() {
+        None => run(ext).await,
+        Some((cmd, rest)) if cmd == "clear-inline-data" => {
+            clear_inline::run_command(ext.storage_resolver, rest).await
+        }
+        Some((cmd, _)) => anyhow::bail!("unknown command `{cmd}`; available: clear-inline-data"),
     }
 }
 

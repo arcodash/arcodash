@@ -219,6 +219,9 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
                             tracing::info!(
                                 results = stats.results,
                                 observations = stats.observations,
+                                narratives = stats.narratives,
+                                mail = stats.mail,
+                                ai_profiles = stats.ai_profiles,
                                 "storage backfill: copied inline data"
                             );
                         }
