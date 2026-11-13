@@ -601,14 +601,25 @@ async fn copy_narrative(
             DbBackend::Postgres,
             "UPDATE dashboard_narratives SET data_location = $2 \
              WHERE id = $1 AND data_location IS NULL",
-            [row.id.into(), rel.into()],
+            [row.id.into(), rel.clone().into()],
         ))
         .await?;
-    Ok(if updated.rows_affected() == 1 {
-        Copy::Copied
-    } else {
-        Copy::Gone
-    })
+    if updated.rows_affected() == 1 {
+        return Ok(Copy::Copied);
+    }
+    let still_there = ctx
+        .db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 AS present FROM dashboard_narratives WHERE id = $1",
+            [row.id.into()],
+        ))
+        .await?
+        .is_some();
+    if !still_there {
+        let _ = storage.delete(StorageArea::Narratives, &rel).await;
+    }
+    Ok(Copy::Gone)
 }
 
 async fn backfill_mail(
@@ -1363,6 +1374,32 @@ pub(crate) mod tests {
 
     pub(crate) fn json_of(s: &str) -> serde_json::Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn backfill_narrative_cleans_up_when_row_vanishes() {
+        let Some(f) = fixture(Arc::new(MemoryBlobStore::default()), false).await else {
+            return;
+        };
+        let narrative = seed_narrative(&f, "sum").await;
+        let row = dashboard_narrative::Entity::find_by_id(narrative)
+            .one(&f.ctx.db)
+            .await
+            .unwrap()
+            .unwrap();
+        exec_sql(
+            &f.ctx.db,
+            "DELETE FROM dashboard_narratives WHERE id = $1",
+            [narrative.into()],
+        )
+        .await;
+        let storage = f.ctx.storage.resolve(&f.ctx.db, f.org_id).await.unwrap();
+        let rel = narrative_rel_key(row.dashboard_id, row.id);
+
+        let outcome = copy_narrative(&f.ctx, &storage, &row).await.unwrap();
+
+        assert!(matches!(outcome, Copy::Gone));
+        assert!(storage.get(StorageArea::Narratives, &rel).await.is_err());
     }
 
     #[tokio::test]

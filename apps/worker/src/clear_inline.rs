@@ -35,7 +35,9 @@ pub struct AreaReport {
     /// Rows holding a copy that is missing, unreadable or different from the inline data.
     pub not_verified: usize,
     /// Rows holding inline data and no copy yet.
-    pub needs_backfill: usize,
+    pub no_copy: usize,
+    /// Rows removed or emptied while the run was examining them.
+    pub vanished: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
@@ -58,8 +60,8 @@ impl fmt::Display for ClearReport {
         ] {
             writeln!(
                 f,
-                "{name}: verified={} cleared={} not_verified={} needs_backfill={}",
-                a.verified, a.cleared, a.not_verified, a.needs_backfill
+                "{name}: verified={} cleared={} not_verified={} no_copy={} vanished={}",
+                a.verified, a.cleared, a.not_verified, a.no_copy, a.vanished
             )?;
         }
         Ok(())
@@ -184,7 +186,7 @@ impl Run<'_> {
                 let hash: String = r.try_get("", "query_hash")?;
                 let location: Option<String> = r.try_get("", "data_location")?;
                 if location.is_none() {
-                    rep.needs_backfill += 1;
+                    rep.no_copy += 1;
                     continue;
                 }
                 let Some(storage) = orgs.get(org_id).await else {
@@ -353,7 +355,7 @@ impl Run<'_> {
             cursor = last.id;
             for n in &rows {
                 if n.data_location.is_none() {
-                    rep.needs_backfill += 1;
+                    rep.no_copy += 1;
                     continue;
                 }
                 let Some(storage) = orgs.get(n.org_id).await else {
@@ -429,7 +431,7 @@ impl Run<'_> {
                 let org_id: i64 = r.try_get("", "org_id")?;
                 let location: Option<String> = r.try_get("", "body_location")?;
                 if location.is_none() {
-                    rep.needs_backfill += 1;
+                    rep.no_copy += 1;
                     continue;
                 }
                 let Some(storage) = orgs.get(org_id).await else {
@@ -511,7 +513,8 @@ impl Run<'_> {
                 };
                 match self.clear_ai_profile(storage, id).await {
                     Ok(Profile::NothingInline) => {}
-                    Ok(Profile::NoCopy) => rep.needs_backfill += 1,
+                    Ok(Profile::Vanished) => rep.vanished += 1,
+                    Ok(Profile::NoCopy) => rep.no_copy += 1,
                     Ok(Profile::Checked { verified, cleared }) => {
                         apply(&mut rep, verified, cleared);
                     }
@@ -526,16 +529,19 @@ impl Run<'_> {
 
     async fn clear_ai_profile(&self, storage: &OrgStorage, id: i64) -> anyhow::Result<Profile> {
         let txn = self.db.begin().await?;
+        let lock = if self.confirm { " FOR UPDATE" } else { "" };
         let row = txn
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT ai_profile, ai_profile_values_location FROM data_sources \
-                 WHERE id = $1 AND ai_profile IS NOT NULL FOR UPDATE",
+                format!(
+                    "SELECT ai_profile, ai_profile_values_location FROM data_sources \
+                     WHERE id = $1 AND ai_profile IS NOT NULL{lock}"
+                ),
                 [id.into()],
             ))
             .await?;
         let Some(row) = row else {
-            return Ok(Profile::NothingInline);
+            return Ok(Profile::Vanished);
         };
         let raw: serde_json::Value = row.try_get("", "ai_profile")?;
         let location: Option<String> = row.try_get("", "ai_profile_values_location")?;
@@ -593,6 +599,8 @@ enum Profile {
     NothingInline,
     /// Inline values and no stored copy.
     NoCopy,
+    /// The row was removed or its profile emptied since the batch was read.
+    Vanished,
     Checked {
         verified: bool,
         cleared: bool,
@@ -789,7 +797,7 @@ mod tests {
             ..AreaReport::default()
         };
         assert_eq!(report.results.verified, 1);
-        assert_eq!(report.results.needs_backfill, 1, "result {orphan}");
+        assert_eq!(report.results.no_copy, 1, "result {orphan}");
         assert_eq!(report.observations, one);
         assert_eq!(report.narratives, one);
         assert_eq!(report.mail, one);
@@ -873,11 +881,12 @@ mod tests {
 
         let report = run(&f, true).await;
 
-        let area = |cleared, not_verified, needs_backfill| AreaReport {
+        let area = |cleared, not_verified, no_copy| AreaReport {
             verified: cleared,
             cleared,
             not_verified,
-            needs_backfill,
+            no_copy,
+            vanished: 0,
         };
         assert_eq!(report.results, area(1, 1, 1));
         assert_eq!(report.observations, area(1, 1, 0));

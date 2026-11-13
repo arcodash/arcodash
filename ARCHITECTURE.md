@@ -110,8 +110,9 @@ storage by a background worker job and verified: results that readers still reac
 published results of a query, results of recent runs, each monitor's latest), all monitor
 observations, all dashboard narratives, recent or pending mail bodies, and AI profile sample
 values. The inline copies stay until an admin runs `arcodash-worker clear-inline-data` (a dry run
-that only counts; `--confirm` clears the rows whose copy re-verifies). Results nothing references
-stay inline until cleared or the data is removed.
+that only counts; `--confirm` clears the rows whose copy re-verifies). Unreferenced old
+results and older sent mail get no copy, so `clear-inline-data` never touches them; they keep their
+inline data until the rows are removed.
 
 **Mail.** Backend (invitations, password resets) and worker (alerts, digests) share one SMTP
 mailer (`crates/shared/src/mailer.rs`). Without `SMTP_HOST`, mail is skipped and recorded as such,

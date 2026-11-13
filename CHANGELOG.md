@@ -22,8 +22,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Query results and other data produced by running queries (monitor observations, dashboard
   narratives, mail bodies, AI profile sample values) are stored in the object store
   (`UPLOAD_BUCKET`) instead of Postgres.
-- Upgrade: after the backfill has copied existing data, run `arcodash-worker clear-inline-data`,
-  then `--confirm`, to free the inline copies.
+- Upgrade: once the backfill has finished, run `docker compose run --rm worker clear-inline-data`
+  (a dry run that only counts), then `docker compose run --rm worker clear-inline-data --confirm`,
+  to free the inline copies. The backfill has finished when the worker has logged
+  `storage backfill: pass complete` for every area; the dry run's `verified` counts show what a
+  `--confirm` would clear.
 - API responses carry `Cache-Control: no-store` by default.
 - Error text stored or returned to clients has customer values scrubbed.
 

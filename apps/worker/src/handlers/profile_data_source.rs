@@ -22,7 +22,8 @@ use arcodash_core::queue::{JobMessage, QueueName};
 use redis::AsyncCommands;
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect, Statement, TransactionTrait,
 };
 use serde_json::Value;
 
@@ -213,7 +214,7 @@ async fn run(
     profile.relationships =
         merge_relationships(fk, mined, name_heuristic(&schema.tables), &schema.tables);
 
-    let (stripped, location) = store_values(ctx, org_id, &storage, ds.id, &profile).await?;
+    let (stripped, location, txn) = store_values(ctx, org_id, &storage, ds.id, &profile).await?;
     data_source::ActiveModel {
         id: Set(ds.id),
         schema: Set(Some(serde_json::to_value(&schema)?)),
@@ -223,8 +224,9 @@ async fn run(
         ai_profile_built_at: Set(Some(DateTimeWithTimeZone::from(seen))),
         ..Default::default()
     }
-    .update(&ctx.db)
+    .update(&txn)
     .await?;
+    txn.commit().await?;
 
     let mut conn = ctx.redis.clone();
     let _: Result<(), _> = redis::cmd("SET")
@@ -303,7 +305,7 @@ async fn run(
         merge_sampled(&mut profile, fresh);
     }
 
-    let (stripped, location) = store_values(ctx, org_id, &storage, ds.id, &profile).await?;
+    let (stripped, location, txn) = store_values(ctx, org_id, &storage, ds.id, &profile).await?;
     data_source::ActiveModel {
         id: Set(ds.id),
         ai_profile: Set(Some(stripped)),
@@ -312,8 +314,9 @@ async fn run(
         ai_profile_last_error: Set(None),
         ..Default::default()
     }
-    .update(&ctx.db)
+    .update(&txn)
     .await?;
+    txn.commit().await?;
     if needs_descriptions(&profile) {
         let job = JobMessage::DescribeDataSource {
             org_id,
@@ -336,21 +339,32 @@ async fn storage_failure(
     err
 }
 
-/// Writes the profile's sampled values to storage and returns the value-free profile JSON with the
-/// values' location. The row is only updated after this succeeds.
+/// Writes the profile's sampled values to storage and returns the value-free profile JSON, the
+/// values' location and the open transaction holding the data source row lock. The caller updates
+/// the row and commits, so a concurrent writer of the same object waits for the pointer.
 async fn store_values(
     ctx: &ExecuteQueryContext,
     org_id: i64,
     storage: &OrgStorage,
     data_source_id: i64,
     profile: &DataSourceAiProfile,
-) -> anyhow::Result<(Value, String)> {
+) -> anyhow::Result<(Value, String, DatabaseTransaction)> {
     let (stripped, values) = split_profile(profile);
+    let txn = ctx.db.begin().await?;
+    txn.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT 1 FROM data_sources WHERE id = $1 FOR UPDATE",
+        [data_source_id.into()],
+    ))
+    .await?;
     let location = match save_profile_values(storage, data_source_id, &values).await {
         Ok(l) => l,
-        Err(e) => return Err(storage_failure(ctx, org_id, e).await.into()),
+        Err(e) => {
+            let _ = txn.rollback().await;
+            return Err(storage_failure(ctx, org_id, e).await.into());
+        }
     };
-    Ok((serde_json::to_value(&stripped)?, location))
+    Ok((serde_json::to_value(&stripped)?, location, txn))
 }
 
 /// One column-less entry per schema table the profile lacks; uncapped so profile coverage matches
@@ -474,7 +488,56 @@ pub fn column_stats(rows: &[Value], name: &str, friendly_type: &str) -> AiProfil
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_backfill::tests::{fixture, seed_profile, PROFILE_JSON};
+    use arcodash_core::org_storage::StorageArea;
+    use arcodash_core::test_support::blob::MemoryBlobStore;
     use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn profile_rebuild_and_backfill_serialize_on_the_row_lock() {
+        let Some(f) = fixture(Arc::new(MemoryBlobStore::default()), false).await else {
+            return;
+        };
+        seed_profile(&f, f.ds_id).await;
+        let storage = f.ctx.storage.resolve(&f.ctx.db, f.org_id).await.unwrap();
+        let profile: DataSourceAiProfile = serde_json::from_str(PROFILE_JSON).unwrap();
+        let rel = arcodash_core::ai::profile_values::values_rel_key(f.ds_id);
+
+        let holder = f.ctx.db.begin().await.unwrap();
+        exec_sql_on(&holder, f.ds_id).await;
+
+        let writer = async {
+            let (_, location, txn) = store_values(&f.ctx, f.org_id, &storage, f.ds_id, &profile)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            location
+        };
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                storage.get(StorageArea::AiProfiles, &rel).await.is_err(),
+                "put happened while the row lock was held"
+            );
+            holder.commit().await.unwrap();
+        };
+        let (location, ()) = tokio::join!(writer, release);
+
+        assert_eq!(location, rel);
+        assert!(storage.get(StorageArea::AiProfiles, &rel).await.is_ok());
+    }
+
+    async fn exec_sql_on(txn: &sea_orm::DatabaseTransaction, id: i64) {
+        txn.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT 1 FROM data_sources WHERE id = $1 FOR UPDATE",
+            [id.into()],
+        ))
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn nulls_ties_and_top5() {

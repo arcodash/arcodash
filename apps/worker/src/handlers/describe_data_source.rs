@@ -18,7 +18,7 @@ use arcodash_core::connectors::TableSchema;
 use arcodash_core::entities::{data_source, organization};
 use arcodash_core::models::{ai_profile_describing_key, DataSourceAiProfile, DataSourceSchema};
 use arcodash_core::org_storage::OrgStorage;
-use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement, TransactionTrait};
 
 use crate::ai_sink::DbAttemptSink;
 use crate::handlers::execute_query::ExecuteQueryContext;
@@ -211,19 +211,28 @@ async fn store(
     let (stripped, values) = split_profile(merged);
     // Descriptions never change values, so an existing object is left alone (a concurrent rebuild
     // may have replaced it); only a row still holding inline values moves them out.
+    let new = serde_json::to_value(&stripped)?;
+    let txn = ctx.db.begin().await?;
     let location = match &ds.ai_profile_values_location {
         Some(l) => l.clone(),
-        None => match save_profile_values(storage, ds.id, &values).await {
-            Ok(l) => l,
-            Err(e) => {
-                report_unreachable(&*ctx.storage, &ctx.db, ds.org_id, &e).await;
-                return Err(e.into());
+        None => {
+            txn.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT 1 FROM data_sources WHERE id = $1 FOR UPDATE",
+                [ds.id.into()],
+            ))
+            .await?;
+            match save_profile_values(storage, ds.id, &values).await {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = txn.rollback().await;
+                    report_unreachable(&*ctx.storage, &ctx.db, ds.org_id, &e).await;
+                    return Err(e.into());
+                }
             }
-        },
+        }
     };
-    let new = serde_json::to_value(&stripped)?;
-    let res = ctx
-        .db
+    let res = txn
         .execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "UPDATE data_sources SET ai_profile = $1, ai_profile_values_location = $2 \
@@ -237,6 +246,7 @@ async fn store(
             ],
         ))
         .await?;
+    txn.commit().await?;
     if res.rows_affected() == 0 {
         tracing::debug!(
             data_source_id = ds.id,
