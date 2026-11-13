@@ -825,7 +825,8 @@ fn is_orphan_upload(
 }
 
 /// Runs from `run_aux_ticks` against the admin/pooled db so it sees every org. Deletes the object
-/// before the row, so a failed object delete is retried next tick.
+/// before the row, so a failed object delete is retried next tick. Objects in storage the
+/// organization supplies are left in place; only the row is removed.
 pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
     let Some(rows) = load_batch(
         &ctx.db,
@@ -844,6 +845,7 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
     };
 
     let now = Utc::now();
+    let mut managed: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
     for row in rows {
         let Ok(id) = row.try_get::<uuid::Uuid>("", "id") else {
             tracing::error!(
@@ -866,15 +868,28 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
             tracing::error!(upload_id = %id, "sweeper: orphaned-upload query returned a non-orphan row, skipping");
             continue;
         }
-        if let Err(e) =
-            arcodash_core::storage::delete_upload(&*ctx.storage, &ctx.db, org_id, &object_key).await
-        {
-            if matches!(e, arcodash_core::org_storage::StorageError::Switching) {
-                tracing::info!(upload_id = %id, "sweeper: org storage is switching, leaving orphaned upload for retry");
-            } else {
-                tracing::error!(upload_id = %id, error = %e, "sweeper: failed to delete orphaned upload object, leaving row for retry");
+        let manages = match managed.get(&org_id) {
+            Some(m) => *m,
+            None => match ctx.storage.resolve(&ctx.db, org_id).await {
+                Ok(s) => *managed.entry(org_id).or_insert(s.manages_retention()),
+                Err(e) => {
+                    tracing::warn!(org_id, error = %e, "sweeper: org storage unavailable, skipping its orphaned uploads");
+                    continue;
+                }
+            },
+        };
+        if manages {
+            if let Err(e) =
+                arcodash_core::storage::delete_upload(&*ctx.storage, &ctx.db, org_id, &object_key)
+                    .await
+            {
+                if matches!(e, arcodash_core::org_storage::StorageError::Switching) {
+                    tracing::info!(upload_id = %id, "sweeper: org storage is switching, leaving orphaned upload for retry");
+                } else {
+                    tracing::error!(upload_id = %id, error = %e, "sweeper: failed to delete orphaned upload object, leaving row for retry");
+                }
+                continue;
             }
-            continue;
         }
         if let Err(e) = data_source_upload::Entity::delete_by_id(id)
             .exec(&ctx.db)
@@ -3295,6 +3310,57 @@ mod tests {
             ctx.store.get(&linked_key).await.is_ok(),
             "a linked upload's object must never be deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_uploads_leaves_objects_in_unmanaged_storage() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-orphan-cust-{}", uuid::Uuid::new_v4())).await;
+        let (ctx, mem) = ctx_with_mem_store(
+            test_ctx(db.clone(), redis),
+            arcodash_core::org_storage::StorageMode::Customer,
+        );
+        let id = uuid::Uuid::new_v4();
+        let rel = arcodash_core::storage::upload_rel_key("csv", id, "data.csv");
+        let abs = format!("orgs/test/uploads/{rel}");
+        arcodash_core::org_storage::BlobStore::put(
+            &*mem,
+            &abs,
+            bytes::Bytes::from_static(b"a\n1\n"),
+            "text/csv",
+        )
+        .await
+        .unwrap();
+        data_source_upload::ActiveModel {
+            id: Set(id),
+            org_id: Set(org.id),
+            object_key: Set(rel),
+            filename: Set("data.csv".to_string()),
+            byte_size: Set(4),
+            content_type: Set("text/csv".to_string()),
+            created_by: Set(None),
+            data_source_id: Set(None),
+            created_at: Set((chrono::Utc::now() - chrono::Duration::hours(25)).into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        sweep_orphan_uploads(&ctx).await;
+
+        assert!(
+            data_source_upload::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "row must be swept"
+        );
+        assert!(mem.keys().contains(&abs), "object must be kept");
+        assert_eq!(mem.deletes(), 0);
     }
 
     #[tokio::test]

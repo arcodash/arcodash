@@ -1147,7 +1147,7 @@ async fn api_responses_default_to_no_store() {
     let (_query_id, hash) = create_query(&client, &app.address, ds_id, "No Store", sql).await;
     let result_id = seed_result(&app.db, org_id, ds_id, &hash, sql, sample_data()).await;
 
-    let no_store = |resp: &reqwest::Response| {
+    let cache_control = |resp: &reqwest::Response| {
         resp.headers()
             .get("cache-control")
             .and_then(|v| v.to_str().ok())
@@ -1160,7 +1160,7 @@ async fn api_responses_default_to_no_store() {
         .await
         .unwrap();
     assert_eq!(result.status().as_u16(), 200);
-    assert_eq!(no_store(&result).as_deref(), Some("no-store"));
+    assert_eq!(cache_control(&result).as_deref(), Some("no-store"));
 
     let csv = client
         .get(format!("{}/api/query_results/{result_id}.csv", app.address))
@@ -1168,7 +1168,7 @@ async fn api_responses_default_to_no_store() {
         .await
         .unwrap();
     assert_eq!(csv.status().as_u16(), 200);
-    assert_eq!(no_store(&csv).as_deref(), Some("no-store"));
+    assert_eq!(cache_control(&csv).as_deref(), Some("no-store"));
 
     let session = client
         .get(format!("{}/api/session", app.address))
@@ -1176,7 +1176,7 @@ async fn api_responses_default_to_no_store() {
         .await
         .unwrap();
     assert_eq!(session.status().as_u16(), 200);
-    assert_eq!(no_store(&session).as_deref(), Some("no-store"));
+    assert_eq!(cache_control(&session).as_deref(), Some("no-store"));
 
     let missing = client
         .get(format!(
@@ -1188,5 +1188,5 @@ async fn api_responses_default_to_no_store() {
         .await
         .unwrap();
     assert_eq!(missing.status().as_u16(), 404);
-    assert_eq!(no_store(&missing).as_deref(), Some("no-store"));
+    assert_eq!(cache_control(&missing).as_deref(), Some("no-store"));
 }

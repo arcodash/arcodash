@@ -28,8 +28,8 @@ use crate::authz::permissions::require_permission;
 use crate::db::Db;
 use crate::error::ApiError;
 use crate::extract::{Json, Path};
-use crate::services::data_source_service;
 use crate::services::upload_service;
+use crate::services::{data_source_service, object_cleanup};
 use crate::state::AppState;
 
 /// Server-side copy for the create block: no group both grants `create_data_source` and is
@@ -384,13 +384,25 @@ pub async fn update(
 
 /// `DELETE /api/data_sources/<id>` — requires `edit_data_source` (edit implies delete).
 pub async fn delete(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     let existing = find_authorized(&db, &user, id, DataSourceVerb::Delete).await?;
-    let (ds_id, name) = (existing.id, existing.name.clone());
+    let (ds_id, name, org_id) = (existing.id, existing.name.clone(), existing.org_id);
+    let upload_keys = object_cleanup::upload_keys(&db, ds_id).await?;
     data_source_service::delete(&db, existing).await?;
+    db.after_commit(Box::pin(object_cleanup::run(
+        state.storage.clone(),
+        state.db.clone(),
+        org_id,
+        object_cleanup::DeletedObject::DataSource {
+            id: ds_id,
+            upload_keys,
+        },
+    )))
+    .await;
 
     record_event(
         &db,

@@ -9,6 +9,7 @@ pub mod embed_service;
 pub mod job_service;
 pub mod mailer;
 pub mod monitor_service;
+pub mod object_cleanup;
 pub mod parameters;
 pub mod permission_service;
 pub mod query_service;

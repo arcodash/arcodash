@@ -20,7 +20,7 @@ use crate::auth::CurrentUser;
 use crate::authz::authorize::{self, Action, Caller, MonitorVerb};
 use crate::db::Db;
 use crate::error::ApiError;
-use crate::services::{monitor_service, run_service};
+use crate::services::{monitor_service, object_cleanup, run_service};
 use crate::state::AppState;
 
 /// The `caller` block for monitor `id`, from the Edit-tier `evaluate(...)` the mutation gates use.
@@ -389,12 +389,21 @@ pub async fn update(
 }
 
 pub async fn delete(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     let existing = monitor_service::get_for_user(&db, user.org_id, &user, id).await?;
+    let org_id = existing.org_id;
     monitor_service::delete(&db, &user, existing).await?;
+    db.after_commit(Box::pin(object_cleanup::run(
+        state.storage.clone(),
+        state.db.clone(),
+        org_id,
+        object_cleanup::DeletedObject::Monitors(vec![id]),
+    )))
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

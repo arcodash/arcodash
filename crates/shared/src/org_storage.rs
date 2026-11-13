@@ -248,6 +248,26 @@ impl OrgStorage {
     }
 }
 
+/// Deletes every area folder under the organization's root. Called by deployments that delete a
+/// whole organization; nothing in this repository does.
+///
+/// A bucket the organization supplies is left untouched (`Ok(0)`); otherwise returns the number of
+/// objects deleted.
+///
+/// # Errors
+///
+/// `Switching` while writes are paused; otherwise the store's error.
+pub async fn delete_org_objects(storage: &OrgStorage) -> Result<usize, StorageError> {
+    if !storage.manages_retention() {
+        return Ok(0);
+    }
+    let mut total = 0;
+    for area in StorageArea::ALL {
+        total += storage.delete_prefix(area, "").await?;
+    }
+    Ok(total)
+}
+
 #[async_trait]
 pub trait OrgStorageResolver: Send + Sync {
     async fn resolve(
@@ -299,6 +319,39 @@ mod tests {
     fn storage(mode: StorageMode, root: &str) -> (OrgStorage, Arc<MemoryBlobStore>) {
         let mem = Arc::new(MemoryBlobStore::default());
         (OrgStorage::new(7, mode, mem.clone(), root), mem)
+    }
+
+    #[tokio::test]
+    async fn delete_org_objects_removes_every_area_in_managed_storage_only() {
+        let seed = || {
+            let mut keys: Vec<String> = StorageArea::ALL
+                .iter()
+                .map(|a| format!("orgs/7/{}/x/y", a.folder()))
+                .collect();
+            keys.push("orgs/70/results/x".to_string());
+            keys
+        };
+        let (s, mem) = storage(StorageMode::ArcoDash, "orgs/7/");
+        for k in seed() {
+            mem.put(&k, Bytes::from_static(b"x"), "text/plain")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            delete_org_objects(&s).await.unwrap(),
+            StorageArea::ALL.len()
+        );
+        assert_eq!(mem.keys(), ["orgs/70/results/x"]);
+
+        let (c, cmem) = storage(StorageMode::Customer, "orgs/7/");
+        for k in seed() {
+            cmem.put(&k, Bytes::from_static(b"x"), "text/plain")
+                .await
+                .unwrap();
+        }
+        assert_eq!(delete_org_objects(&c).await.unwrap(), 0);
+        assert_eq!(cmem.keys().len(), StorageArea::ALL.len() + 1);
+        assert_eq!(cmem.deletes(), 0);
     }
 
     #[tokio::test]

@@ -117,6 +117,7 @@ pub fn build_app(mut state: AppState, cors: CorsLayer, ext: AppExtensions) -> Ro
             "/api",
             api::router::router(&state)
                 .merge(ext.api_router)
+                .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
                 .layer(axum::middleware::map_response(default_no_store)),
         )
         // Tower applies later `.layer()` calls as outer wrappers, so org resolution runs BEFORE
@@ -222,7 +223,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn cache_control_app() -> Router {
-        Router::new()
+        let api = Router::new()
             .route("/plain", get(|| async { "x" }))
             .route(
                 "/own",
@@ -233,7 +234,9 @@ mod tests {
                     )
                 }),
             )
-            .layer(axum::middleware::map_response(default_no_store))
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(axum::middleware::map_response(default_no_store));
+        Router::new().nest("/api", api)
     }
 
     async fn cache_control_of(uri: &str) -> Vec<String> {
@@ -250,13 +253,16 @@ mod tests {
 
     #[tokio::test]
     async fn no_store_is_added_when_absent() {
-        assert_eq!(cache_control_of("/plain").await, vec!["no-store"]);
-        assert_eq!(cache_control_of("/missing").await, vec!["no-store"]);
+        assert_eq!(cache_control_of("/api/plain").await, vec!["no-store"]);
+        assert_eq!(cache_control_of("/api/missing").await, vec!["no-store"]);
     }
 
     #[tokio::test]
     async fn handler_set_cache_control_is_not_overwritten() {
-        assert_eq!(cache_control_of("/own").await, vec!["private, max-age=60"]);
+        assert_eq!(
+            cache_control_of("/api/own").await,
+            vec!["private, max-age=60"]
+        );
     }
 
     async fn always_panics() -> &'static str {

@@ -126,7 +126,7 @@ and invitation links are logged. The local compose adds Mailpit to catch mail.
 ### 4.1 Requests, authentication and permissions
 
 `build_app` mounts `/health`, `/ping` and `/metrics` at the root and everything else under `/api`.
-Every `/api` response defaults to `Cache-Control: no-store` unless the handler sets its own.
+Every response from an `/api` route defaults to `Cache-Control: no-store` unless the handler sets its own.
 A request passes these layers from the outside in:
 
 ```mermaid
@@ -233,7 +233,9 @@ sequenceDiagram
   distinct query and parameter combination, and deleted after `RESULT_RETENTION_DAYS` (default 7)
   without use; every read or refresh resets the clock and a missing object is a cache miss. Rows
   written by older versions with inline data are never swept, and buckets the operator does not
-  manage are skipped.
+  manage are skipped. Results are shared by query text and data source, so deleting a query leaves
+  its results to expire through retention; deleting a monitor or data source removes its stored
+  objects only from storage the operator manages.
 - **Parameters** (`{{ name }}`) are substituted into the SQL text, not bound. Number, date and
   dropdown values are validated; free-text values are inserted as written, so using them requires
   manage access to the data source.

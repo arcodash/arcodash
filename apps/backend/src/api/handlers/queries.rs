@@ -8,11 +8,11 @@ use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use arcodash_core::entities::{favorite, group, query, query_result, user};
+use arcodash_core::entities::{favorite, group, monitor, query, query_result, user};
 use arcodash_core::events::record_event;
 
 use crate::api::handlers::jobs::JobResponse;
@@ -24,6 +24,7 @@ use crate::db::Db;
 use crate::error::ApiError;
 use crate::extract::{Json, Path};
 use crate::middleware::rate_limit::UserKeyedLimiter;
+use crate::services::object_cleanup::{self, DeletedObject};
 use crate::services::query_service::RevertTarget;
 use crate::services::result_service::ResultFormat;
 use crate::services::{
@@ -682,12 +683,31 @@ pub async fn consumers(
 
 /// `DELETE /api/queries/<id>`.
 pub async fn delete(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     let existing = query_service::get_for_user(&db, user.org_id, &user, id).await?;
+    let org_id = existing.org_id;
+    let monitor_ids = monitor::Entity::find()
+        .filter(monitor::Column::QueryId.eq(existing.id))
+        .select_only()
+        .column(monitor::Column::Id)
+        .into_tuple::<i64>()
+        .all(&db)
+        .await?;
     query_service::delete(&db, &user, existing).await?;
+    // Stored results are shared by query text and data source, so they expire through retention.
+    if !monitor_ids.is_empty() {
+        db.after_commit(Box::pin(object_cleanup::run(
+            state.storage.clone(),
+            state.db.clone(),
+            org_id,
+            DeletedObject::Monitors(monitor_ids),
+        )))
+        .await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
