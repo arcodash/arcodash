@@ -422,6 +422,13 @@ export interface MonitorTile {
   last_check_error?: string | null;
 }
 
+export interface CheckSummary {
+  total: number;
+  ok: number;
+  triggered: number;
+  unevaluable: number;
+}
+
 export interface Widget {
   id: number;
   dashboard_id: number;
@@ -441,6 +448,8 @@ export interface Widget {
   freshness?: WidgetFreshness | null;
   /** Only for monitor-bound widgets. */
   monitors?: MonitorTile[] | null;
+  /** Visible, non-silenced monitor counts for a viz widget's query; absent when none. */
+  check_summary?: CheckSummary | null;
   /** Whether the viewer can read the underlying query results; `true` for text widgets. */
   viewer_can_read_data: boolean;
   text: string | null;

@@ -2242,6 +2242,231 @@ async fn dashboard_widget_monitors_garbage_or_empty_never_500s() {
     }
 }
 
+mod check_summary {
+    use super::{non_admin_client_in_groups, ok_json, spawn_app, TestApp};
+    use crate::skip_if_none;
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
+        Statement,
+    };
+
+    /// Published query with a viz widget on a published dashboard and one monitor on the query.
+    /// Returns `(dashboard slug, monitor id)`.
+    async fn dashboard_with_monitored_widget(
+        app: &TestApp,
+        admin: &reqwest::Client,
+    ) -> (String, i64) {
+        let ds_id = ok_json(
+            admin
+                .post(format!("{}/api/data_sources", app.address))
+                .json(
+                    &serde_json::json!({ "name": "check-summary-ds", "type": "pg", "options": {} }),
+                )
+                .send()
+                .await
+                .unwrap(),
+            "create data source",
+        )
+        .await["id"]
+            .as_i64()
+            .unwrap();
+        let query_id = ok_json(
+            admin
+                .post(format!("{}/api/queries", app.address))
+                .json(&serde_json::json!({
+                    "data_source_id": ds_id,
+                    "name": "Check Summary Query",
+                    "query": "SELECT 1",
+                    "options": {}
+                }))
+                .send()
+                .await
+                .unwrap(),
+            "create query",
+        )
+        .await["id"]
+            .as_i64()
+            .unwrap();
+        ok_json(
+            admin
+                .post(format!("{}/api/queries/{query_id}/publish", app.address))
+                .json(&serde_json::json!({ "expected_version": 0 }))
+                .send()
+                .await
+                .unwrap(),
+            "publish query",
+        )
+        .await;
+        let viz_id = ok_json(
+            admin
+                .post(format!("{}/api/visualizations", app.address))
+                .json(&serde_json::json!({
+                    "query_id": query_id,
+                    "type": "table",
+                    "name": "Check Summary Viz",
+                    "options": {}
+                }))
+                .send()
+                .await
+                .unwrap(),
+            "create visualization",
+        )
+        .await["id"]
+            .as_i64()
+            .unwrap();
+        let monitor_id = ok_json(
+            admin
+                .post(format!("{}/api/monitors", app.address))
+                .json(&serde_json::json!({
+                    "query_id": query_id,
+                    "name": "Check Summary Monitor",
+                    "options": { "column": "value", "op": ">", "value": 5.0 }
+                }))
+                .send()
+                .await
+                .unwrap(),
+            "create monitor",
+        )
+        .await["id"]
+            .as_i64()
+            .unwrap();
+        let dash = ok_json(
+            admin
+                .post(format!("{}/api/dashboards", app.address))
+                .json(&serde_json::json!({ "name": "Check Summary Dashboard" }))
+                .send()
+                .await
+                .unwrap(),
+            "create dashboard",
+        )
+        .await;
+        let dash_id = dash["id"].as_i64().unwrap();
+        let slug = dash["slug"].as_str().unwrap().to_string();
+        ok_json(
+            admin
+                .post(format!("{}/api/widgets", app.address))
+                .json(&serde_json::json!({
+                    "dashboard_id": dash_id,
+                    "visualization_id": viz_id,
+                    "width": 1
+                }))
+                .send()
+                .await
+                .unwrap(),
+            "create widget",
+        )
+        .await;
+        let publish = admin
+            .post(format!("{}/api/dashboards/{slug}/publish", app.address))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(publish.status().as_u16(), 200, "publish dashboard");
+        (slug, monitor_id)
+    }
+
+    async fn set_state(app: &TestApp, monitor_id: i64, state: &str) {
+        app.db
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE monitors SET state = $1 WHERE id = $2",
+                [state.into(), monitor_id.into()],
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn widget_carries_check_summary() {
+        let app = skip_if_none!(spawn_app().await);
+        app.cleanup().await;
+        let admin = app.admin_client().await;
+        let (slug, monitor_id) = dashboard_with_monitored_widget(&app, &admin).await;
+        set_state(&app, monitor_id, "triggered").await;
+
+        let body = ok_json(
+            admin
+                .get(format!("{}/api/dashboards/{slug}", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "get dashboard",
+        )
+        .await;
+        assert_eq!(
+            body["widgets"][0]["check_summary"],
+            serde_json::json!({ "total": 1, "ok": 0, "triggered": 1, "unevaluable": 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn check_summary_respects_monitor_visibility() {
+        let app = skip_if_none!(spawn_app().await);
+        app.cleanup().await;
+        let admin = app.admin_client().await;
+        let (slug, monitor_id) = dashboard_with_monitored_widget(&app, &admin).await;
+        set_state(&app, monitor_id, "triggered").await;
+
+        let mut active: arcodash_core::entities::monitor::ActiveModel =
+            arcodash_core::entities::monitor::Entity::find_by_id(monitor_id)
+                .one(&app.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        active.visibility = sea_orm::ActiveValue::Set("restricted".to_string());
+        active.update(&app.db).await.unwrap();
+
+        let default_org = arcodash_core::entities::organization::Entity::find()
+            .filter(arcodash_core::entities::organization::Column::Slug.eq("default"))
+            .one(&app.db)
+            .await
+            .unwrap()
+            .expect("default org must exist");
+        let viewers = arcodash_core::entities::group::Entity::find()
+            .filter(arcodash_core::entities::group::Column::OrgId.eq(default_org.id))
+            .filter(arcodash_core::entities::group::Column::Name.eq("viewers"))
+            .one(&app.db)
+            .await
+            .unwrap()
+            .expect("builtin viewers group must exist");
+        let viewer = non_admin_client_in_groups(
+            &app,
+            &admin,
+            "check-summary-viewer@test.local",
+            &[viewers.id],
+        )
+        .await;
+
+        let as_viewer = ok_json(
+            viewer
+                .get(format!("{}/api/dashboards/{slug}", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "get dashboard as viewer",
+        )
+        .await;
+        assert_eq!(as_viewer["widgets"].as_array().unwrap().len(), 1);
+        assert!(
+            as_viewer["widgets"][0].get("check_summary").is_none(),
+            "a monitor the viewer cannot see must not be counted: {}",
+            as_viewer["widgets"][0]
+        );
+
+        let as_admin = ok_json(
+            admin
+                .get(format!("{}/api/dashboards/{slug}", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "get dashboard as admin",
+        )
+        .await;
+        assert_eq!(as_admin["widgets"][0]["check_summary"]["total"], 1);
+    }
+}
+
 mod freshness {
     use super::{ok_json, spawn_app};
     use crate::skip_if_none;

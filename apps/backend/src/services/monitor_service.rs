@@ -175,6 +175,58 @@ pub async fn list_for_user(
     })
 }
 
+/// Counts of a query's visible, non-silenced monitors by state; `unknown` counts toward `total` only.
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct CheckSummary {
+    pub total: u32,
+    pub ok: u32,
+    pub triggered: u32,
+    pub unevaluable: u32,
+}
+
+/// Groups monitors by `query_id`; silenced monitors are skipped entirely so a muted `triggered`
+/// monitor never reads as failing.
+#[must_use]
+pub fn summarize_checks(
+    monitors: &[monitor::Model],
+    now: DateTime<Utc>,
+) -> HashMap<i64, CheckSummary> {
+    let mut out: HashMap<i64, CheckSummary> = HashMap::new();
+    for m in monitors {
+        if arcodash_core::models::parse_monitor_options(m.id, &m.options).is_silenced(now) {
+            continue;
+        }
+        let s = out.entry(m.query_id).or_default();
+        s.total += 1;
+        match m.state.as_str() {
+            "ok" => s.ok += 1,
+            "triggered" => s.triggered += 1,
+            "unevaluable" => s.unevaluable += 1,
+            _ => {}
+        }
+    }
+    out
+}
+
+// One visibility-filtered list per dashboard load; orgs rarely hold enough monitors to need a per-query filter.
+pub async fn check_summaries(
+    db: &impl ConnectionTrait,
+    org_id: i64,
+    user: &user::Model,
+    query_ids: &[i64],
+) -> Result<HashMap<i64, CheckSummary>, ApiError> {
+    if query_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let monitors: Vec<monitor::Model> = list_for_user(db, org_id, user, None, None, None, None)
+        .await?
+        .into_iter()
+        .map(|(m, _)| m)
+        .filter(|m| query_ids.contains(&m.query_id))
+        .collect();
+    Ok(summarize_checks(&monitors, Utc::now()))
+}
+
 /// Batched `query_service::get_for_user` visibility check over many query ids; a missing id is the
 /// same fail-closed answer a per-id failure gives.
 async fn batch_visible_queries(
@@ -2464,5 +2516,90 @@ mod tests {
             !ids.contains(&invisible.id),
             "ids filter must still exclude a monitor the caller cannot see"
         );
+    }
+}
+
+#[cfg(test)]
+mod check_summary_tests {
+    use super::*;
+
+    fn monitor_model(query_id: i64, state: &str, options: Value) -> monitor::Model {
+        let now = Utc::now().fixed_offset();
+        monitor::Model {
+            id: 1,
+            org_id: 1,
+            name: "m".to_string(),
+            query_id,
+            user_id: 1,
+            options,
+            state: state.to_string(),
+            visibility: "org".to_string(),
+            last_triggered_at: None,
+            rearm: None,
+            created_at: now,
+            updated_at: now,
+            acked_at: None,
+            acked_by: None,
+            escalation_step: 0,
+            last_escalated_at: None,
+            unevaluable_reason: None,
+        }
+    }
+
+    #[test]
+    fn silenced_triggered_monitor_is_skipped() {
+        let now = Utc::now();
+        let muted = monitor_model(7, "triggered", json!({"kind":"threshold","muted":true}));
+        let live = monitor_model(7, "triggered", json!({"kind":"threshold"}));
+        let ok = monitor_model(7, "ok", json!({"kind":"threshold"}));
+        let other = monitor_model(8, "unevaluable", json!({"kind":"baseline"}));
+        let m = summarize_checks(&[muted, live, ok, other], now);
+        assert_eq!(
+            m[&7],
+            CheckSummary {
+                total: 2,
+                ok: 1,
+                triggered: 1,
+                unevaluable: 0
+            }
+        );
+        assert_eq!(
+            m[&8],
+            CheckSummary {
+                total: 1,
+                ok: 0,
+                triggered: 0,
+                unevaluable: 1
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_state_counts_toward_total_only() {
+        let m = summarize_checks(
+            &[monitor_model(3, "unknown", json!({"kind":"threshold"}))],
+            Utc::now(),
+        );
+        assert_eq!(
+            m[&3],
+            CheckSummary {
+                total: 1,
+                ok: 0,
+                triggered: 0,
+                unevaluable: 0
+            }
+        );
+    }
+
+    #[test]
+    fn snoozed_monitor_is_skipped_until_expiry() {
+        let now = Utc::now();
+        let until = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let snoozed = monitor_model(
+            5,
+            "triggered",
+            json!({"kind":"threshold","muted_until":until}),
+        );
+        assert!(summarize_checks(&[snoozed], now).is_empty());
     }
 }
