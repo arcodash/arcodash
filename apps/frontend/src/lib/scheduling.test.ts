@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  cadenceLabel,
   countdown,
   describeSpec,
   expectedCadenceSecs,
@@ -214,5 +215,19 @@ describe("isFailedStatus", () => {
 
   it("does not misclassify an unknown status as a failure", () => {
     expect(isFailedStatus("some_future_status")).toBe(false);
+  });
+});
+
+describe("cadenceLabel", () => {
+  it("names the common cadences", () => {
+    expect(cadenceLabel(3600)).toBe("hourly");
+    expect(cadenceLabel(86400)).toBe("daily");
+    expect(cadenceLabel(604800)).toBe("weekly");
+  });
+
+  it("spells out other intervals", () => {
+    expect(cadenceLabel(900)).toBe("every 15 min");
+    expect(cadenceLabel(7200)).toBe("every 2h");
+    expect(cadenceLabel(172800)).toBe("every 2d");
   });
 });

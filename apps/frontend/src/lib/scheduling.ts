@@ -105,6 +105,18 @@ export function isStale(ageSecs: number, cadenceSecs: number | null): boolean {
   return cadenceSecs != null && ageSecs > 1.5 * cadenceSecs;
 }
 
+/** Human wording for an expected refresh cadence: `hourly`, `daily`, `weekly`, else `every 15 min`. */
+export function cadenceLabel(secs: number): string {
+  if (secs === 3600) return "hourly";
+  if (secs === 86400) return "daily";
+  if (secs === 604800) return "weekly";
+  const m = Math.round(secs / 60);
+  if (m < 60) return `every ${Math.max(1, m)} min`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `every ${h}h`;
+  return `every ${Math.round(h / 24)}d`;
+}
+
 /** Whether a schedule whose last run finished at `finishedMs` is stale at `nowMs`. */
 export function isScheduleStale(
   schedule: Pick<Schedule, "spec" | "next_run_at">,

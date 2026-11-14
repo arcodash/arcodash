@@ -317,6 +317,7 @@ export const WidgetCard = memo(function WidgetCard({
   const linkMonitors = !editMode && !publicView;
   const monitorHref =
     linkMonitors && monitorMeta?.monitorId != null ? `/monitors/${monitorMeta.monitorId}` : undefined;
+  const showFooter = !editMode && !publicView && widget.visualization_id != null;
   const chrome = CHROME[monitorMeta?.treatment ?? "neutral"];
 
   return (
@@ -350,12 +351,13 @@ export const WidgetCard = memo(function WidgetCard({
             </Button>
           </div>
         )}
-        {!editMode &&
+        {publicView &&
+          !editMode &&
           widget.visualization_id != null &&
           widget.freshness &&
-          (!publicView || widget.freshness.expected_interval_secs != null) && (
-          <TileFreshnessDot freshness={widget.freshness} alwaysShowAge={publicView ?? false} />
-        )}
+          widget.freshness.expected_interval_secs != null && (
+            <TileFreshnessDot freshness={widget.freshness} alwaysShowAge />
+          )}
       </div>
       <div className="min-h-0 flex-1 overflow-hidden p-2">
         {widget.visualization_id != null ? (
@@ -366,6 +368,14 @@ export const WidgetCard = memo(function WidgetCard({
           <TextWidget text={widget.text} />
         )}
       </div>
+      {showFooter && (
+        <div
+          data-testid="tile-footer"
+          className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs"
+        >
+          {widget.freshness && <TileFreshnessDot freshness={widget.freshness} />}
+        </div>
+      )}
     </div>
   );
 });

@@ -101,10 +101,22 @@ describe("WidgetCard freshness on public views", () => {
     expect(screen.getByText(/Updated/)).toBeInTheDocument();
   });
 
+  it("has no tile footer", () => {
+    renderCard(vizWidget(3600), { publicView: true });
+
+    expect(screen.queryByTestId("tile-footer")).not.toBeInTheDocument();
+  });
+
   it("keeps the dot on private views for an unscheduled query", () => {
     renderCard(vizWidget(null));
 
     expect(screen.getByLabelText(/^Updated /)).toBeInTheDocument();
+  });
+
+  it("renders the age in a footer on private views", () => {
+    renderCard(vizWidget(null));
+
+    expect(screen.getByTestId("tile-footer")).toHaveTextContent("Updated");
   });
 });
 

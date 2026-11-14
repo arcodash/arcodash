@@ -1,16 +1,15 @@
-import { exactTs, isFailedStatus, isStale, timeAgo, useNow } from "@/lib/scheduling";
+import { cadenceLabel, exactTs, isFailedStatus, isStale, timeAgo, useNow } from "@/lib/scheduling";
 import type { WidgetFreshness } from "@/types/api";
 
 interface TileFreshnessDotProps {
   freshness: WidgetFreshness;
-  /** Public/embed: age always shown inline (no cursor to hover on a TV); private dashboards
-   * hover-gate it. */
-  alwaysShowAge: boolean;
+  /** Retained for callers; the age text is always shown. */
+  alwaysShowAge?: boolean;
 }
 
 /** The tile's freshness dot: a pure reader of the widget DTO's `freshness` fields. Neutral (fresh),
  * amber (stale), red (failed; the last-good number stays, only the dot changes). */
-export function TileFreshnessDot({ freshness, alwaysShowAge }: TileFreshnessDotProps) {
+export function TileFreshnessDot({ freshness }: TileFreshnessDotProps) {
   const now = useNow(true);
   const retrievedMs = Date.parse(freshness.retrieved_at);
   const ago = timeAgo(retrievedMs, now);
@@ -22,17 +21,20 @@ export function TileFreshnessDot({ freshness, alwaysShowAge }: TileFreshnessDotP
 
   let containerClass = "text-muted-foreground";
   let dotClass = "bg-muted-foreground/40";
-  let text: string | null = alwaysShowAge ? `Updated ${ago}` : null;
+  let text = `Updated ${ago}`;
   let title = `Updated ${ago} (${exact})`;
 
   if (stale) {
     containerClass = "rounded bg-warning/10 px-1 text-warning-foreground";
     dotClass = "bg-warning";
-    text = ago;
+    text =
+      freshness.expected_interval_secs != null
+        ? `${ago} · expected ${cadenceLabel(freshness.expected_interval_secs)}`
+        : ago;
   } else if (failed) {
     containerClass = "text-destructive";
     dotClass = "bg-destructive";
-    text = alwaysShowAge ? `Data may be outdated · ${ago}` : "Data may be outdated";
+    text = `Data may be outdated · ${ago}`;
     title = `Showing last successful result from ${ago} (${exact})`;
   }
 
@@ -43,7 +45,7 @@ export function TileFreshnessDot({ freshness, alwaysShowAge }: TileFreshnessDotP
       aria-label={title}
     >
       <span className={`h-2 w-2 shrink-0 rounded-full ${dotClass}`} />
-      {text && <span>{text}</span>}
+      <span>{text}</span>
     </span>
   );
 }
