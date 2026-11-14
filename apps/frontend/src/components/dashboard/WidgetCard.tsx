@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { GripVertical, ShieldCheck, X } from "lucide-react";
+import { Bell, GripVertical, ShieldCheck, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,9 @@ import { ApiError, api, apiErrorMessage } from "@/lib/api";
 import { usePollJob } from "@/lib/jobs";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { getViz, toVizData } from "@/components/visualizations/registry";
+import { usePermissions } from "@/lib/permissions";
 import { TileFreshnessDot } from "./TileFreshnessDot";
+import { TileCheckBadge } from "./TileCheckBadge";
 import { MonitorWidget, computeMonitorCardMeta, type MonitorCardMeta } from "./MonitorWidget";
 import type { Widget, ResultData, ParamValue } from "@/types/api";
 import type { QueryResultData } from "@/components/visualizations/registry";
@@ -294,6 +296,35 @@ function TruncatedTitle({
   );
 }
 
+/** Private-view only: `usePermissions` hits the session endpoint, which public embeds must not. */
+function useCanAddMonitor(published: boolean): boolean {
+  const { has } = usePermissions();
+  return published && has("create_monitor");
+}
+
+function TileMonitorBell({ queryId, published, title }: { queryId: number; published: boolean; title: string }) {
+  if (!useCanAddMonitor(published)) return null;
+  return (
+    <Button asChild variant="ghost" size="icon" className="ml-auto h-6 w-6 shrink-0 text-muted-foreground">
+      <Link to={`/monitors/new?query_id=${queryId}`} aria-label={`Add a monitor for ${title}`} title={`Add a monitor for ${title}`}>
+        <Bell className="h-3.5 w-3.5" />
+      </Link>
+    </Button>
+  );
+}
+
+function TileCheckSlot({
+  summary,
+  queryId,
+  published,
+}: {
+  summary: Widget["check_summary"];
+  queryId: number;
+  published: boolean;
+}) {
+  return <TileCheckBadge summary={summary} queryId={queryId} canAddMonitor={useCanAddMonitor(published)} />;
+}
+
 export function isMonitorWidget(widget: Widget): boolean {
   return widget.visualization_id == null && (widget.monitors != null || (widget.options.monitors?.length ?? 0) > 0);
 }
@@ -337,6 +368,7 @@ export const WidgetCard = memo(function WidgetCard({
     linkMonitors && monitorMeta?.monitorId != null ? `/monitors/${monitorMeta.monitorId}` : undefined;
   const showFooter = !editMode && !publicView && widget.visualization_id != null;
   const chrome = CHROME[monitorMeta?.treatment ?? "neutral"];
+  const query = widget.visualization?.query;
 
   return (
     <div
@@ -369,6 +401,7 @@ export const WidgetCard = memo(function WidgetCard({
             </Button>
           </div>
         )}
+        {showFooter && query != null && <TileMonitorBell queryId={query.id} published={query.is_published} title={title} />}
         {publicView &&
           !editMode &&
           widget.visualization_id != null &&
@@ -392,6 +425,9 @@ export const WidgetCard = memo(function WidgetCard({
           className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs"
         >
           {widget.freshness && <TileFreshnessDot freshness={widget.freshness} />}
+          {query != null && (
+            <TileCheckSlot summary={widget.check_summary} queryId={query.id} published={query.is_published} />
+          )}
         </div>
       )}
     </div>

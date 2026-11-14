@@ -1,10 +1,13 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { MemoryRouter } from "react-router";
 import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { server } from "@/__tests__/msw-server";
 import { WidgetCard } from "../WidgetCard";
 import type { Widget } from "@/types/api";
+
+vi.mock("@/lib/permissions", () => ({ usePermissions: () => ({ has: () => true, hasAny: () => true }) }));
 
 const BASE = "http://localhost:8080";
 
@@ -37,9 +40,9 @@ function tableWidget(overrides: Partial<Widget> = {}): Widget {
 function renderCard(widget: Widget) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <QueryClientProvider client={qc}>
+    <MemoryRouter><QueryClientProvider client={qc}>
       <WidgetCard widget={widget} editMode={false} onDelete={() => {}} />
-    </QueryClientProvider>,
+    </QueryClientProvider></MemoryRouter>,
   );
 }
 
@@ -226,9 +229,9 @@ describe("WidgetCard job-poll flow", () => {
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
-      <QueryClientProvider client={qc}>
+      <MemoryRouter><QueryClientProvider client={qc}>
         <WidgetCard widget={tableWidget()} editMode={false} onDelete={() => {}} refreshKey={0} />
-      </QueryClientProvider>,
+      </QueryClientProvider></MemoryRouter>,
     );
     await screen.findByText("1");
 
@@ -252,9 +255,9 @@ describe("WidgetCard job-poll flow", () => {
 
   function renderTick(qc: QueryClient, refreshKey: number) {
     return (
-      <QueryClientProvider client={qc}>
+      <MemoryRouter><QueryClientProvider client={qc}>
         <WidgetCard widget={tableWidget()} editMode={false} onDelete={() => {}} refreshKey={refreshKey} />
-      </QueryClientProvider>
+      </QueryClientProvider></MemoryRouter>
     );
   }
 
@@ -394,14 +397,14 @@ describe("WidgetCard job-poll flow", () => {
     }
     function renderParams(qc: QueryClient, region: string) {
       return (
-        <QueryClientProvider client={qc}>
+        <MemoryRouter><QueryClientProvider client={qc}>
           <WidgetCard
             widget={paramWidget()}
             editMode={false}
             onDelete={() => {}}
             dashboardParams={{ region }}
           />
-        </QueryClientProvider>
+        </QueryClientProvider></MemoryRouter>
       );
     }
 

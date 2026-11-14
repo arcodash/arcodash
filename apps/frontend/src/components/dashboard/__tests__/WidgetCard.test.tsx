@@ -7,6 +7,10 @@ import { WidgetCard } from "../WidgetCard";
 import type { Widget } from "@/types/api";
 
 vi.mock("@/lib/api", () => ({ api: {} }));
+let canCreateMonitor = true;
+vi.mock("@/lib/permissions", () => ({
+  usePermissions: () => ({ has: (k: string) => (k === "create_monitor" ? canCreateMonitor : true) }),
+}));
 
 function textWidget(text: string): Widget {
   return {
@@ -264,5 +268,55 @@ describe("WidgetCard verified badge", () => {
     renderCard(withVerified(false));
 
     expect(screen.queryByRole("img", { name: "Verified by an admin" })).not.toBeInTheDocument();
+  });
+});
+
+describe("WidgetCard check badge and bell", () => {
+  afterEach(() => {
+    canCreateMonitor = true;
+  });
+
+  function withQuery(isPublished: boolean): Widget {
+    return {
+      ...vizWidget(null),
+      visualization: {
+        id: 5,
+        name: "Viz",
+        type: "table",
+        options: {},
+        query: { id: 42, is_published: isPublished },
+      },
+    } as unknown as Widget;
+  }
+
+  it("shows the bell and add-a-check link for a published query", () => {
+    renderCard(withQuery(true));
+
+    expect(screen.getByLabelText("Add a monitor for Viz")).toHaveAttribute("href", "/monitors/new?query_id=42");
+    expect(screen.getByRole("link", { name: "No checks · add one" })).toBeInTheDocument();
+  });
+
+  it("shows neither for an unpublished query", () => {
+    renderCard(withQuery(false));
+
+    expect(screen.queryByLabelText("Add a monitor for Viz")).not.toBeInTheDocument();
+    expect(screen.getByText("No checks")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /No checks/ })).not.toBeInTheDocument();
+  });
+
+  it("shows neither on public views", () => {
+    renderCard(withQuery(true), { publicView: true });
+
+    expect(screen.queryByLabelText("Add a monitor for Viz")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No checks/)).not.toBeInTheDocument();
+  });
+
+  it("shows a plain label without create_monitor", () => {
+    canCreateMonitor = false;
+    renderCard(withQuery(true));
+
+    expect(screen.queryByLabelText("Add a monitor for Viz")).not.toBeInTheDocument();
+    expect(screen.getByText("No checks")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /No checks/ })).not.toBeInTheDocument();
   });
 });
