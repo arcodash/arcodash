@@ -3,7 +3,7 @@
 //! Every read/mutation goes through `authz::authorize::authorize`: capability AND reach;
 //! update/delete/mute need `edit_monitor` AND Editor-or-above reach.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -208,7 +208,7 @@ pub fn summarize_checks(
     out
 }
 
-// One visibility-filtered list per dashboard load; orgs rarely hold enough monitors to need a per-query filter.
+/// One visibility-filtered list per dashboard load; orgs rarely hold enough monitors to need a per-query filter.
 pub async fn check_summaries(
     db: &impl ConnectionTrait,
     org_id: i64,
@@ -218,11 +218,12 @@ pub async fn check_summaries(
     if query_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    let wanted: HashSet<i64> = query_ids.iter().copied().collect();
     let monitors: Vec<monitor::Model> = list_for_user(db, org_id, user, None, None, None, None)
         .await?
         .into_iter()
         .map(|(m, _)| m)
-        .filter(|m| query_ids.contains(&m.query_id))
+        .filter(|m| wanted.contains(&m.query_id))
         .collect();
     Ok(summarize_checks(&monitors, Utc::now()))
 }

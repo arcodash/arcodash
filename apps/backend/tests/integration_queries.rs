@@ -3583,6 +3583,69 @@ mod verified {
     }
 
     #[tokio::test]
+    async fn cross_org_admin_cannot_verify() {
+        use crate::common::{make_org, user_with_role};
+        let app = skip_if_none!(spawn_app().await);
+        app.cleanup().await;
+        let admin = app.admin_client().await;
+        let ds_id = create_ds(&admin, &app.address, "verify-xorg-ds").await;
+        let id = create_published_query(&admin, &app.address, ds_id).await;
+
+        let other_org = make_org(&app.db).await;
+        let (other_admin, _) = user_with_role(&app.db, other_org, &["admin"]).await;
+
+        let err = arcodash_backend::services::query_service::set_verified(
+            &app.db,
+            other_org,
+            &other_admin,
+            id,
+            true,
+        )
+        .await
+        .expect_err("cross-org verify must fail");
+        assert_eq!(err.status.as_u16(), 404);
+
+        let q = ok_json(
+            admin
+                .get(format!("{}/api/queries/{id}", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "get query",
+        )
+        .await;
+        assert!(q["verified_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn verifying_twice_is_a_noop() {
+        let app = skip_if_none!(spawn_app().await);
+        app.cleanup().await;
+        let admin = app.admin_client().await;
+        let ds_id = create_ds(&admin, &app.address, "verify-twice-ds").await;
+        let id = create_published_query(&admin, &app.address, ds_id).await;
+
+        let mut stamps = Vec::new();
+        for _ in 0..2 {
+            let v = ok_json(
+                admin
+                    .post(format!("{}/api/queries/{id}/verify", app.address))
+                    .send()
+                    .await
+                    .unwrap(),
+                "verify",
+            )
+            .await;
+            stamps.push(v["verified_at"].clone());
+        }
+        assert!(!stamps[0].is_null());
+        assert_eq!(stamps[0], stamps[1]);
+
+        let events = event_object_ids(&admin, &app.address, "query.verified").await;
+        assert_eq!(events.iter().filter(|e| **e == id).count(), 1);
+    }
+
+    #[tokio::test]
     async fn dashboard_query_summary_carries_verified() {
         let app = skip_if_none!(spawn_app().await);
         app.cleanup().await;

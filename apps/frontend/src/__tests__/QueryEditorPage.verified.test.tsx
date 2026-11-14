@@ -69,17 +69,19 @@ const VERIFIED = { ...QUERY, verified_at: "2026-01-01T00:00:00Z", verified_by: 1
 
 function renderEditor() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["dashboard", "sales", false], { id: 1 });
   const router = createMemoryRouter(
     [{ path: "/queries/:id", element: <QueryEditorPage /> }],
     { initialEntries: ["/queries/5"] },
   );
-  return render(
+  const view = render(
     <QueryClientProvider client={qc}>
       <AuthProvider>
         <RouterProvider router={router} />
       </AuthProvider>
     </QueryClientProvider>,
   );
+  return { ...view, qc };
 }
 
 describe("QueryEditorPage verified toggle", () => {
@@ -104,12 +106,13 @@ describe("QueryEditorPage verified toggle", () => {
 
   it("lets an admin mark a query verified and flips the label", async () => {
     server.use(http.get(`${BASE}/api/queries/5`, () => HttpResponse.json(QUERY)));
-    renderEditor();
+    const { qc } = renderEditor();
 
     fireEvent.click(await screen.findByRole("button", { name: "Mark as verified" }));
 
     expect(await screen.findByRole("button", { name: "Verified · remove" })).toBeInTheDocument();
     expect(calls).toEqual(["verify"]);
+    await waitFor(() => expect(qc.getQueryState(["dashboard", "sales", false])?.isInvalidated).toBe(true));
   });
 
   it("hides the toggle from non-admins", async () => {

@@ -36,6 +36,15 @@ describe("healthLine", () => {
     expect(healthLine(h, NOW)).toBe("Oldest result 2h ago · 1 check failing · 1 not run · 3 passing");
   });
 
+  it("counts a query's checks once when tiles share it, but still considers every tile's age", () => {
+    const shared = (retrievedAgoMs: number) =>
+      ({ ...viz(retrievedAgoMs, sum(1, 1, 0)), visualization: { query: { id: 7 } } }) as unknown as Widget;
+    const h = summarizeDashboardHealth([shared(5 * MIN), shared(90 * MIN)]);
+    expect(h.failing).toBe(1);
+    expect(h.passing).toBe(1);
+    expect(healthLine(h, NOW)).toBe("Oldest result 2h ago · 1 check failing · 1 passing");
+  });
+
   it("returns null with no viz widgets", () => {
     expect(healthLine(summarizeDashboardHealth([]), NOW)).toBeNull();
   });

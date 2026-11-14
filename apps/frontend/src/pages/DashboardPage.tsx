@@ -101,7 +101,7 @@ export function DashboardPage() {
     enabled: slug != null,
   });
 
-  const sourcesQ = useQuery({ queryKey: ["data-sources"], queryFn: () => api.listDataSources() });
+  const sourcesQ = useQuery({ queryKey: ["data-sources"], queryFn: () => api.listDataSources(), enabled: has("create_query") });
   const exploreSourceId = sourcesQ.data?.data_sources.find((d) => d.type === "query_results")?.id ?? null;
 
   const narrativesEnabled = clientConfig?.ai_dashboard_narratives === true;

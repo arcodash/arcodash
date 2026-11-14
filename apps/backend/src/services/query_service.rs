@@ -1123,6 +1123,10 @@ pub async fn set_verified(
         .await?
         .ok_or_else(|| ApiError::not_found("query not found"))?;
 
+    if q.verified_at.is_some() == verified {
+        return Ok(q);
+    }
+
     let mut active: query::ActiveModel = q.clone().into();
     if verified {
         active.verified_at = Set(Some(Utc::now().into()));

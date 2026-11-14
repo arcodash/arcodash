@@ -3,8 +3,6 @@ import type { WidgetFreshness } from "@/types/api";
 
 interface TileFreshnessDotProps {
   freshness: WidgetFreshness;
-  /** Retained for callers; the age text is always shown. */
-  alwaysShowAge?: boolean;
 }
 
 /** The tile's freshness dot: a pure reader of the widget DTO's `freshness` fields. Neutral (fresh),

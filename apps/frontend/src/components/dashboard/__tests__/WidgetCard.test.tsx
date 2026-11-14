@@ -13,7 +13,7 @@ vi.mock("react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof ReactRouterModule>();
   return { ...actual, useNavigate: () => navigateSpy };
 });
-vi.mock("@/lib/api", () => ({ api: {} }));
+vi.mock("@/lib/api", () => ({ api: {}, ApiError: class ApiError extends Error {} }));
 let canCreateMonitor = true;
 vi.mock("@/lib/permissions", () => ({
   usePermissions: () => ({ has: (k: string) => (k === "create_monitor" ? canCreateMonitor : true) }),
@@ -268,7 +268,9 @@ describe("WidgetCard verified badge", () => {
   it("shows a shield when the query is verified", () => {
     renderCard(withVerified(true));
 
-    expect(screen.getByRole("img", { name: "Verified by an admin" })).toBeInTheDocument();
+    const icon = screen.getByRole("img", { name: "Verified by an admin" });
+    expect(icon).toBeInTheDocument();
+    expect(icon).not.toHaveAttribute("aria-hidden", "true");
   });
 
   it("shows nothing when the query is not verified", () => {
@@ -331,7 +333,7 @@ describe("WidgetCard check badge and bell", () => {
 describe("WidgetCard tile menu", () => {
   const widget = {
     ...vizWidget(null),
-    viewer_can_read_data: false,
+    viewer_can_read_data: true,
     visualization: {
       id: 5,
       name: "Viz",
@@ -361,6 +363,15 @@ describe("WidgetCard tile menu", () => {
     });
   });
 
+  it("omits explore when the viewer cannot read the data", async () => {
+    const user = userEvent.setup();
+    renderCard({ ...widget, viewer_can_read_data: false } as Widget, { exploreSourceId: 9 });
+
+    await user.click(screen.getByRole("button", { name: "Tile menu for Viz" }));
+    expect(screen.getByRole("menuitem", { name: "Open query" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Explore this tile/ })).not.toBeInTheDocument();
+  });
+
   it("omits explore when the org has no query-results source", async () => {
     const user = userEvent.setup();
     renderCard(widget, { exploreSourceId: null });
@@ -370,7 +381,7 @@ describe("WidgetCard tile menu", () => {
     expect(screen.queryByRole("menuitem", { name: /Explore this tile/ })).not.toBeInTheDocument();
   });
 
-  it("has no menu on public views or in edit mode", () => {
+  it("has no menu on public views", () => {
     renderCard(widget, { publicView: true, exploreSourceId: 9 });
     expect(screen.queryByRole("button", { name: "Tile menu for Viz" })).not.toBeInTheDocument();
   });

@@ -261,8 +261,6 @@ export function QueryEditorPage() {
     };
   }, []);
 
-  // Non-empty default so a saved query never shows a blank name; `nameTouched` is what gates
-  // autosave.
   const location = useLocation();
   // Prefill handed over by "Add with AI" (the Ask tab opens, never auto-runs) or by "Explore this
   // tile" (starter SQL over a cached result). Location state is untyped, so validate each field.
@@ -706,6 +704,7 @@ export function QueryEditorPage() {
         old ? { ...old, verified_at: updated.verified_at, verified_by: updated.verified_by } : updated,
       );
       queryClient.invalidateQueries({ queryKey: ["queries"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
     },
     onError: (err) => setSaveError(apiErrorMessage(err, "Failed to update verified state")),
   });

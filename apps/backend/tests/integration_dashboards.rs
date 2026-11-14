@@ -2407,16 +2407,6 @@ mod check_summary {
         let (slug, monitor_id) = dashboard_with_monitored_widget(&app, &admin).await;
         set_state(&app, monitor_id, "triggered").await;
 
-        let mut active: arcodash_core::entities::monitor::ActiveModel =
-            arcodash_core::entities::monitor::Entity::find_by_id(monitor_id)
-                .one(&app.db)
-                .await
-                .unwrap()
-                .unwrap()
-                .into();
-        active.visibility = sea_orm::ActiveValue::Set("restricted".to_string());
-        active.update(&app.db).await.unwrap();
-
         let default_org = arcodash_core::entities::organization::Entity::find()
             .filter(arcodash_core::entities::organization::Column::Slug.eq("default"))
             .one(&app.db)
@@ -2437,6 +2427,30 @@ mod check_summary {
             &[viewers.id],
         )
         .await;
+
+        let visible_to_viewer = ok_json(
+            viewer
+                .get(format!("{}/api/dashboards/{slug}", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "get dashboard as viewer before restricting",
+        )
+        .await;
+        assert_eq!(
+            visible_to_viewer["widgets"][0]["check_summary"]["total"], 1,
+            "an org-visible monitor must be counted for the viewer"
+        );
+
+        let mut active: arcodash_core::entities::monitor::ActiveModel =
+            arcodash_core::entities::monitor::Entity::find_by_id(monitor_id)
+                .one(&app.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        active.visibility = sea_orm::ActiveValue::Set("restricted".to_string());
+        active.update(&app.db).await.unwrap();
 
         let as_viewer = ok_json(
             viewer

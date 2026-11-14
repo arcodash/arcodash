@@ -9,8 +9,8 @@ function minutesAgoIso(minutes: number): string {
   return new Date(NOW.getTime() - minutes * 60_000).toISOString();
 }
 
-function renderDot(freshness: WidgetFreshness, alwaysShowAge: boolean) {
-  return render(<TileFreshnessDot freshness={freshness} alwaysShowAge={alwaysShowAge} />);
+function renderDot(freshness: WidgetFreshness) {
+  return render(<TileFreshnessDot freshness={freshness} />);
 }
 
 beforeEach(() => {
@@ -30,20 +30,18 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900, // 15 min
         last_run_status: "success",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.textContent).toBe("Updated 8 min ago");
   });
 
-  it("fresh success with alwaysShowAge shows 'Updated 8 min ago' inline", () => {
+  it("fresh success shows 'Updated 8 min ago' inline", () => {
     const { container } = renderDot(
       {
         retrieved_at: minutesAgoIso(8),
         expected_interval_secs: 900,
         last_run_status: "success",
       },
-      true,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.textContent).toBe("Updated 8 min ago");
@@ -56,7 +54,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "success",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.getAttribute("title")).toContain("Updated 8 min ago");
@@ -71,7 +68,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "success",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.className).toContain("warning");
@@ -85,7 +81,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: null,
         last_run_status: "success",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.className).not.toContain("warning");
@@ -100,7 +95,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "failed",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.className).toContain("destructive");
@@ -114,7 +108,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "failed",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.getAttribute("title")).toContain("Showing last successful result from 3h ago");
@@ -127,7 +120,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "failed",
       },
-      true,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.textContent).toBe("Data may be outdated · 3h ago");
@@ -141,7 +133,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "failed",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.className).toContain("destructive");
@@ -155,7 +146,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "timed_out",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.className).toContain("destructive");
@@ -169,7 +159,6 @@ describe("TileFreshnessDot", () => {
         expected_interval_secs: 900,
         last_run_status: "cancelled",
       },
-      false,
     );
     const wrapper = container.querySelector("span[title]")!;
     expect(wrapper.className).not.toContain("destructive");
@@ -179,7 +168,6 @@ describe("TileFreshnessDot", () => {
   it("shows the age text on private dashboards too", () => {
     renderDot(
       { retrieved_at: minutesAgoIso(12), expected_interval_secs: null, last_run_status: "success" },
-      false,
     );
     expect(screen.getByText(/Updated 12 min ago/)).toBeInTheDocument();
   });
@@ -187,7 +175,6 @@ describe("TileFreshnessDot", () => {
   it("names the expected cadence when stale", () => {
     renderDot(
       { retrieved_at: minutesAgoIso(120), expected_interval_secs: 3600, last_run_status: "success" },
-      false,
     );
     expect(screen.getByText(/2h ago · expected hourly/)).toBeInTheDocument();
   });

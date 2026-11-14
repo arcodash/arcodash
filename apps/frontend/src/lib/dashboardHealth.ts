@@ -9,15 +9,21 @@ export interface DashboardHealth {
   anyFailedRun: boolean;
 }
 
-/** Rolls up the viz tiles that carry freshness; counts are per tile, so tiles sharing a query count twice. */
+/** Rolls up the viz tiles that carry freshness. Oldest age considers every tile; check counts are per query, so tiles sharing a query count once. */
 export function summarizeDashboardHealth(widgets: Widget[]): DashboardHealth {
   const h: DashboardHealth = { oldestRetrievedMs: null, failing: 0, notRun: 0, passing: 0, anyFailedRun: false };
+  const countedQueries = new Set<number>();
   for (const w of widgets) {
     if (w.visualization_id == null || !w.freshness) continue;
     const ms = Date.parse(w.freshness.retrieved_at);
     if (Number.isNaN(ms)) continue;
     h.oldestRetrievedMs = h.oldestRetrievedMs == null ? ms : Math.min(h.oldestRetrievedMs, ms);
     if (isFailedStatus(w.freshness.last_run_status)) h.anyFailedRun = true;
+    const queryId = w.visualization?.query?.id;
+    if (queryId != null) {
+      if (countedQueries.has(queryId)) continue;
+      countedQueries.add(queryId);
+    }
     h.failing += w.check_summary?.triggered ?? 0;
     h.notRun += w.check_summary?.unevaluable ?? 0;
     h.passing += w.check_summary?.ok ?? 0;

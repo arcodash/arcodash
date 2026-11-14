@@ -280,22 +280,25 @@ function TruncatedTitle({
     >
       <TooltipTrigger asChild>
         {/* The clamp lives on a block wrapper so a link title clamps too (an inline <a> can't). */}
-        <div ref={ref} className={`${minW} flex-1 break-words font-serif text-base font-medium leading-snug line-clamp-3`}>
-          {href ? (
-            <Link
-              to={href}
-              className="outline-none after:absolute after:inset-0 after:content-[''] hover:underline"
-            >
-              {title}
-            </Link>
-          ) : (
-            title
-          )}
+        <div className="flex min-w-0 flex-1 items-start gap-1">
+          <div ref={ref} className={`${minW} flex-1 break-words font-serif text-base font-medium leading-snug line-clamp-3`}>
+            {href ? (
+              <Link
+                to={href}
+                className="outline-none after:absolute after:inset-0 after:content-[''] hover:underline"
+              >
+                {title}
+              </Link>
+            ) : (
+              title
+            )}
+          </div>
           {verified && (
             <ShieldCheck
               role="img"
+              aria-hidden={false}
               aria-label="Verified by an admin"
-              className="ml-1 inline h-3.5 w-3.5 shrink-0 align-[-2px] text-blue-600"
+              className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-600"
             />
           )}
         </div>
@@ -315,15 +318,17 @@ function TileMenu({
   query,
   title,
   exploreSourceId,
+  canReadData,
 }: {
   query: { id: number; name: string; is_published: boolean };
   title: string;
   exploreSourceId?: number | null;
+  canReadData: boolean;
 }) {
   const { has } = usePermissions();
   const navigate = useNavigate();
   const canMonitor = useCanAddMonitor(query.is_published);
-  const canExplore = exploreSourceId != null && has("create_query");
+  const canExplore = exploreSourceId != null && canReadData && has("create_query");
   return (
     <div className="ml-auto flex shrink-0 items-center gap-0.5">
       {canMonitor && (
@@ -465,13 +470,13 @@ export const WidgetCard = memo(function WidgetCard({
             </Button>
           </div>
         )}
-        {showFooter && query != null && <TileMenu query={query} title={title} exploreSourceId={exploreSourceId} />}
+        {showFooter && query != null && <TileMenu query={query} title={title} exploreSourceId={exploreSourceId} canReadData={widget.viewer_can_read_data} />}
         {publicView &&
           !editMode &&
           widget.visualization_id != null &&
           widget.freshness &&
           widget.freshness.expected_interval_secs != null && (
-            <TileFreshnessDot freshness={widget.freshness} alwaysShowAge />
+            <TileFreshnessDot freshness={widget.freshness} />
           )}
       </div>
       <div className="min-h-0 flex-1 overflow-hidden p-2">
