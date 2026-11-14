@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { DropdownMenuItem, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { ActionBar, type ActionItem } from "@/components/common/ActionBar";
+import { DashboardHealthLine } from "@/components/dashboard/DashboardHealthLine";
 import { EmptyState } from "@/components/common/EmptyState";
 import { TagEditor } from "@/components/common/TagEditor";
 import { UnpublishedBadge } from "@/components/common/StateBadge";
@@ -541,6 +542,8 @@ export function DashboardPage() {
             extra={refreshSelect}
             menuExtra={refreshMenuExtra}
           />
+
+          {!editMode && <DashboardHealthLine widgets={dashboard.widgets} />}
 
           {canEdit && !editMode && state.pending && (
             <p className="text-xs text-muted-foreground">
