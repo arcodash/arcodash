@@ -153,9 +153,27 @@ describe("WidgetCard truncated title tooltip", () => {
 
     const el = screen.getByText("Text");
     expect(el.className).toContain("line-clamp-3");
-    expect(el.className).toContain("min-w-[min(8rem,100%)]");
+    expect(el.className).toContain("min-w-0");
     expect(el.className).toContain("break-words");
     expect(el.className).not.toContain("truncate");
+    expect(el.parentElement).toHaveClass("min-w-[min(8rem,100%)]");
+  });
+
+  it("moves the width floor to the title group when draggable", () => {
+    widths(100, 100);
+    const qc = new QueryClient();
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={qc}>
+          <WidgetCard widget={textWidget("x")} editMode onDelete={vi.fn()} />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+
+    const el = screen.getByText("Text");
+    expect(el.parentElement).toHaveClass("min-w-0");
+    expect(el.parentElement).not.toHaveClass("min-w-[min(8rem,100%)]");
+    expect(screen.getByTestId("widget-title-group")).toHaveClass("min-w-[min(8rem,100%)]");
   });
 
   it("lets editor actions wrap below the title rather than squeeze it", () => {

@@ -279,9 +279,9 @@ function TruncatedTitle({
       }}
     >
       <TooltipTrigger asChild>
-        {/* The clamp lives on a block wrapper so a link title clamps too (an inline <a> can't). */}
-        <div className="flex min-w-0 flex-1 items-start gap-1">
-          <div ref={ref} className={`${minW} flex-1 break-words font-serif text-base font-medium leading-snug line-clamp-3`}>
+        <div className={`${minW} flex flex-1 items-start gap-1`}>
+          {/* The clamp lives on a block wrapper so a link title clamps too (an inline <a> can't). */}
+          <div ref={ref} className="min-w-0 flex-1 break-words font-serif text-base font-medium leading-snug line-clamp-3">
             {href ? (
               <Link
                 to={href}
@@ -296,7 +296,6 @@ function TruncatedTitle({
           {verified && (
             <ShieldCheck
               role="img"
-              aria-hidden={false}
               aria-label="Verified by an admin"
               className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-600"
             />
