@@ -219,6 +219,9 @@ pub struct QueryResponse {
     pub row_count: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set while an admin vouches for the query.
+    pub verified_at: Option<DateTime<Utc>>,
+    pub verified_by: Option<i64>,
     /// Display name of the owning user; `None` if the user row is gone. Populated by handlers,
     /// never by `From<query::Model>`.
     pub owner_name: Option<String>,
@@ -258,6 +261,8 @@ impl From<query::Model> for QueryResponse {
             row_count: q.row_count,
             created_at: q.created_at.with_timezone(&Utc),
             updated_at: q.updated_at.with_timezone(&Utc),
+            verified_at: q.verified_at.map(|t| t.with_timezone(&Utc)),
+            verified_by: q.verified_by,
             owner_name: None,
             caller: Caller::default(),
         }
@@ -545,6 +550,28 @@ pub async fn unpublish(
 ) -> Result<impl IntoResponse, ApiError> {
     let existing = query_service::get_for_user(&db, user.org_id, &user, id).await?;
     let updated = query_service::unpublish(&db, &user, existing, payload.expected_version).await?;
+    query_json(&db, &user, updated).await
+}
+
+/// `POST /api/queries/<id>/verify` — admin-only; stamps the query as verified.
+pub async fn verify(
+    db: Db,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    super::require_admin(&db, &user).await?;
+    let updated = query_service::set_verified(&db, user.org_id, &user, id, true).await?;
+    query_json(&db, &user, updated).await
+}
+
+/// `DELETE /api/queries/<id>/verify` — admin-only; clears the verification stamp.
+pub async fn unverify(
+    db: Db,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    super::require_admin(&db, &user).await?;
+    let updated = query_service::set_verified(&db, user.org_id, &user, id, false).await?;
     query_json(&db, &user, updated).await
 }
 

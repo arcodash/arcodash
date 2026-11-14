@@ -3429,3 +3429,224 @@ async fn parameter_values_hides_a_draft_only_definition_from_a_non_editor() {
     assert_eq!(values.len(), 1, "expected 1 option; got: {allowed}");
     assert_eq!(values[0]["name"], "Alpha");
 }
+
+mod verified {
+    use super::{create_ds, invite_and_login};
+    use crate::common::spawn_app;
+    use crate::common::{ok_json, ADMIN_EMAIL};
+    use crate::skip_if_none;
+
+    async fn create_published_query(client: &reqwest::Client, base: &str, ds_id: i64) -> i64 {
+        let q = ok_json(
+            client
+                .post(format!("{base}/api/queries"))
+                .json(&serde_json::json!({
+                    "data_source_id": ds_id,
+                    "name": "Verified Candidate",
+                    "query": "SELECT 1",
+                    "options": {}
+                }))
+                .send()
+                .await
+                .unwrap(),
+            "create query",
+        )
+        .await;
+        let id = q["id"].as_i64().unwrap();
+        ok_json(
+            client
+                .post(format!("{base}/api/queries/{id}/publish"))
+                .json(&serde_json::json!({ "expected_version": q["working_version"] }))
+                .send()
+                .await
+                .unwrap(),
+            "publish query",
+        )
+        .await;
+        id
+    }
+
+    async fn event_object_ids(client: &reqwest::Client, base: &str, action: &str) -> Vec<i64> {
+        let list = ok_json(
+            client
+                .get(format!("{base}/api/events?action={action}"))
+                .send()
+                .await
+                .unwrap(),
+            "list events",
+        )
+        .await;
+        list.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["object_id"].as_i64())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn admin_can_verify_and_unverify() {
+        let app = skip_if_none!(spawn_app().await);
+        app.cleanup().await;
+        let admin = app.admin_client().await;
+        let ds_id = create_ds(&admin, &app.address, "verify-ds").await;
+        let id = create_published_query(&admin, &app.address, ds_id).await;
+
+        let me = {
+            use arcodash_core::entities::user;
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+            user::Entity::find()
+                .filter(user::Column::Email.eq(ADMIN_EMAIL))
+                .one(&app.db)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        let verified = ok_json(
+            admin
+                .post(format!("{}/api/queries/{id}/verify", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "verify",
+        )
+        .await;
+        assert!(!verified["verified_at"].is_null());
+        assert_eq!(verified["verified_by"], me.id);
+
+        let cleared = ok_json(
+            admin
+                .delete(format!("{}/api/queries/{id}/verify", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "unverify",
+        )
+        .await;
+        assert!(cleared["verified_at"].is_null());
+        assert!(cleared["verified_by"].is_null());
+
+        assert!(event_object_ids(&admin, &app.address, "query.verified")
+            .await
+            .contains(&id));
+        assert!(event_object_ids(&admin, &app.address, "query.unverified")
+            .await
+            .contains(&id));
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_verify() {
+        let app = skip_if_none!(spawn_app().await);
+        app.cleanup().await;
+        let admin = app.admin_client().await;
+        let ds_id = create_ds(&admin, &app.address, "verify-forbidden-ds").await;
+        let id = create_published_query(&admin, &app.address, ds_id).await;
+
+        let (_, other) = invite_and_login(
+            &app,
+            &admin,
+            &format!(
+                "verify-nonadmin-{}@test.local",
+                uuid::Uuid::new_v4().simple()
+            ),
+            "Non Admin",
+            "P@ssw0rd!",
+            vec![],
+        )
+        .await;
+
+        for resp in [
+            other
+                .post(format!("{}/api/queries/{id}/verify", app.address))
+                .send()
+                .await
+                .unwrap(),
+            other
+                .delete(format!("{}/api/queries/{id}/verify", app.address))
+                .send()
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(resp.status().as_u16(), 403);
+        }
+
+        let q = ok_json(
+            admin
+                .get(format!("{}/api/queries/{id}", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "get query",
+        )
+        .await;
+        assert!(q["verified_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn dashboard_query_summary_carries_verified() {
+        let app = skip_if_none!(spawn_app().await);
+        app.cleanup().await;
+        let admin = app.admin_client().await;
+        let ds_id = create_ds(&admin, &app.address, "verify-tile-ds").await;
+        let id = create_published_query(&admin, &app.address, ds_id).await;
+
+        ok_json(
+            admin
+                .post(format!("{}/api/queries/{id}/verify", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "verify",
+        )
+        .await;
+
+        let viz = ok_json(
+            admin
+                .post(format!("{}/api/visualizations", app.address))
+                .json(&serde_json::json!({
+                    "query_id": id, "type": "table", "name": "Tile", "options": {}
+                }))
+                .send()
+                .await
+                .unwrap(),
+            "create visualization",
+        )
+        .await;
+        let dash = ok_json(
+            admin
+                .post(format!("{}/api/dashboards", app.address))
+                .json(&serde_json::json!({ "name": "Verified Tile Dashboard" }))
+                .send()
+                .await
+                .unwrap(),
+            "create dashboard",
+        )
+        .await;
+        let slug = dash["slug"].as_str().unwrap().to_string();
+        ok_json(
+            admin
+                .post(format!("{}/api/widgets", app.address))
+                .json(&serde_json::json!({
+                    "dashboard_id": dash["id"], "visualization_id": viz["id"], "width": 1
+                }))
+                .send()
+                .await
+                .unwrap(),
+            "create widget",
+        )
+        .await;
+
+        let body = ok_json(
+            admin
+                .get(format!("{}/api/dashboards/{slug}", app.address))
+                .send()
+                .await
+                .unwrap(),
+            "get dashboard",
+        )
+        .await;
+        let summary = &body["widgets"][0]["visualization"]["query"];
+        assert_eq!(summary["verified"], true, "{summary}");
+        assert_eq!(summary["is_published"], true, "{summary}");
+    }
+}

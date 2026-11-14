@@ -440,6 +440,10 @@ export const api = {
   unpublishQuery: (id: number, expectedVersion: number) =>
     postJson<Query>(`/api/queries/${id}/unpublish`, { expected_version: expectedVersion }),
 
+  verifyQuery: (id: number) => postJson<Query>(`/api/queries/${id}/verify`, {}),
+
+  unverifyQuery: (id: number) => deleteJson<Query>(`/api/queries/${id}/verify`),
+
   restoreQueryVersion: (id: number, changeId: number, expectedVersion: number) =>
     postJson<Query>(`/api/queries/${id}/restore`, {
       change_id: changeId,

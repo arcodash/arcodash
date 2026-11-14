@@ -217,6 +217,9 @@ export interface Query {
   row_count: number | null;
   created_at: string;
   updated_at: string;
+  /** Set while an admin vouches for the query. */
+  verified_at: string | null;
+  verified_by: number | null;
   caller: Caller;
 }
 
@@ -441,6 +444,10 @@ export interface Widget {
       /** Parameter tokens referenced by the served SQL — the SQL text itself is never sent here. */
       parameter_names: string[];
       options: QueryOptions;
+      /** An admin vouches for the query. */
+      verified: boolean;
+      /** Live right now; tiles of a draft or unpublished query offer no monitor actions. */
+      is_published: boolean;
     };
   };
   /** Pre-loaded cached result data — only present on public dashboard responses. */

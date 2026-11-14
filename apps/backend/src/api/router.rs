@@ -168,6 +168,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/queries/{id}/fork", post(queries::fork))
         .route("/queries/{id}/publish", post(queries::publish))
         .route("/queries/{id}/unpublish", post(queries::unpublish))
+        .route(
+            "/queries/{id}/verify",
+            post(queries::verify).delete(queries::unverify),
+        )
         .route("/queries/{id}/restore", post(queries::restore))
         .route("/queries/{id}/discard", post(queries::discard))
         .route("/queries/{id}/consumers", get(queries::consumers))

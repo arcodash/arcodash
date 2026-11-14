@@ -88,6 +88,10 @@ pub struct QuerySummary {
     /// Served `options` (parameter definitions included), so the param bar can resolve each
     /// `{{token}}` without a second fetch.
     pub options: Value,
+    /// An admin vouches for the query.
+    pub verified: bool,
+    /// Live right now; tiles of a draft or unpublished query offer no monitor actions.
+    pub is_published: bool,
 }
 
 impl From<query::Model> for QuerySummary {
@@ -106,6 +110,8 @@ impl From<query::Model> for QuerySummary {
             data_source_id: resolved.data_source_id,
             parameter_names,
             options: resolved.options,
+            verified: q.verified_at.is_some(),
+            is_published: crate::services::query_service::is_published(&q),
         }
     }
 }

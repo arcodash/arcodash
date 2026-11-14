@@ -1107,6 +1107,49 @@ pub async fn publish(
     Ok(published)
 }
 
+/// Sets or clears the admin verification stamp. The caller must already have passed the admin
+/// check. Leaves `working_version` alone so an editor's in-flight draft isn't invalidated.
+pub async fn set_verified(
+    db: &(impl ConnectionTrait + TransactionTrait<Transaction = sea_orm::DatabaseTransaction>),
+    org_id: i64,
+    admin: &user::Model,
+    query_id: i64,
+    verified: bool,
+) -> Result<query::Model, ApiError> {
+    let txn = db.begin().await?;
+    let q = query::Entity::find_by_id(query_id)
+        .filter(query::Column::OrgId.eq(org_id))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| ApiError::not_found("query not found"))?;
+
+    let mut active: query::ActiveModel = q.clone().into();
+    if verified {
+        active.verified_at = Set(Some(Utc::now().into()));
+        active.verified_by = Set(Some(admin.id));
+    } else {
+        active.verified_at = Set(None);
+        active.verified_by = Set(None);
+    }
+    let updated = active.update(&txn).await?;
+    record_event(
+        &txn,
+        org_id,
+        Some(admin.id),
+        if verified {
+            "query.verified"
+        } else {
+            "query.unverified"
+        },
+        Some("query"),
+        Some(updated.id),
+        serde_json::json!({ "name": q.name }),
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(updated)
+}
+
 /// `POST /api/queries/<id>/unpublish` — returns a live query to draft by setting `unpublished_at`
 /// only; publish history and [`restore`] survive. Writes no `changes` row; errors if the query
 /// isn't live.
@@ -2167,6 +2210,8 @@ mod tests {
             published_at: None,
             working_version: 1,
             unpublished_at: None,
+            verified_at: None,
+            verified_by: None,
         }
     }
 

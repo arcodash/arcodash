@@ -21,7 +21,7 @@ function tableWidget(overrides: Partial<Widget> = {}): Widget {
       options: {},
       created_at: "2026-01-01T00:00:00.000Z",
       updated_at: "2026-01-01T00:00:00.000Z",
-      query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: [], options: {} },
+      query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: [], options: {}, verified: false, is_published: true },
     },
     query_result_data: null,
     viewer_can_read_data: true,
@@ -388,7 +388,7 @@ describe("WidgetCard job-poll flow", () => {
           options: {},
           created_at: "2026-01-01T00:00:00.000Z",
           updated_at: "2026-01-01T00:00:00.000Z",
-          query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: ["region"], options: {} },
+          query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: ["region"], options: {}, verified: false, is_published: true },
         },
       });
     }

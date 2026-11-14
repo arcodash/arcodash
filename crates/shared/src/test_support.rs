@@ -135,6 +135,8 @@ pub fn new_query(org_id: i64, data_source_id: i64, user_id: i64) -> query::Activ
         published_at: Set(None),
         working_version: Set(0),
         unpublished_at: NotSet,
+        verified_at: NotSet,
+        verified_by: NotSet,
     }
 }
 
