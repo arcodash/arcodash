@@ -263,19 +263,37 @@ export function QueryEditorPage() {
 
   // Non-empty default so a saved query never shows a blank name; `nameTouched` is what gates
   // autosave.
-  const [name, setName] = useState("Untitled query");
+  const location = useLocation();
+  // Prefill handed over by "Add with AI" (the Ask tab opens, never auto-runs) or by "Explore this
+  // tile" (starter SQL over a cached result). Location state is untyped, so validate each field.
+  const [prefill] = useState(() => {
+    const s = location.state as {
+      askQuestion?: unknown;
+      dataSourceId?: unknown;
+      sql?: unknown;
+      explore?: { queryId?: unknown; queryName?: unknown } | null;
+    } | null;
+    const dataSourceId = typeof s?.dataSourceId === "number" ? s.dataSourceId : null;
+    if (typeof s?.explore?.queryId === "number") {
+      const queryName = typeof s.explore.queryName === "string" ? s.explore.queryName : "";
+      return {
+        question: null,
+        dataSourceId,
+        sql: typeof s.sql === "string" ? s.sql : null,
+        name: queryName ? `Explore: ${queryName}` : null,
+      };
+    }
+    return typeof s?.askQuestion === "string"
+      ? { question: s.askQuestion, dataSourceId, sql: null, name: null }
+      : null;
+  });
+  // Non-empty default so a saved query never shows a blank name; `nameTouched` is what gates
+  // autosave.
+  const [name, setName] = useState(prefill?.name ?? "Untitled query");
   // True once the user edits the name, so autosave cannot create a query from SQL alone.
   const [nameTouched, setNameTouched] = useState(false);
   const [description, setDescription] = useState("");
-  const [sql, setSql] = useState("SELECT 1");
-  const location = useLocation();
-  // Prefill handed over by "Add with AI" on a dashboard; the Ask tab opens but never auto-runs.
-  const [prefill] = useState(() => {
-    const s = location.state as { askQuestion?: unknown; dataSourceId?: unknown } | null;
-    return typeof s?.askQuestion === "string"
-      ? { question: s.askQuestion, dataSourceId: typeof s.dataSourceId === "number" ? s.dataSourceId : null }
-      : null;
-  });
+  const [sql, setSql] = useState(prefill?.sql ?? "SELECT 1");
   const [dataSourceId, setDataSourceId] = useState<number | null>(prefill?.dataSourceId ?? null);
   const [saveError, setSaveError] = useState<string | null>(null);
   // Another editor advanced the row (409): the fix is reload, not retry; keep the local buffer
@@ -298,7 +316,7 @@ export function QueryEditorPage() {
   const [scheduleExpanded, setScheduleExpanded] = useState(false);
   const [scheduleFocusRunId, setScheduleFocusRunId] = useState<number | null>(null);
 
-  const [editorTab, setEditorTab] = useState<"sql" | "ai">(prefill ? "ai" : "sql");
+  const [editorTab, setEditorTab] = useState<"sql" | "ai">(prefill?.question != null ? "ai" : "sql");
   const [aiQuestion, setAiQuestion] = useState(prefill?.question ?? "");
   const ask = useAskRun();
   const askState = ask.state;

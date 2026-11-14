@@ -18,6 +18,8 @@ interface Props {
   dashboardSlug?: string;
   publicView?: boolean;
   highlightWidgetId?: number | null;
+  /** Query Results data source id, enabling "Explore this tile" on private dashboards. */
+  exploreSourceId?: number | null;
 }
 
 export function toLayout(widgets: Widget[]): LayoutItem[] {
@@ -45,6 +47,7 @@ export function DashboardGrid({
   dashboardSlug,
   publicView,
   highlightWidgetId,
+  exploreSourceId,
 }: Props) {
   const queryClient = useQueryClient();
   const { width, mounted, containerRef } = useContainerWidth();
@@ -107,6 +110,7 @@ export function DashboardGrid({
       refreshKey={refreshKey}
       publicView={publicView}
       highlight={w.id === highlightWidgetId}
+      exploreSourceId={exploreSourceId}
     />
   );
   const errorBanner = layoutError && <p className="text-sm text-destructive">{layoutError}</p>;

@@ -1,15 +1,22 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { Bell, GripVertical, ShieldCheck, X } from "lucide-react";
+import { Bell, FileCode, GripVertical, MoreHorizontal, Search, ShieldCheck, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import { Link } from "react-router";
+import { Link, useNavigate } from "react-router";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Loader } from "@/components/ui/loader";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ApiError, api, apiErrorMessage } from "@/lib/api";
 import { usePollJob } from "@/lib/jobs";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { getViz, toVizData } from "@/components/visualizations/registry";
+import { exploreState } from "@/lib/explore";
 import { usePermissions } from "@/lib/permissions";
 import { TileFreshnessDot } from "./TileFreshnessDot";
 import { TileCheckBadge } from "./TileCheckBadge";
@@ -29,6 +36,8 @@ interface Props {
   publicView?: boolean;
   /** Rings the tile briefly to mark a freshly added widget. */
   highlight?: boolean;
+  /** Query Results data source id; tiles offer "Explore this tile" only when set. */
+  exploreSourceId?: number | null;
 }
 
 function isCompleteParamValue(value: ParamValue | undefined): boolean {
@@ -302,14 +311,68 @@ function useCanAddMonitor(published: boolean): boolean {
   return published && has("create_monitor");
 }
 
-function TileMonitorBell({ queryId, published, title }: { queryId: number; published: boolean; title: string }) {
-  if (!useCanAddMonitor(published)) return null;
+function TileMenu({
+  query,
+  title,
+  exploreSourceId,
+}: {
+  query: { id: number; name: string; is_published: boolean };
+  title: string;
+  exploreSourceId?: number | null;
+}) {
+  const { has } = usePermissions();
+  const navigate = useNavigate();
+  const canMonitor = useCanAddMonitor(query.is_published);
+  const canExplore = exploreSourceId != null && has("create_query");
   return (
-    <Button asChild variant="ghost" size="icon" className="ml-auto h-6 w-6 shrink-0 text-muted-foreground">
-      <Link to={`/monitors/new?query_id=${queryId}`} aria-label={`Add a monitor for ${title}`} title={`Add a monitor for ${title}`}>
-        <Bell className="h-3.5 w-3.5" />
-      </Link>
-    </Button>
+    <div className="ml-auto flex shrink-0 items-center gap-0.5">
+      {canMonitor && (
+        <Button asChild variant="ghost" size="icon" className="h-6 w-6 shrink-0 text-muted-foreground">
+          <Link
+            to={`/monitors/new?query_id=${query.id}`}
+            aria-label={`Add a monitor for ${title}`}
+            title={`Add a monitor for ${title}`}
+          >
+            <Bell className="h-3.5 w-3.5" />
+          </Link>
+        </Button>
+      )}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0 text-muted-foreground"
+            aria-label={`Tile menu for ${title}`}
+          >
+            <MoreHorizontal className="h-3.5 w-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          {canExplore && (
+            <DropdownMenuItem
+              onSelect={() => navigate("/queries/new", { state: exploreState(query.id, query.name, exploreSourceId) })}
+            >
+              <Search className="h-4 w-4" />
+              <span className="flex flex-col">
+                <span>Explore this tile</span>
+                <span className="text-xs text-muted-foreground">Draft query on the cached result</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+          {canMonitor && (
+            <DropdownMenuItem onSelect={() => navigate(`/monitors/new?query_id=${query.id}`)}>
+              <Bell className="h-4 w-4" />
+              Add a monitor
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onSelect={() => navigate(`/queries/${query.id}`)}>
+            <FileCode className="h-4 w-4" />
+            Open query
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
   );
 }
 
@@ -355,6 +418,7 @@ export const WidgetCard = memo(function WidgetCard({
   refreshKey,
   publicView,
   highlight,
+  exploreSourceId,
 }: Props) {
   // `widget.monitors` is present (even empty) whenever the widget is monitor-bound, so a public
   // widget whose monitors all fail the viewer gate stays a monitor card.
@@ -401,7 +465,7 @@ export const WidgetCard = memo(function WidgetCard({
             </Button>
           </div>
         )}
-        {showFooter && query != null && <TileMonitorBell queryId={query.id} published={query.is_published} title={title} />}
+        {showFooter && query != null && <TileMenu query={query} title={title} exploreSourceId={exploreSourceId} />}
         {publicView &&
           !editMode &&
           widget.visualization_id != null &&
