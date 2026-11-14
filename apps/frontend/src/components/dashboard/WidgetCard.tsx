@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { GripVertical, X } from "lucide-react";
+import { GripVertical, ShieldCheck, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
@@ -246,7 +246,17 @@ function TextWidget({ text }: { text: string | null }) {
   );
 }
 
-function TruncatedTitle({ title, href, minW = "min-w-[min(8rem,100%)]" }: { title: string; href?: string; minW?: string }) {
+function TruncatedTitle({
+  title,
+  href,
+  minW = "min-w-[min(8rem,100%)]",
+  verified = false,
+}: {
+  title: string;
+  href?: string;
+  minW?: string;
+  verified?: boolean;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   return (
@@ -269,6 +279,13 @@ function TruncatedTitle({ title, href, minW = "min-w-[min(8rem,100%)]" }: { titl
             </Link>
           ) : (
             title
+          )}
+          {verified && (
+            <ShieldCheck
+              role="img"
+              aria-label="Verified by an admin"
+              className="ml-1 inline h-3.5 w-3.5 shrink-0 align-[-2px] text-blue-600"
+            />
           )}
         </div>
       </TooltipTrigger>
@@ -314,6 +331,7 @@ export const WidgetCard = memo(function WidgetCard({
   const monitorMeta = isMonitor ? computeMonitorCardMeta(widget) : null;
   const title = monitorMeta ? monitorMeta.title : widgetTitle(widget);
 
+  const verified = widget.visualization?.query?.verified === true;
   const linkMonitors = !editMode && !publicView;
   const monitorHref =
     linkMonitors && monitorMeta?.monitorId != null ? `/monitors/${monitorMeta.monitorId}` : undefined;
@@ -332,10 +350,10 @@ export const WidgetCard = memo(function WidgetCard({
         {draggable ? (
           <div data-testid="widget-title-group" className="flex min-w-[min(8rem,100%)] flex-1 items-start gap-1.5">
             <GripVertical aria-hidden className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <TruncatedTitle title={title} href={monitorHref} minW="min-w-0" />
+            <TruncatedTitle title={title} href={monitorHref} minW="min-w-0" verified={verified} />
           </div>
         ) : (
-          <TruncatedTitle title={title} href={monitorHref} />
+          <TruncatedTitle title={title} href={monitorHref} verified={verified} />
         )}
         {editMode && (
           <div className="ml-auto flex shrink-0 items-center gap-1">

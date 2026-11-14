@@ -243,3 +243,26 @@ describe("WidgetCard drag affordances", () => {
     expect(screen.getByRole("button", { name: /^Remove / })).toBeInTheDocument();
   });
 });
+
+describe("WidgetCard verified badge", () => {
+  const withVerified = (verified: boolean): Widget => ({
+    ...vizWidget(null),
+    visualization: {
+      type: "TABLE",
+      options: {},
+      query: { id: 5, name: "Q", data_source_id: 1, parameter_names: [], options: {}, verified, is_published: true },
+    },
+  } as unknown as Widget);
+
+  it("shows a shield when the query is verified", () => {
+    renderCard(withVerified(true));
+
+    expect(screen.getByRole("img", { name: "Verified by an admin" })).toBeInTheDocument();
+  });
+
+  it("shows nothing when the query is not verified", () => {
+    renderCard(withVerified(false));
+
+    expect(screen.queryByRole("img", { name: "Verified by an admin" })).not.toBeInTheDocument();
+  });
+});

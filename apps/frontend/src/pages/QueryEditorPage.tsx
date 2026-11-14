@@ -19,6 +19,7 @@ import {
   History,
   Info,
   Share2,
+  ShieldCheck,
   Star,
   Sparkles,
   User,
@@ -675,6 +676,22 @@ export function QueryEditorPage() {
     },
   });
 
+  const verifyMutation = useMutation({
+    mutationFn: async () => {
+      if (queryId == null) throw new Error("Save the query first");
+      return existingQueryQuery.data?.verified_at ? api.unverifyQuery(queryId) : api.verifyQuery(queryId);
+    },
+    onSuccess: (updated) => {
+      setSaveError(null);
+      // Patch only the verification fields so the editor's cached copy (and buffer) is not replaced.
+      queryClient.setQueryData<Query>(["query", queryId], (old) =>
+        old ? { ...old, verified_at: updated.verified_at, verified_by: updated.verified_by } : updated,
+      );
+      queryClient.invalidateQueries({ queryKey: ["queries"] });
+    },
+    onError: (err) => setSaveError(apiErrorMessage(err, "Failed to update verified state")),
+  });
+
   const starMutation = useMutation({
     mutationFn: async () => {
       if (queryId == null) return;
@@ -1049,6 +1066,18 @@ export function QueryEditorPage() {
       onSelect: () => setDiscardConfirmOpen(true),
     });
   }
+  if (saved && has("admin") && existingQueryQuery.data) {
+    const isVerified = existingQueryQuery.data.verified_at != null;
+    secondaryActions.push({
+      key: "verify",
+      label: isVerified ? "Verified · remove" : "Mark as verified",
+      icon: ShieldCheck,
+      variant: "ghost",
+      pending: verifyMutation.isPending,
+      group: 3,
+      onSelect: () => verifyMutation.mutate(),
+    });
+  }
   if (canEditSaved && existingQueryQuery.data) {
     secondaryActions.push({
       key: "archive",
@@ -1254,6 +1283,7 @@ export function QueryEditorPage() {
             menuOrder={[
               "publish",
               "unpublish",
+              "verify",
               "discard-changes",
               "share",
               "history",
