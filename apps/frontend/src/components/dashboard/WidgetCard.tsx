@@ -18,6 +18,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { getViz, toVizData } from "@/components/visualizations/registry";
 import { exploreState } from "@/lib/explore";
 import { usePermissions } from "@/lib/permissions";
+import { newMonitorHref } from "@/lib/monitorLinks";
 import { TileFreshnessDot } from "./TileFreshnessDot";
 import { TileCheckBadge } from "./TileCheckBadge";
 import { MonitorWidget, computeMonitorCardMeta, type MonitorCardMeta } from "./MonitorWidget";
@@ -38,6 +39,8 @@ interface Props {
   highlight?: boolean;
   /** Query Results data source id; tiles offer "Explore this tile" only when set. */
   exploreSourceId?: number | null;
+  /** Dashboard this tile belongs to; carried into the new-monitor form so it can return here. */
+  dashboardSlug?: string;
 }
 
 function isCompleteParamValue(value: ParamValue | undefined): boolean {
@@ -318,11 +321,13 @@ function TileMenu({
   title,
   exploreSourceId,
   canReadData,
+  addMonitorHref,
 }: {
   query: { id: number; name: string; is_published: boolean };
   title: string;
   exploreSourceId?: number | null;
   canReadData: boolean;
+  addMonitorHref: string;
 }) {
   const { has } = usePermissions();
   const navigate = useNavigate();
@@ -333,7 +338,7 @@ function TileMenu({
       {canMonitor && (
         <Button asChild variant="ghost" size="icon" className="h-6 w-6 shrink-0 text-muted-foreground">
           <Link
-            to={`/monitors/new?query_id=${query.id}`}
+            to={addMonitorHref}
             aria-label={`Add a monitor for ${title}`}
             title={`Add a monitor for ${title}`}
           >
@@ -365,7 +370,7 @@ function TileMenu({
             </DropdownMenuItem>
           )}
           {canMonitor && (
-            <DropdownMenuItem onSelect={() => navigate(`/monitors/new?query_id=${query.id}`)}>
+            <DropdownMenuItem onSelect={() => navigate(addMonitorHref)}>
               <Bell className="h-4 w-4" />
               Add a monitor
             </DropdownMenuItem>
@@ -384,12 +389,21 @@ function TileCheckSlot({
   summary,
   queryId,
   published,
+  addMonitorHref,
 }: {
   summary: Widget["check_summary"];
   queryId: number;
   published: boolean;
+  addMonitorHref: string;
 }) {
-  return <TileCheckBadge summary={summary} queryId={queryId} canAddMonitor={useCanAddMonitor(published)} />;
+  return (
+    <TileCheckBadge
+      summary={summary}
+      queryId={queryId}
+      canAddMonitor={useCanAddMonitor(published)}
+      addMonitorHref={addMonitorHref}
+    />
+  );
 }
 
 export function isMonitorWidget(widget: Widget): boolean {
@@ -423,6 +437,7 @@ export const WidgetCard = memo(function WidgetCard({
   publicView,
   highlight,
   exploreSourceId,
+  dashboardSlug,
 }: Props) {
   // `widget.monitors` is present (even empty) whenever the widget is monitor-bound, so a public
   // widget whose monitors all fail the viewer gate stays a monitor card.
@@ -437,6 +452,9 @@ export const WidgetCard = memo(function WidgetCard({
   const showFooter = !editMode && !publicView && widget.visualization_id != null;
   const chrome = CHROME[monitorMeta?.treatment ?? "neutral"];
   const query = widget.visualization?.query;
+  const addMonitorHref = query
+    ? newMonitorHref(query.id, dashboardSlug ? { dashboardSlug, widgetId: widget.id } : undefined)
+    : "";
 
   return (
     <div
@@ -469,7 +487,7 @@ export const WidgetCard = memo(function WidgetCard({
             </Button>
           </div>
         )}
-        {showFooter && query != null && <TileMenu query={query} title={title} exploreSourceId={exploreSourceId} canReadData={widget.viewer_can_read_data} />}
+        {showFooter && query != null && <TileMenu query={query} title={title} exploreSourceId={exploreSourceId} canReadData={widget.viewer_can_read_data} addMonitorHref={addMonitorHref} />}
         {publicView &&
           !editMode &&
           widget.visualization_id != null &&
@@ -494,7 +512,7 @@ export const WidgetCard = memo(function WidgetCard({
         >
           {widget.freshness && <TileFreshnessDot freshness={widget.freshness} />}
           {query != null && (
-            <TileCheckSlot summary={widget.check_summary} queryId={query.id} published={query.is_published} />
+            <TileCheckSlot summary={widget.check_summary} queryId={query.id} published={query.is_published} addMonitorHref={addMonitorHref} />
           )}
         </div>
       )}

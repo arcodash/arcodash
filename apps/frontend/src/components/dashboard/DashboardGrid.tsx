@@ -111,6 +111,7 @@ export function DashboardGrid({
       publicView={publicView}
       highlight={w.id === highlightWidgetId}
       exploreSourceId={exploreSourceId}
+      dashboardSlug={dashboardSlug}
     />
   );
   const errorBanner = layoutError && <p className="text-sm text-destructive">{layoutError}</p>;

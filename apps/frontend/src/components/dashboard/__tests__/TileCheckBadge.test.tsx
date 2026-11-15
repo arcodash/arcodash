@@ -7,7 +7,7 @@ import type { CheckSummary } from "@/types/api";
 function renderBadge(summary: CheckSummary | null, canAddMonitor = true) {
   return render(
     <MemoryRouter>
-      <TileCheckBadge summary={summary} queryId={42} canAddMonitor={canAddMonitor} />
+      <TileCheckBadge summary={summary} queryId={42} canAddMonitor={canAddMonitor} addMonitorHref="/monitors/new?query_id=42&from=tile&dashboard=d&widget=7" />
     </MemoryRouter>,
   );
 }
@@ -38,7 +38,7 @@ describe("TileCheckBadge", () => {
     renderBadge(null);
     expect(screen.getByRole("link", { name: "No checks · add one" })).toHaveAttribute(
       "href",
-      "/monitors/new?query_id=42",
+      "/monitors/new?query_id=42&from=tile&dashboard=d&widget=7",
     );
   });
 

@@ -6,6 +6,8 @@ interface TileCheckBadgeProps {
   queryId: number;
   /** Whether the viewer may create a monitor for this query (published query + permission). */
   canAddMonitor: boolean;
+  /** Destination of the "add one" link. */
+  addMonitorHref: string;
 }
 
 const PILL = "inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-xs font-medium whitespace-nowrap";
@@ -13,7 +15,7 @@ const PILL = "inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 /** The tile footer's check status pill, worst state first; links to the query's monitors. */
-export function TileCheckBadge({ summary, queryId, canAddMonitor }: TileCheckBadgeProps) {
+export function TileCheckBadge({ summary, queryId, canAddMonitor, addMonitorHref }: TileCheckBadgeProps) {
   const s = summary && summary.total > 0 ? summary : null;
   let text: string;
   let tone: string;
@@ -23,7 +25,7 @@ export function TileCheckBadge({ summary, queryId, canAddMonitor }: TileCheckBad
     }
     return (
       <Link
-        to={`/monitors/new?query_id=${queryId}`}
+        to={addMonitorHref}
         className={`${PILL} ml-auto border-dashed border-border text-muted-foreground hover:bg-muted`}
       >
         No checks · add one

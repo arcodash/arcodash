@@ -33,7 +33,7 @@ function textWidget(text: string): Widget {
   };
 }
 
-function renderCard(widget: Widget, props: { publicView?: boolean; editMode?: boolean; exploreSourceId?: number | null } = {}) {
+function renderCard(widget: Widget, props: { publicView?: boolean; editMode?: boolean; exploreSourceId?: number | null; dashboardSlug?: string } = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter>
@@ -323,6 +323,14 @@ describe("WidgetCard check badge and bell", () => {
     expect(screen.getByRole("link", { name: "No checks · add one" })).toBeInTheDocument();
   });
 
+  it("carries the tile origin on the bell and the add-one link when the dashboard is known", () => {
+    renderCard({ ...withQuery(true), id: 7 } as Widget, { dashboardSlug: "sales-q3" });
+
+    const href = "/monitors/new?query_id=42&from=tile&dashboard=sales-q3&widget=7";
+    expect(screen.getByLabelText("Add a monitor for Viz")).toHaveAttribute("href", href);
+    expect(screen.getByRole("link", { name: "No checks · add one" })).toHaveAttribute("href", href);
+  });
+
   it("shows neither for an unpublished query", () => {
     renderCard(withQuery(false));
 
@@ -379,6 +387,16 @@ describe("WidgetCard tile menu", () => {
         sql: expect.stringContaining("FROM query_42"),
       },
     });
+  });
+
+  it("sends the menu's add-a-monitor item to the form with the tile origin", async () => {
+    navigateSpy.mockClear();
+    const user = userEvent.setup();
+    renderCard({ ...widget, id: 7 } as Widget, { dashboardSlug: "sales-q3" });
+
+    await user.click(screen.getByRole("button", { name: "Tile menu for Viz" }));
+    await user.click(screen.getByRole("menuitem", { name: "Add a monitor" }));
+    expect(navigateSpy).toHaveBeenCalledWith("/monitors/new?query_id=42&from=tile&dashboard=sales-q3&widget=7");
   });
 
   it("omits explore when the viewer cannot read the data", async () => {
