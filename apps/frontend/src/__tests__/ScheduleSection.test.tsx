@@ -565,6 +565,52 @@ describe("ScheduleSection — monitor flavor", () => {
     );
   }
 
+  it("states the auto-check reuse window from the schedule and the data age the last check used", async () => {
+    mockSchedules(makeSchedule({ entity_type: "monitor", entity_id: 42, spec: { kind: "interval", every_secs: 1800 } }), null);
+    mockApi.listRuns.mockImplementation((entityType: string) =>
+      Promise.resolve(
+        entityType === "monitor"
+          ? [makeRun({ id: 5, finished_at: new Date().toISOString(), data_age_secs: 120 })]
+          : [],
+      ),
+    );
+    renderMonitorSection();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("auto-check-refresh-note")).toHaveTextContent(
+        "Auto checks rerun the query when its data is over 30 min old.",
+      ),
+    );
+    expect(await screen.findByTestId("last-check-result")).toHaveTextContent("Last check: data from 2 min ago");
+  });
+
+  it("Refresh data reruns the watched query, not the check, and reports when it lands", async () => {
+    mockSchedules(makeSchedule({ entity_type: "monitor", entity_id: 42 }), null);
+    mockApi.listRuns.mockImplementation((entityType: string) =>
+      Promise.resolve(entityType === "query" ? [makeRun({ id: 99, status: "success" })] : []),
+    );
+    mockApi.runNow.mockResolvedValue(makeRun({ id: 99, status: "pending" }));
+    renderMonitorSection();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Refresh data" }));
+    expect(mockApi.runNow).toHaveBeenCalledTimes(1);
+    expect(mockApi.runNow).toHaveBeenCalledWith("query", 7);
+    expect(await screen.findByText("Data refreshed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh data" })).toBeEnabled();
+  });
+
+  it("Refresh data shows the query run's error when it fails", async () => {
+    mockSchedules(makeSchedule({ entity_type: "monitor", entity_id: 42 }), null);
+    mockApi.listRuns.mockImplementation((entityType: string) =>
+      Promise.resolve(entityType === "query" ? [makeRun({ id: 99, status: "failed", error: "connection refused" })] : []),
+    );
+    mockApi.runNow.mockResolvedValue(makeRun({ id: 99, status: "pending" }));
+    renderMonitorSection();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Refresh data" }));
+    expect(await screen.findByText("connection refused")).toBeInTheDocument();
+  });
+
   it("renders the Check-schedule title, Eye/amber accent, and 'Check every:' cadence label", async () => {
     mockSchedules(makeSchedule({ entity_type: "monitor", entity_id: 42 }), null);
     renderMonitorSection();

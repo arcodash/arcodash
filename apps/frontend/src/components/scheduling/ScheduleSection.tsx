@@ -24,10 +24,13 @@ import {
   isInFlight,
   isScheduleStale,
   isSchedulePaused,
+  lastCheckResultLine,
+  monitorReuseWindowSecs,
   runStartMs,
   specToForm,
   timeAgo,
   useNow,
+  windowLabel,
   type PresetForm,
   type PresetId,
 } from "@/lib/scheduling";
@@ -95,6 +98,51 @@ function ReadsQueryLine({ query }: { query: { id: number; name: string } }) {
           ? "scheduled, not run yet"
           : `refreshed ${timeAgo(finishedMs, now)}`}
     </p>
+  );
+}
+
+/** Monitor-only: reruns the watched query without checking, so the next Check now sees fresh data.
+ * Follows the query run to completion; the backend reuses a run already in flight. */
+function RefreshDataButton({ queryId, disabled }: { queryId: number; disabled: boolean }) {
+  const queryClient = useQueryClient();
+  const [runId, setRunId] = useState<number | null>(null);
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+  const start = useMutation({
+    mutationFn: () => api.runNow("query", queryId),
+    onMutate: () => setMessage(null),
+    onSuccess: (run) => setRunId(run.id),
+    onError: (err) =>
+      setMessage({ text: err instanceof ApiError ? err.message : "Couldn't refresh the data", error: true }),
+  });
+  const runsQuery = useQuery({
+    queryKey: ["runs", "query", queryId],
+    queryFn: () => api.listRuns("query", queryId),
+    enabled: runId != null,
+    refetchInterval: runId != null ? 1500 : false,
+  });
+  const run = runId != null ? runsQuery.data?.find((r) => r.id === runId) : undefined;
+  useEffect(() => {
+    if (!run || isInFlight(run)) return;
+    setRunId(null);
+    setMessage(
+      isFailedRun(run)
+        ? { text: run.error ?? "The refresh failed", error: true }
+        : { text: "Data refreshed", error: false },
+    );
+    queryClient.invalidateQueries({ queryKey: ["schedules", "query", queryId] });
+  }, [run, queryId, queryClient]);
+  const busy = start.isPending || runId != null;
+  return (
+    <>
+      <Button size="sm" variant="outline" disabled={disabled || busy} onClick={() => start.mutate()}>
+        {busy ? "Refreshing data…" : "Refresh data"}
+      </Button>
+      {message && (
+        <span className={`text-xs ${message.error ? "text-destructive" : "text-muted-foreground"}`}>
+          {message.text}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -367,6 +415,7 @@ export function ScheduleSection({
 
   const Icon = flavor.icon;
   const runsLabel = isMonitor ? "Recent checks" : "Recent runs";
+  const lastResultLine = isMonitor ? lastCheckResultLine(runs, now) : null;
   const waitingRun = running && running.waiting_on_run_id != null ? running : null;
   const waitingStartMs = waitingRun ? runStartMs(waitingRun) : null;
 
@@ -448,6 +497,13 @@ export function ScheduleSection({
                 />
                 <span className="text-sm">{flavor.toggleLabel}</span>
               </div>
+
+              {isMonitor && (
+                <p className="text-xs text-muted-foreground" data-testid="auto-check-refresh-note">
+                  Auto checks rerun the query when its data is over{" "}
+                  {windowLabel(monitorReuseWindowSecs(schedule?.spec ?? formToSpec(form)))} old.
+                </p>
+              )}
 
               {isMonitor && !schedule?.enabled && (
                 <p className="text-xs text-muted-foreground">
@@ -578,7 +634,14 @@ export function ScheduleSection({
                 >
                   {isRefreshing ? flavor.runNowPendingLabel : flavor.runNowLabel}
                 </Button>
+                {isMonitor && readsQuery && <RefreshDataButton queryId={readsQuery.id} disabled={!canEdit} />}
               </div>
+
+              {isMonitor && lastResultLine && (
+                <p className="text-xs text-muted-foreground" data-testid="last-check-result">
+                  {lastResultLine}
+                </p>
+              )}
 
               {isMonitor && waitingRun && (
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">

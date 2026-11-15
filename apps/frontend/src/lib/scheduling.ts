@@ -226,3 +226,29 @@ export function useNow(active: boolean): number {
   }, [active]);
   return now;
 }
+
+/** How old a query result may be before a monitor check reruns the query: an interval schedule's
+ * own period, else the worker's `MONITOR_DEFAULT_STALENESS_SECS`. Manual checks carry no schedule,
+ * so they always get the default (`evaluate_monitor.rs` `resolve_staleness_secs`).
+ * ponytail: 900 mirrors the worker default; surface it from the API if an operator ever changes it. */
+export const MONITOR_DEFAULT_REUSE_SECS = 900;
+
+export function monitorReuseWindowSecs(spec: ScheduleSpec | null | undefined): number {
+  return spec?.kind === "interval" ? spec.every_secs : MONITOR_DEFAULT_REUSE_SECS;
+}
+
+/** `900` -> "15 min", `3600` -> "1 h", `5400` -> "90 min", `86400` -> "24 h". */
+export function windowLabel(secs: number): string {
+  if (secs % 3600 === 0) return `${secs / 3600} h`;
+  if (secs % 60 === 0) return `${secs / 60} min`;
+  return `${secs}s`;
+}
+
+/** "Last check: data from 3 min ago", from the newest finished check that
+ * evaluated a concrete result; null when no check has used one yet. */
+export function lastCheckResultLine(runs: Run[], nowMs: number): string | null {
+  const run = runs.find((r) => r.finished_at != null && r.data_age_secs != null);
+  if (!run) return null;
+  const resultMs = Date.parse(run.finished_at!) - run.data_age_secs! * 1000;
+  return `Last check: data from ${timeAgo(resultMs, nowMs)}`;
+}

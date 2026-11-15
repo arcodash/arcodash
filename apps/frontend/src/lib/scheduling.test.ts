@@ -10,11 +10,14 @@ import {
   isScheduleStale,
   isStale,
   isStaleFallback,
+  lastCheckResultLine,
+  monitorReuseWindowSecs,
   specToForm,
   timeAgo,
+  windowLabel,
   type PresetForm,
 } from "@/lib/scheduling";
-import type { ScheduleSpec } from "@/types/api";
+import type { Run, ScheduleSpec } from "@/types/api";
 
 describe("specToForm / formToSpec round-trip", () => {
   const cases: { label: string; spec: ScheduleSpec; preset: PresetForm["preset"] }[] = [
@@ -229,5 +232,33 @@ describe("cadenceLabel", () => {
     expect(cadenceLabel(900)).toBe("every 15 min");
     expect(cadenceLabel(7200)).toBe("every 2h");
     expect(cadenceLabel(172800)).toBe("every 2d");
+  });
+});
+
+describe("monitor result reuse", () => {
+  it("uses an interval schedule's own period, else the 15 min default", () => {
+    expect(monitorReuseWindowSecs({ kind: "interval", every_secs: 300 })).toBe(300);
+    expect(monitorReuseWindowSecs({ kind: "at", time: "09:00" })).toBe(900);
+    expect(monitorReuseWindowSecs({ kind: "cron", expr: "0 * * * * *" })).toBe(900);
+    expect(monitorReuseWindowSecs(null)).toBe(900);
+  });
+
+  it("labels windows in minutes or hours", () => {
+    expect(windowLabel(900)).toBe("15 min");
+    expect(windowLabel(3600)).toBe("1 h");
+    expect(windowLabel(5400)).toBe("90 min");
+    expect(windowLabel(45)).toBe("45s");
+  });
+
+  it("dates the result the newest finished check used, skipping checks without one", () => {
+    const now = Date.parse("2026-11-15T10:10:00Z");
+    const runs = [
+      { finished_at: null, data_age_secs: null },
+      { finished_at: "2026-11-15T10:09:00Z", data_age_secs: null },
+      { finished_at: "2026-11-15T10:08:00Z", data_age_secs: 120 },
+      { finished_at: "2026-11-15T09:00:00Z", data_age_secs: 0 },
+    ] as unknown as Run[];
+    expect(lastCheckResultLine(runs, now)).toBe("Last check: data from 4 min ago");
+    expect(lastCheckResultLine([], now)).toBeNull();
   });
 });
