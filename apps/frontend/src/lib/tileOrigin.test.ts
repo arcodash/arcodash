@@ -12,7 +12,16 @@ describe("parseTileOrigin", () => {
     });
   });
 
+  it("accepts non-Latin dashboard slugs", () => {
+    expect(parseTileOrigin(p("query_id=7&from=tile&dashboard=हिंदी-1a2b3c&widget=7"))).toEqual({
+      dashboardSlug: "हिंदी-1a2b3c",
+      widgetId: 7,
+    });
+  });
+
   it.each([
+    "query_id=7&from=tile&dashboard=a.b&widget=7",
+    "query_id=7&from=tile&dashboard=a%2Fb&widget=7",
     "query_id=7&dashboard=sales-q3&widget=7",
     "query_id=7&from=tile&dashboard=sales-q3&widget=abc",
     "query_id=7&from=tile&dashboard=sales-q3&widget=0",

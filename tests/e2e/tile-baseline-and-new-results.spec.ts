@@ -101,6 +101,8 @@ test.describe.serial("tile baseline monitor and new-results pill", () => {
     await expect(tsCell).toBeVisible({ timeout: 15_000 });
     const before = await tsCell.innerText();
 
+    await page.clock.fastForward("01:05");
+    await expect(page.getByRole("status").filter({ hasText: "New results available" })).toHaveCount(0);
     await freshRun();
     await page.clock.fastForward("01:05");
 

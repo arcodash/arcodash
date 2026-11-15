@@ -88,6 +88,12 @@ export function DashboardPage() {
   const [dashboardParams, setDashboardParams] = useState<Record<string, ParamValue>>({});
   const [shown, setShown] = useState<Record<number, string>>({});
   const [tileRefreshKeys, setTileRefreshKeys] = useState<Record<number, number>>({});
+  const [stateSlug, setStateSlug] = useState(slug);
+  if (stateSlug !== slug) {
+    setStateSlug(slug);
+    setShown({});
+    setTileRefreshKeys({});
+  }
   const onResultShown = useCallback(
     (id: number, at: string) => setShown((p) => (p[id] === at ? p : { ...p, [id]: at })),
     [],

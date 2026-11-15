@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import { resolveWidgetParams } from "@/components/dashboard/WidgetCard";
+import { resolveWidgetParams } from "@/lib/widgetParams";
 import type { Dashboard, ParamValue, Widget } from "@/types/api";
 
 export const NEW_RESULTS_POLL_MS = 60_000;
@@ -44,17 +44,17 @@ export function newResultsEnabled(o: {
 
 /** Polls the published dashboard for newer results, starting once the visible dashboard has
  * loaded (its payload seeds the poll cache so the first poll fires a full interval later). The key
- * sits outside `["dashboard", slug]` so mutation invalidations never touch it. */
+ * sits outside `["dashboard", slug]` so mutation invalidations never touch it.
+ * `initialData` would not apply: the disabled query is built before the seed exists. */
 export function useLatestWidgets(slug: string | undefined, enabled: boolean): Widget[] | undefined {
   const qc = useQueryClient();
-  const key = ["dashboard-latest", slug];
   const seed = qc.getQueryData<Dashboard>(["dashboard", slug, false]);
   useEffect(() => {
-    if (enabled && seed && !qc.getQueryData(key)) qc.setQueryData(key, seed);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const k = ["dashboard-latest", slug];
+    if (enabled && seed && !qc.getQueryData(k)) qc.setQueryData(k, seed);
   }, [enabled, seed, qc, slug]);
   const q = useQuery({
-    queryKey: key,
+    queryKey: ["dashboard-latest", slug],
     queryFn: () => api.getDashboard(slug!, { draft: false }),
     enabled: enabled && seed != null,
     refetchInterval: NEW_RESULTS_POLL_MS,

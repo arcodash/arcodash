@@ -111,7 +111,12 @@ describe("DashboardPage new results", () => {
     expect(screen.queryByText(/New results available/)).toBeNull();
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(61_000);
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(calls).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(31_000);
     });
     expect(await screen.findByText("New results available for 1 tile")).toBeInTheDocument();
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveWidgetParams } from "@/components/dashboard/WidgetCard";
+import { resolveWidgetParams } from "@/lib/widgetParams";
 
 const TOKENS = ["region", "d"];
 

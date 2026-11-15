@@ -2,8 +2,8 @@ import type { Dashboard } from "@/types/api";
 import type { TileOrigin } from "@/lib/monitorLinks";
 
 const ID_RE = /^[1-9]\d{0,17}$/;
-// Slugs are alphanumeric words joined by "-" (plus an optional numeric suffix); never "/" or ".".
-const SLUG_RE = /^[\p{L}\p{N}_-]{1,200}$/u;
+// Mirrors the backend slugify: Unicode alphanumeric runs joined by "-"; never "/" or ".".
+const SLUG_RE = /^[\p{Alphabetic}\p{N}_-]{1,512}$/u;
 
 /** The dashboard tile a new-monitor form was opened from, or null when the params are absent or malformed. */
 export function parseTileOrigin(params: URLSearchParams): TileOrigin | null {
