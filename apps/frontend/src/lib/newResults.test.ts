@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { newResultsLabel, staleTileIds } from "./newResults";
+import { newResultsEnabled, newResultsLabel, staleTileIds } from "./newResults";
 import type { Widget } from "@/types/api";
 
 function viz(id: number, retrievedAt: string, over: Partial<Widget> = {}, params: string[] = []): Widget {
@@ -58,5 +58,14 @@ describe("newResultsLabel", () => {
   it("pluralizes", () => {
     expect(newResultsLabel(1)).toBe("New results available for 1 tile");
     expect(newResultsLabel(3)).toBe("New results available for 3 tiles");
+  });
+});
+
+describe("newResultsEnabled", () => {
+  it("is true only for a saved dashboard in view mode with no auto-refresh", () => {
+    expect(newResultsEnabled({ slug: "a", editMode: false, refreshInterval: 0 })).toBe(true);
+    expect(newResultsEnabled({ slug: "a", editMode: true, refreshInterval: 0 })).toBe(false);
+    expect(newResultsEnabled({ slug: "a", editMode: false, refreshInterval: 60 })).toBe(false);
+    expect(newResultsEnabled({ slug: undefined, editMode: false, refreshInterval: 0 })).toBe(false);
   });
 });

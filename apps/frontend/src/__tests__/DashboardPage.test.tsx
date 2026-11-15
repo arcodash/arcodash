@@ -20,7 +20,8 @@ vi.mock("@/components/dashboard/DashboardGrid", () => ({
   ),
 }));
 
-vi.mock("@/components/dashboard/DashboardParamsBar", () => ({
+vi.mock("@/components/dashboard/DashboardParamsBar", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   DashboardParamsBar: () => <div data-testid="params-bar" />,
 }));
 

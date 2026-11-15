@@ -1,5 +1,8 @@
+import { useEffect } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/lib/api";
 import { resolveWidgetParams } from "@/components/dashboard/WidgetCard";
-import type { ParamValue, Widget } from "@/types/api";
+import type { Dashboard, ParamValue, Widget } from "@/types/api";
 
 export const NEW_RESULTS_POLL_MS = 60_000;
 
@@ -28,4 +31,36 @@ export function staleTileIds(
 
 export function newResultsLabel(count: number): string {
   return `New results available for ${count} ${count === 1 ? "tile" : "tiles"}`;
+}
+
+/** Polling applies only to the private view of a saved dashboard with no auto-refresh set. */
+export function newResultsEnabled(o: {
+  slug: string | undefined;
+  editMode: boolean;
+  refreshInterval: number;
+}): boolean {
+  return o.slug != null && !o.editMode && o.refreshInterval === 0;
+}
+
+/** Polls the published dashboard for newer results, starting once the visible dashboard has
+ * loaded (its payload seeds the poll cache so the first poll fires a full interval later). The key
+ * sits outside `["dashboard", slug]` so mutation invalidations never touch it. */
+export function useLatestWidgets(slug: string | undefined, enabled: boolean): Widget[] | undefined {
+  const qc = useQueryClient();
+  const key = ["dashboard-latest", slug];
+  const seed = qc.getQueryData<Dashboard>(["dashboard", slug, false]);
+  useEffect(() => {
+    if (enabled && seed && !qc.getQueryData(key)) qc.setQueryData(key, seed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, seed, qc, slug]);
+  const q = useQuery({
+    queryKey: key,
+    queryFn: () => api.getDashboard(slug!, { draft: false }),
+    enabled: enabled && seed != null,
+    refetchInterval: NEW_RESULTS_POLL_MS,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+    staleTime: NEW_RESULTS_POLL_MS - 5_000,
+  });
+  return q.data?.widgets;
 }
