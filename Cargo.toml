@@ -80,7 +80,7 @@ tokio-util = { version = "0.7.20", features = ["compat"] }
 # in by jsonwebtoken's `rust_crypto` feature (same 0.9 line); it is used directly for Snowflake
 # key-pair auth, which needs the DER-encoded public key (to SHA256-fingerprint) that jsonwebtoken
 # does not expose.
-rsa = "0.9"
+rsa = "0.10"
 # Athena uses the official SDK: the StartQueryExecution / GetQueryExecution / GetQueryResults
 # orchestration is fiddly to hand-roll over raw REST + SigV4. Static creds + region come from
 # `aws_sdk_athena::config` directly, so `aws-config` is not needed.
