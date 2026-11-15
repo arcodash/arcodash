@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Sparkles } from "lucide-react";
 import { formatNumeric } from "@/lib/formatNumber";
 import { splitExplanation } from "@/lib/monitors";
@@ -7,12 +8,44 @@ import type { MonitorObservation } from "@/types/api";
 interface Props {
   observation: MonitorObservation & { explanation: string };
   onViewRun: (runId: number) => void;
+  /** Whether the monitor is triggered right now; otherwise the card collapses to one line. */
+  firing?: boolean;
 }
 
-export function LatestIncidentCard({ observation, onViewRun }: Props) {
+export function LatestIncidentCard({ observation, onViewRun, firing = true }: Props) {
   const now = useNow(false);
+  const [open, setOpen] = useState(false);
   const { stats, ai, confidence } = splitExplanation(observation.explanation);
   const ms = Date.parse(observation.observed_at);
+  const observed = observation.value != null ? formatNumeric(observation.value) : "—";
+  if (!firing && !open) {
+    return (
+      <section
+        aria-label="Latest incident"
+        className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground"
+        data-testid="latest-incident"
+      >
+        <span className="font-medium text-foreground">Last incident</span>
+        <span>·</span>
+        <time dateTime={observation.observed_at} title={exactTs(ms)}>
+          {timeAgo(ms, now)}
+        </time>
+        <span>·</span>
+        <span>no longer firing</span>
+        <span>·</span>
+        <span>
+          Observed <span className="tabular-nums">{observed}</span>
+        </span>
+        <button
+          type="button"
+          className="ml-auto text-primary underline underline-offset-2"
+          onClick={() => setOpen(true)}
+        >
+          Show details
+        </button>
+      </section>
+    );
+  }
   return (
     <section
       aria-labelledby="latest-incident-heading"
@@ -28,7 +61,7 @@ export function LatestIncidentCard({ observation, onViewRun }: Props) {
       <p className="text-sm">
         Observed{" "}
         <span className="font-medium tabular-nums">
-          {observation.value != null ? formatNumeric(observation.value) : "—"}
+          {observed}
         </span>
       </p>
       <p className="whitespace-pre-line break-words text-sm text-foreground">{stats}</p>
@@ -39,6 +72,15 @@ export function LatestIncidentCard({ observation, onViewRun }: Props) {
           </p>
           <p className="mt-1 whitespace-pre-line break-words text-sm">{ai}</p>
         </div>
+      )}
+      {!firing && (
+        <button
+          type="button"
+          className="mr-3 text-sm text-primary underline underline-offset-2"
+          onClick={() => setOpen(false)}
+        >
+          Hide details
+        </button>
       )}
       {observation.run_id != null && (
         <button

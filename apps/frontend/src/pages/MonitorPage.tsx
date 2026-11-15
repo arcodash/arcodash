@@ -858,7 +858,13 @@ export function MonitorPage() {
       <FeedbackLine feedback={snoozeFeedback} />
       <FeedbackLine feedback={ackFeedback} />
 
-      {!isNew && latestIncident && <LatestIncidentCard observation={latestIncident} onViewRun={viewRun} />}
+      {!isNew && latestIncident && (
+        <LatestIncidentCard
+          observation={latestIncident}
+          onViewRun={viewRun}
+          firing={monitorQuery.data?.state === "triggered"}
+        />
+      )}
 
       {monitorQuery.isLoading && <PageLoader />}
 
