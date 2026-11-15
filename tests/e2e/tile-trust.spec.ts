@@ -97,7 +97,7 @@ test.describe.serial("dashboard tile trust affordances", () => {
     const monitorName = `tile-trust-monitor-${stamp}`;
     await page.goto(`/dashboard/${dashSlug}`);
     await page.getByRole("link", { name: `Add a monitor for ${vizName}` }).click();
-    await expect(page).toHaveURL(new RegExp(`/monitors/new\\?query_id=${queryId}$`));
+    await expect(page).toHaveURL(new RegExp(`/monitors/new\\?query_id=${queryId}&from=tile&dashboard=${dashSlug}&widget=\\d+$`));
     await expect(page.getByTestId("monitor-query-select")).toContainText(queryName, {
       timeout: 10_000,
     });

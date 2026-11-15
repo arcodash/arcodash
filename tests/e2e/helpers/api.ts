@@ -158,10 +158,13 @@ export class E2EApiClient {
     await this.post(`/api/queries/${id}/publish`, { expected_version: full.working_version });
   }
 
-  async executeQuery(id: number, params?: Record<string, unknown>) {
+  async executeQuery(id: number, params?: Record<string, unknown>, opts?: { maxAge?: number }) {
     return this.post<{ job?: { id: string }; query_result?: unknown }>(
       `/api/queries/${id}/results`,
-      { parameters: params ?? {} },
+      {
+        parameters: params ?? {},
+        ...(opts?.maxAge !== undefined ? { max_age: opts.maxAge } : {}),
+      },
     );
   }
 
@@ -536,8 +539,9 @@ export async function executeAndWait(
   api: E2EApiClient,
   queryId: number,
   params?: Record<string, unknown>,
+  opts?: { maxAge?: number },
 ): Promise<number> {
-  const res = await api.executeQuery(queryId, params);
+  const res = await api.executeQuery(queryId, params, opts);
   if ("query_result" in res && res.query_result) {
     return (res.query_result as { id: number }).id;
   }
