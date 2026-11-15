@@ -440,4 +440,52 @@ describe("WidgetCard job-poll flow", () => {
     await waitFor(() => expect(screen.getByText(/running/i)).toBeInTheDocument());
     expect(screen.queryByText("1")).not.toBeInTheDocument();
   });
+
+  describe("rendered result reporting", () => {
+    function resultAt(retrievedAt: string) {
+      return HttpResponse.json({
+        query_result: {
+          id: 1,
+          data_source_id: 1,
+          query: "SELECT 1",
+          query_hash: "h",
+          data: { columns: [{ name: "n", friendly_type: "integer" }], rows: [{ n: 7 }] },
+          runtime: 0.01,
+          retrieved_at: retrievedAt,
+        },
+      });
+    }
+
+    it("reports the rendered retrieved_at", async () => {
+      server.use(http.get(`${BASE}/api/queries/5/results`, () => resultAt("2026-11-15T10:00:00Z")));
+      const onResultShown = vi.fn();
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <MemoryRouter><QueryClientProvider client={qc}>
+          <WidgetCard widget={tableWidget()} editMode={false} onDelete={() => {}} onResultShown={onResultShown} />
+        </QueryClientProvider></MemoryRouter>,
+      );
+      await screen.findByText("7");
+      await waitFor(() => expect(onResultShown).toHaveBeenCalledWith(1, "2026-11-15T10:00:00Z"));
+    });
+
+    it("footer age follows the rendered result", async () => {
+      const now = Date.now();
+      server.use(
+        http.get(`${BASE}/api/queries/5/results`, () => resultAt(new Date(now - 2 * 3600_000).toISOString())),
+      );
+      const widget = tableWidget({
+        freshness: {
+          retrieved_at: new Date(now - 60_000).toISOString(),
+          expected_interval_secs: null,
+          last_run_status: "success",
+        },
+      });
+      renderCard(widget);
+      await screen.findByText("7");
+      const footer = await screen.findByTestId("tile-footer");
+      await waitFor(() => expect(footer).toHaveTextContent("2h ago"));
+      expect(footer).not.toHaveTextContent("1m ago");
+    });
+  });
 });

@@ -20,6 +20,9 @@ interface Props {
   highlightWidgetId?: number | null;
   /** Query Results data source id, enabling "Explore this tile" on private dashboards. */
   exploreSourceId?: number | null;
+  /** Per-tile additions to `refreshKey`, so one tile can refetch without the rest. */
+  tileRefreshKeys?: Readonly<Record<number, number>>;
+  onResultShown?: (widgetId: number, retrievedAt: string) => void;
 }
 
 export function toLayout(widgets: Widget[]): LayoutItem[] {
@@ -48,6 +51,8 @@ export function DashboardGrid({
   publicView,
   highlightWidgetId,
   exploreSourceId,
+  tileRefreshKeys,
+  onResultShown,
 }: Props) {
   const queryClient = useQueryClient();
   const { width, mounted, containerRef } = useContainerWidth();
@@ -100,20 +105,24 @@ export function DashboardGrid({
     [editMode, widgets, dashboardSlug, queryClient],
   );
 
-  const card = (w: Widget, draggable?: boolean) => (
+  const card = (w: Widget, draggable?: boolean) => {
+    const bump = tileRefreshKeys?.[w.id] ?? 0;
+    return (
     <WidgetCard
       widget={w}
       editMode={editMode}
       draggable={draggable}
       onDelete={() => onDeleteWidget(w.id)}
       dashboardParams={dashboardParams}
-      refreshKey={refreshKey}
+      refreshKey={bump ? (refreshKey ?? 0) + bump : refreshKey}
       publicView={publicView}
       highlight={w.id === highlightWidgetId}
       exploreSourceId={exploreSourceId}
       dashboardSlug={dashboardSlug}
+      onResultShown={onResultShown}
     />
-  );
+    );
+  };
   const errorBanner = layoutError && <p className="text-sm text-destructive">{layoutError}</p>;
 
   if (isPhone) {

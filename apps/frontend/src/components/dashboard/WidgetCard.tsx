@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Bell, FileCode, GripVertical, MoreHorizontal, Search, ShieldCheck, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -41,6 +41,8 @@ interface Props {
   exploreSourceId?: number | null;
   /** Dashboard this tile belongs to; carried into the new-monitor form so it can return here. */
   dashboardSlug?: string;
+  /** Reports the `retrieved_at` of the latest result this tile has rendered. */
+  onResultShown?: (widgetId: number, retrievedAt: string) => void;
 }
 
 function isCompleteParamValue(value: ParamValue | undefined): boolean {
@@ -73,10 +75,12 @@ const VizWidget = memo(function VizWidget({
   widget,
   dashboardParams,
   refreshKey,
+  onShown,
 }: {
   widget: Widget;
   dashboardParams?: Record<string, ParamValue>;
   refreshKey?: number;
+  onShown?: (retrievedAt: string) => void;
 }) {
   const viz = widget.visualization;
   const preloaded = widget.query_result_data;
@@ -144,8 +148,16 @@ const VizWidget = memo(function VizWidget({
   }, [job.isSuccess, job.queryResultId]);
 
   const rawQueryResult = (
-    resultQuery.data as ({ query_result?: { data: ResultData } } & Record<string, unknown>) | undefined
+    resultQuery.data as
+      | ({ query_result?: { data: ResultData; retrieved_at?: string } } & Record<string, unknown>)
+      | undefined
   )?.query_result;
+
+  const shownRetrievedAt = rawQueryResult?.retrieved_at;
+  const settled = !hasParams && !resultQuery.isPlaceholderData;
+  useEffect(() => {
+    if (shownRetrievedAt && settled) onShown?.(shownRetrievedAt);
+  }, [shownRetrievedAt, settled, onShown]);
 
   const preloadedData = useMemo(() => (preloaded ? toVizData(preloaded) : null), [preloaded]);
   const fetchedData = useMemo(
@@ -438,9 +450,19 @@ export const WidgetCard = memo(function WidgetCard({
   highlight,
   exploreSourceId,
   dashboardSlug,
+  onResultShown,
 }: Props) {
   // `widget.monitors` is present (even empty) whenever the widget is monitor-bound, so a public
   // widget whose monitors all fail the viewer gate stays a monitor card.
+  const [shownAt, setShownAt] = useState<string | null>(null);
+  const widgetId = widget.id;
+  const handleShown = useCallback(
+    (at: string) => {
+      setShownAt(at);
+      onResultShown?.(widgetId, at);
+    },
+    [widgetId, onResultShown],
+  );
   const isMonitor = isMonitorWidget(widget);
   const monitorMeta = isMonitor ? computeMonitorCardMeta(widget) : null;
   const title = monitorMeta ? monitorMeta.title : widgetTitle(widget);
@@ -498,7 +520,7 @@ export const WidgetCard = memo(function WidgetCard({
       </div>
       <div className="min-h-0 flex-1 overflow-hidden p-2">
         {widget.visualization_id != null ? (
-          <VizWidget widget={widget} dashboardParams={dashboardParams} refreshKey={refreshKey} />
+          <VizWidget widget={widget} dashboardParams={dashboardParams} refreshKey={refreshKey} onShown={handleShown} />
         ) : isMonitor ? (
           <MonitorWidget widget={widget} linkable={linkMonitors} />
         ) : (
@@ -510,7 +532,11 @@ export const WidgetCard = memo(function WidgetCard({
           data-testid="tile-footer"
           className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs"
         >
-          {widget.freshness && <TileFreshnessDot freshness={widget.freshness} />}
+          {widget.freshness && (
+            <TileFreshnessDot
+              freshness={shownAt ? { ...widget.freshness, retrieved_at: shownAt } : widget.freshness}
+            />
+          )}
           {query != null && (
             <TileCheckSlot summary={widget.check_summary} queryId={query.id} published={query.is_published} addMonitorHref={addMonitorHref} />
           )}
