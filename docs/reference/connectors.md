@@ -24,7 +24,7 @@ their JSON configuration schemas, which the UI turns into the "add data source" 
 | CSV | `csv` | object storage | `upload_id` (uploaded file), `delimiter` (default `,`) |
 | SQL Server (MSSQL) | `mssql` | `tiberius` (pure-Rust TDS, rustls) | `server`, `port` (1433), `user`, `password`*, `db`, `encrypt` (off/optional/required, default required), `trust_server_certificate` (default false), `tds_version` (informational) |
 | BigQuery ‡ | `bigquery` | `reqwest` (REST: SA-JWT → OAuth2 → jobs.query) | `project_id`, `service_account_json`*, `location` (optional), `dataset` (optional), `api_endpoint` (optional — local emulator override) |
-| Snowflake † | `snowflake` | `reqwest` (SQL API v2, key-pair JWT) | `account`, `user`, `private_key`* (PEM; may be an encrypted PKCS#8 `ENCRYPTED PRIVATE KEY`), `private_key_passphrase`* (encrypted key only), `password`* (unused), `warehouse`, `database`, `schema`, `role` (optional) |
+| Snowflake † | `snowflake` | `reqwest` (SQL API v2, key-pair JWT) | `account`, `user`, `private_key`* (required; PEM; may be an encrypted PKCS#8 `ENCRYPTED PRIVATE KEY`), `private_key_passphrase`* (encrypted key only), `password`* (unused), `warehouse`, `database`, `schema`, `role` (optional) |
 | Amazon Athena † | `athena` | `aws-sdk-athena` (start → poll → get results) | `aws_access_key`, `aws_secret_key`*, `region`, `s3_output_location`, `database`; `work_group`/Athena `catalog` name (optional — e.g. `AwsDataCatalog`, not a Glue account ID), `api_endpoint` (optional — local emulator override) |
 
 \* Secret fields are encrypted at rest with `ENCRYPTION_KEY` (AES-256-GCM) and never returned by

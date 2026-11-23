@@ -528,7 +528,7 @@ impl QueryRunner for SnowflakeConnector {
                 "user": { "type": "string", "title": "User" },
                 "private_key": {
                     "type": "string",
-                    "title": "Private Key (PEM, key-pair auth — required)",
+                    "title": "Private Key (PEM, key-pair auth)",
                     "x-widget": "textarea"
                 },
                 "private_key_passphrase": {
@@ -544,7 +544,7 @@ impl QueryRunner for SnowflakeConnector {
                 "schema": { "type": "string", "title": "Schema", "default": "PUBLIC" },
                 "role": { "type": "string", "title": "Role (optional)" }
             },
-            "required": ["account", "user", "database"],
+            "required": ["account", "user", "private_key", "database"],
             "secret": ["private_key", "private_key_passphrase", "password"]
         })
     }
@@ -893,7 +893,10 @@ mod tests {
     fn configuration_schema_shape() {
         assert_eq!(SnowflakeConnector.type_name(), "snowflake");
         let schema = SnowflakeConnector.configuration_schema();
-        assert_eq!(schema["required"], json!(["account", "user", "database"]));
+        assert_eq!(
+            schema["required"],
+            json!(["account", "user", "private_key", "database"])
+        );
         assert_eq!(
             schema["secret"],
             json!(["private_key", "private_key_passphrase", "password"])
