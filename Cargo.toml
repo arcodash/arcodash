@@ -80,7 +80,7 @@ tokio-util = { version = "0.7.20", features = ["compat"] }
 # in by jsonwebtoken's `rust_crypto` feature (same 0.9 line); it is used directly for Snowflake
 # key-pair auth, which needs the DER-encoded public key (to SHA256-fingerprint) that jsonwebtoken
 # does not expose.
-rsa = "0.9"
+rsa = "0.10"
 # Same pkcs8 0.10 line `rsa` 0.9 uses; listed only to turn on encrypted-PKCS#8 decoding for
 # Snowflake's "ENCRYPTED PRIVATE KEY" PEMs. `3des` + `sha1-insecure` cover Snowflake's documented
 # `openssl pkcs8 -topk8 -v2 des3` output (LibreSSL/older OpenSSL default to an HMAC-SHA1 PRF).
