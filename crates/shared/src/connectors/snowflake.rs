@@ -2,6 +2,8 @@
 //! username/password is not supported by that API, so `password` is accepted but `private_key` is
 //! required.
 //!
+//! The key may be an encrypted PKCS#8 PEM (`ENCRYPTED PRIVATE KEY`) with `private_key_passphrase`.
+//!
 //! The host is built from `account` (guarded via `network_targets`; `run_statement` validates its
 //! character set before interpolating).
 
@@ -37,10 +39,13 @@ pub struct SnowflakeOptions {
     /// URL segment.
     pub account: String,
     pub user: String,
-    /// PEM-encoded RSA private key (PKCS#1 or PKCS#8) whose public key is registered on the
-    /// Snowflake user. Required.
+    /// PEM-encoded RSA private key (PKCS#1, PKCS#8, or encrypted PKCS#8) whose public key is
+    /// registered on the Snowflake user. Required.
     #[serde(default)]
     pub private_key: Option<String>,
+    /// Passphrase for an encrypted PKCS#8 `private_key` (`-----BEGIN ENCRYPTED PRIVATE KEY-----`).
+    #[serde(default)]
+    pub private_key_passphrase: Option<String>,
     /// Accepted for config-schema parity; not used to authenticate (a password-only config yields a
     /// clear error).
     #[serde(default)]
@@ -63,10 +68,25 @@ fn clean_pem_string(pem: &str) -> String {
     pem.replace("\\n", "\n").trim().to_string()
 }
 
-fn parse_rsa_private_key(pem: &str) -> Result<RsaPrivateKey> {
+fn parse_rsa_private_key(pem: &str, passphrase: Option<&str>) -> Result<RsaPrivateKey> {
+    use pkcs8::DecodePrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
 
+    if pem.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
+        let passphrase = passphrase.filter(|p| !p.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Snowflake private_key is encrypted (ENCRYPTED PRIVATE KEY) — set \
+                 private_key_passphrase"
+            )
+        })?;
+        // pkcs8's error doesn't say why (wrong passphrase vs unsupported cipher), so name both.
+        return RsaPrivateKey::from_pkcs8_encrypted_pem(pem, passphrase).map_err(|_| {
+            anyhow::anyhow!(
+                "failed to decrypt Snowflake private_key: wrong private_key_passphrase or \
+                 unsupported encryption (supported: PBES2 with AES-CBC or 3DES)"
+            )
+        });
+    }
     RsaPrivateKey::from_pkcs8_pem(pem)
         .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
         .context(
@@ -94,10 +114,18 @@ struct SnowflakeClaims {
     exp: u64,
 }
 
-/// Build the key-pair auth JWT for `account`/`user`, signed with `private_key_pem`. Pure/offline.
-fn build_jwt(account: &str, user: &str, private_key_pem: &str) -> Result<String> {
+/// Build the key-pair auth JWT for `account`/`user`, signed with `private_key_pem` (decrypted with
+/// `passphrase` when encrypted). Pure/offline.
+fn build_jwt(
+    account: &str,
+    user: &str,
+    private_key_pem: &str,
+    passphrase: Option<&str>,
+) -> Result<String> {
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+
     let clean_pem = clean_pem_string(private_key_pem);
-    let private_key = parse_rsa_private_key(&clean_pem)?;
+    let private_key = parse_rsa_private_key(&clean_pem, passphrase)?;
     let fingerprint = public_key_fingerprint(&private_key)?;
 
     // `iss`/`sub` use the account LOCATOR only (before the first `.`), uppercased; a
@@ -114,8 +142,11 @@ fn build_jwt(account: &str, user: &str, private_key_pem: &str) -> Result<String>
         iat: now,
         exp: now + JWT_LIFETIME_SECS,
     };
-    let encoding_key = EncodingKey::from_rsa_pem(clean_pem.as_bytes())
+    // Sign from the parsed key (PKCS#1 DER) — jsonwebtoken can't read an encrypted PEM itself.
+    let der = private_key
+        .to_pkcs1_der()
         .context("failed to load Snowflake private_key for signing")?;
+    let encoding_key = EncodingKey::from_rsa_der(der.as_bytes());
     encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
         .context("failed to sign Snowflake key-pair JWT")
 }
@@ -271,9 +302,12 @@ async fn run_statement(
     let account = opts.account.clone();
     let user = opts.user.clone();
     let private_key_pem = private_key_pem.to_string();
-    let jwt = tokio::task::spawn_blocking(move || build_jwt(&account, &user, &private_key_pem))
-        .await
-        .context("Snowflake JWT signing thread panicked")??;
+    let passphrase = opts.private_key_passphrase.clone();
+    let jwt = tokio::task::spawn_blocking(move || {
+        build_jwt(&account, &user, &private_key_pem, passphrase.as_deref())
+    })
+    .await
+    .context("Snowflake JWT signing thread panicked")??;
 
     let base = format!(
         "https://{}.snowflakecomputing.com/api/v2/statements",
@@ -489,6 +523,10 @@ impl QueryRunner for SnowflakeConnector {
                     "title": "Private Key (PEM, key-pair auth — required)",
                     "x-widget": "textarea"
                 },
+                "private_key_passphrase": {
+                    "type": "string",
+                    "title": "Private Key Passphrase (only for an ENCRYPTED PRIVATE KEY)"
+                },
                 "password": {
                     "type": "string",
                     "title": "Password (not currently supported by this connector — use Private Key)"
@@ -499,7 +537,7 @@ impl QueryRunner for SnowflakeConnector {
                 "role": { "type": "string", "title": "Role (optional)" }
             },
             "required": ["account", "user", "database"],
-            "secret": ["private_key", "password"]
+            "secret": ["private_key", "private_key_passphrase", "password"]
         })
     }
 
@@ -586,13 +624,14 @@ mod tests {
     #[test]
     fn build_jwt_signs_a_verifiable_rs256_jwt_with_expected_claims() {
         let (pem, public_key) = test_key_pem();
-        let jwt = build_jwt("xy12345.us-east-1", "alice", &pem).expect("build_jwt failed");
+        let jwt = build_jwt("xy12345.us-east-1", "alice", &pem, None).expect("build_jwt failed");
 
         let public_pem = public_key
             .to_public_key_pem(LineEnding::LF)
             .expect("encode test public key");
-        let expected_fingerprint = public_key_fingerprint(&parse_rsa_private_key(&pem).unwrap())
-            .expect("fingerprint failed");
+        let expected_fingerprint =
+            public_key_fingerprint(&parse_rsa_private_key(&pem, None).unwrap())
+                .expect("fingerprint failed");
 
         let decoding_key =
             DecodingKey::from_rsa_pem(public_pem.as_bytes()).expect("decode public key");
@@ -609,6 +648,37 @@ mod tests {
             format!("XY12345.ALICE.{expected_fingerprint}")
         );
         assert!(expected_fingerprint.starts_with("SHA256:"));
+    }
+
+    /// An `ENCRYPTED PRIVATE KEY` PEM signs with the right passphrase (same key as plaintext), and
+    /// a missing or wrong passphrase fails with an error naming `private_key_passphrase`.
+    #[test]
+    fn build_jwt_decrypts_encrypted_pkcs8_private_key() {
+        use pkcs8::EncodePrivateKey as _;
+
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let encrypted_pem = private_key
+            .to_pkcs8_encrypted_pem(&mut rng, "s3cret", LineEnding::LF)
+            .expect("encrypt test private key");
+        assert!(encrypted_pem.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
+
+        let decrypted = parse_rsa_private_key(&encrypted_pem, Some("s3cret")).expect("decrypt");
+        assert_eq!(decrypted, private_key);
+        build_jwt("xy12345", "alice", &encrypted_pem, Some("s3cret")).expect("build_jwt failed");
+
+        for passphrase in [None, Some("")] {
+            let err = build_jwt("xy12345", "alice", &encrypted_pem, passphrase).unwrap_err();
+            assert!(
+                err.to_string().contains("set private_key_passphrase"),
+                "{err}"
+            );
+        }
+        let err = build_jwt("xy12345", "alice", &encrypted_pem, Some("wrong")).unwrap_err();
+        assert!(
+            err.to_string().contains("wrong private_key_passphrase"),
+            "{err}"
+        );
     }
 
     /// `account` becomes a hostname segment: anything that could break out of it must be rejected,
@@ -811,6 +881,9 @@ mod tests {
         assert_eq!(SnowflakeConnector.type_name(), "snowflake");
         let schema = SnowflakeConnector.configuration_schema();
         assert_eq!(schema["required"], json!(["account", "user", "database"]));
-        assert_eq!(schema["secret"], json!(["private_key", "password"]));
+        assert_eq!(
+            schema["secret"],
+            json!(["private_key", "private_key_passphrase", "password"])
+        );
     }
 }

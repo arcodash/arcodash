@@ -82,6 +82,8 @@ export interface DataSourceTypeField {
   enum?: unknown[];
   /** File-picker accept string (e.g. ".csv"), only meaningful when `type === "file"`. */
   accept?: string;
+  /** `"textarea"` = multi-line input (e.g. PEM keys; a single-line input strips their newlines). */
+  "x-widget"?: string;
 }
 
 export interface UploadDataSourceResponse {

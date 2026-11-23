@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Snowflake: encrypted private keys (`ENCRYPTED PRIVATE KEY`, AES or 3DES) with a new
+  `private_key_passphrase` field.
+
+### Fixed
+
+- Data source form renders multi-line fields (Snowflake private key, BigQuery service account
+  JSON) as a textarea, so pasted PEM keys keep their line breaks.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added

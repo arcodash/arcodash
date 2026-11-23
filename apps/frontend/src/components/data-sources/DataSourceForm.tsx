@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Label, RequiredMark, FieldError } from "@/components/ui/label";
 import {
   Select,
@@ -238,19 +239,33 @@ export function DataSourceForm({
                   </Select>
                 ) : (
                   <>
-                    <Input
-                      id={fieldId}
-                      type={isSecret ? "password" : isNumeric ? "number" : "text"}
-                      autoComplete={isSecret ? "new-password" : "off"}
-                      value={value != null ? String(value) : ""}
-                      placeholder={isSecret && initialType != null ? "Leave blank to keep current" : undefined}
-                      aria-invalid={fieldError ? true : undefined}
-                      aria-describedby={fieldError ? errorId : undefined}
-                      onChange={(e) => {
-                        const raw = e.target.value;
-                        handleOptionChange(key, isNumeric ? (raw === "" ? undefined : Number(raw)) : raw);
-                      }}
-                    />
+                    {field["x-widget"] === "textarea" ? (
+                      <Textarea
+                        id={fieldId}
+                        rows={6}
+                        spellCheck={false}
+                        className="font-mono"
+                        value={value != null ? String(value) : ""}
+                        placeholder={isSecret && initialType != null ? "Leave blank to keep current" : undefined}
+                        aria-invalid={fieldError ? true : undefined}
+                        aria-describedby={fieldError ? errorId : undefined}
+                        onChange={(e) => handleOptionChange(key, e.target.value)}
+                      />
+                    ) : (
+                      <Input
+                        id={fieldId}
+                        type={isSecret ? "password" : isNumeric ? "number" : "text"}
+                        autoComplete={isSecret ? "new-password" : "off"}
+                        value={value != null ? String(value) : ""}
+                        placeholder={isSecret && initialType != null ? "Leave blank to keep current" : undefined}
+                        aria-invalid={fieldError ? true : undefined}
+                        aria-describedby={fieldError ? errorId : undefined}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          handleOptionChange(key, isNumeric ? (raw === "" ? undefined : Number(raw)) : raw);
+                        }}
+                      />
+                    )}
                     {isSecret && initialType != null && (
                       <p className="text-xs text-muted-foreground">Leave empty to keep the current value.</p>
                     )}
