@@ -43,7 +43,8 @@ pub struct SnowflakeOptions {
     /// registered on the Snowflake user. Required.
     #[serde(default)]
     pub private_key: Option<String>,
-    /// Passphrase for an encrypted PKCS#8 `private_key` (`-----BEGIN ENCRYPTED PRIVATE KEY-----`).
+    /// Passphrase for an encrypted PKCS#8 `private_key` (`-----BEGIN ENCRYPTED PRIVATE KEY-----`);
+    /// ignored for an unencrypted key.
     #[serde(default)]
     pub private_key_passphrase: Option<String>,
     /// Accepted for config-schema parity; not used to authenticate (a password-only config yields a
@@ -86,6 +87,13 @@ fn parse_rsa_private_key(pem: &str, passphrase: Option<&str>) -> Result<RsaPriva
                  unsupported encryption (supported: PBES2 with AES-CBC or 3DES)"
             )
         });
+    }
+    if pem.contains("Proc-Type: 4,ENCRYPTED") {
+        anyhow::bail!(
+            "Snowflake private_key is a legacy encrypted PKCS#1 key, which isn't supported — \
+             convert it with `openssl pkcs8 -topk8 -v2 aes256 -in key.pem -out rsa_key.p8` and \
+             paste the resulting ENCRYPTED PRIVATE KEY"
+        );
     }
     RsaPrivateKey::from_pkcs8_pem(pem)
         .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
@@ -656,10 +664,10 @@ mod tests {
     fn build_jwt_decrypts_encrypted_pkcs8_private_key() {
         use pkcs8::EncodePrivateKey as _;
 
-        let mut rng = rand::thread_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let (pem, _) = test_key_pem();
+        let private_key = parse_rsa_private_key(&pem, None).unwrap();
         let encrypted_pem = private_key
-            .to_pkcs8_encrypted_pem(&mut rng, "s3cret", LineEnding::LF)
+            .to_pkcs8_encrypted_pem(&mut rand::thread_rng(), "s3cret", LineEnding::LF)
             .expect("encrypt test private key");
         assert!(encrypted_pem.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
 
@@ -679,6 +687,11 @@ mod tests {
             err.to_string().contains("wrong private_key_passphrase"),
             "{err}"
         );
+
+        let legacy = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+                      DEK-Info: AES-256-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----";
+        let err = build_jwt("xy12345", "alice", legacy, Some("s3cret")).unwrap_err();
+        assert!(err.to_string().contains("openssl pkcs8 -topk8"), "{err}");
     }
 
     /// `account` becomes a hostname segment: anything that could break out of it must be rejected,

@@ -244,7 +244,8 @@ export function DataSourceForm({
                         id={fieldId}
                         rows={6}
                         spellCheck={false}
-                        className="font-mono"
+                        autoComplete="off"
+                        className={isSecret ? "font-mono [-webkit-text-security:disc]" : "font-mono"}
                         value={value != null ? String(value) : ""}
                         placeholder={isSecret && initialType != null ? "Leave blank to keep current" : undefined}
                         aria-invalid={fieldError ? true : undefined}
