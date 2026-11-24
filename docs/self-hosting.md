@@ -52,17 +52,41 @@ docker compose -f docker-compose.prod.yml up -d --build
 
 The `migrate` service runs on every `up` and applies only pending migrations.
 
+### Upgrading from a version that stored results in Postgres
+
+Query results, monitor history, dashboard summaries, recent mail bodies and AI profile sample
+values now live in the object store (`UPLOAD_BUCKET`), not in Postgres. After you update, the
+worker copies existing inline data to the object store in the background and verifies each copy.
+Nothing is removed during that copy. Once the worker has logged `storage backfill: pass complete`
+for every area, free the inline copies:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm worker clear-inline-data            # dry run, only counts
+docker compose -f docker-compose.prod.yml run --rm worker clear-inline-data --confirm  # clears verified rows
+```
+
+Only rows whose object-store copy re-verifies are cleared.
+
+### Result retention
+
+Stored query results that go unread and unrefreshed for `RESULT_RETENTION_DAYS` (default `7`) are
+deleted by the worker; every read or refresh resets the clock. A deleted result is re-run when
+it is next needed. Monitor history is kept longer than results. See [ENV_VARS.md](../ENV_VARS.md).
+
 ## 4. Back up
 
-Postgres holds everything that matters. Back it up regularly, together with a copy of `.env`:
+Postgres holds your configuration and metadata, and the object store holds results and uploaded
+files. Back up both regularly, together with a copy of `.env`:
 
 ```bash
 docker compose -f docker-compose.prod.yml exec -T postgres \
   sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > backup.sql
 ```
 
-Uploaded CSV and SQLite files live in the `objectdata` volume; back it up too if you use upload
-data sources.
+The bundled object store keeps its data in the `objectdata` volume; back it up too. It holds
+uploaded CSV and SQLite files, which cannot be regenerated. Query results can be re-run, so losing
+them costs only a refresh. If you point `UPLOAD_BUCKET` at your own bucket, its backup and
+lifecycle rules are yours to manage; do not add an expiry shorter than `RESULT_RETENTION_DAYS`.
 
 ## TLS and reverse proxy
 

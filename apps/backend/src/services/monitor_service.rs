@@ -525,18 +525,18 @@ pub async fn tile_data(
             let stored_value = match (fresh_obs, row.and_then(|r| r.obs_id)) {
                 (Some(at), Some(id)) if row.is_some_and(|r| r.obs_value.is_none()) => {
                     let storage = match storages.entry(m.org_id) {
-                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                            std::collections::hash_map::Entry::Vacant(e) => e.insert(
-                                results
-                                    .resolver
-                                    .resolve(results.pool, m.org_id)
-                                    .await
-                                    .map_err(|e| {
-                                        tracing::warn!(monitor_id = m.id, error = %e, "tile: storage unavailable");
-                                    })
-                                    .ok(),
-                            ),
-                        };
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => e.insert(
+                            results
+                                .resolver
+                                .resolve(results.pool, m.org_id)
+                                .await
+                                .map_err(|e| {
+                                    tracing::warn!(monitor_id = m.id, error = %e, "tile: storage unavailable");
+                                })
+                                .ok(),
+                        ),
+                    };
                     match storage {
                         Some(storage) => arcodash_core::observation_store::load_for_rows(
                             storage,

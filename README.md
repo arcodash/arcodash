@@ -155,17 +155,19 @@ Status, configuration fields and how to add your own are in the [connector refer
 ```mermaid
 flowchart LR
     Browser["Browser (React SPA)"] -->|REST /api| API["Backend API (Axum)"]
-    API <-->|state, results| PG[("Postgres")]
+    API <-->|state| PG[("Postgres")]
+    API <-->|results| OS[("Object store")]
     API -->|enqueue jobs| VK[("Valkey queue")]
     VK --> Worker["Worker"]
     Worker --> Data[("Your data sources")]
-    Worker -->|results, monitor state| PG
+    Worker -->|state| PG
+    Worker -->|results, monitor history| OS
     Worker -->|alerts| Dest["Slack, email, webhooks, ..."]
     API -.->|Ask with AI| AI["AI provider (your key)"]
     Worker -.->|alert explanations| AI
 ```
 
-The backend enqueues query and monitor jobs on Valkey; the worker runs them against your data sources, writes results to Postgres and sends alerts. [ARCHITECTURE.md](ARCHITECTURE.md) walks through each component and the code layout.
+The backend enqueues query and monitor jobs on Valkey; the worker runs them against your data sources, writes results to the object store (`UPLOAD_BUCKET`) and sends alerts. [ARCHITECTURE.md](ARCHITECTURE.md) walks through each component and the code layout.
 
 ## 🧪 Testing
 

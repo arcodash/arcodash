@@ -299,6 +299,31 @@ describe("WidgetCard result footnote slot", () => {
     expect(screen.getByTestId("widget-result-footnote")).toContainElement(screen.getByTestId("ext-footnote"));
   });
 
+  it("renders_footnote_inside_tile_footer_in_app_view", () => {
+    extensions.push({
+      navItems: [],
+      routes: [],
+      resultFootnoteSlot: () => <span data-testid="ext-footnote">note</span>,
+    });
+
+    renderCard(vizWidget(3600));
+
+    expect(screen.getByTestId("tile-footer")).toContainElement(screen.getByTestId("widget-result-footnote"));
+  });
+
+  it("renders_separate_footnote_row_on_public_view", () => {
+    extensions.push({
+      navItems: [],
+      routes: [],
+      resultFootnoteSlot: () => <span data-testid="ext-footnote">note</span>,
+    });
+
+    renderCard(vizWidget(3600), { publicView: true });
+
+    expect(screen.queryByTestId("tile-footer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("widget-result-footnote")).toBeInTheDocument();
+  });
+
   it("does_not_render_slot_in_edit_mode", () => {
     extensions.push({
       navItems: [],
