@@ -1718,7 +1718,7 @@ export function QueryEditorPage() {
                         </Badge>
                       )}
                       {result.data.rows.length} row{result.data.rows.length === 1 ? "" : "s"} ·{" "}
-                      {(result.data.runtime_seconds ?? result.runtime).toFixed(3)}s · Updated{" "}
+                      {(result.data.runtime_seconds ?? result.runtime ?? 0).toFixed(3)}s · Updated{" "}
                       {timeAgo(Date.parse(result.retrieved_at), now)}
                       {hasResultFootnote() && (
                         <ResultFootnote retrievedAt={result.retrieved_at} placement="editor" />

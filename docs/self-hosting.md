@@ -88,7 +88,8 @@ docker compose -f docker-compose.prod.yml exec -T postgres \
 ```
 
 The bundled object store keeps its data in the `objectdata` volume; back it up too. It holds
-uploaded CSV and SQLite files, which cannot be regenerated. Query results can be re-run, so losing
+uploaded CSV and SQLite files, monitor history and copies of sent emails, none of which can be
+regenerated. Query results can be re-run, so losing
 them costs only a refresh. If you point `UPLOAD_BUCKET` at your own bucket, its backup and
 lifecycle rules are yours to manage; do not add an expiry shorter than `RESULT_RETENTION_DAYS`.
 

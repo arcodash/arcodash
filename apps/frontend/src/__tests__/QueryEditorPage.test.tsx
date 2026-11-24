@@ -928,7 +928,7 @@ describe("QueryEditorPage", () => {
         }),
         http.post(`${BASE}/api/query_results`, async ({ request }) => {
           execBody = (await request.json()) as Record<string, unknown>;
-          return HttpResponse.json({ query_result: { id: 1, query: "SELECT 1", data: { columns: [], rows: [] } } });
+          return HttpResponse.json({ query_result: { id: 1, query: "SELECT 1", data: { columns: [], rows: [] }, runtime: 0.01, retrieved_at: new Date().toISOString() } });
         }),
       );
 
@@ -955,7 +955,7 @@ describe("QueryEditorPage", () => {
         }),
         http.post(`${BASE}/api/query_results`, async ({ request }) => {
           execBody = (await request.json()) as Record<string, unknown>;
-          return HttpResponse.json({ query_result: { id: 1, query: "SELECT * FROM widgets", data: { columns: [], rows: [] } } });
+          return HttpResponse.json({ query_result: { id: 1, query: "SELECT * FROM widgets", data: { columns: [], rows: [] }, runtime: 0.01, retrieved_at: new Date().toISOString() } });
         }),
       );
 
