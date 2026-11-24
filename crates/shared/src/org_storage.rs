@@ -60,6 +60,11 @@ pub trait BlobStore: Send + Sync {
     async fn put(&self, key: &str, bytes: Bytes, content_type: &str) -> Result<(), StorageError>;
     /// A missing object is `Err(NotFound)`.
     async fn get(&self, key: &str) -> Result<Bytes, StorageError>;
+    /// Like `get`, but may refuse an object over `max` bytes before buffering it. Callers must
+    /// still check the returned length.
+    async fn get_max(&self, key: &str, _max: u64) -> Result<Bytes, StorageError> {
+        self.get(key).await
+    }
     /// A missing object is `Ok`.
     async fn delete(&self, key: &str) -> Result<(), StorageError>;
     /// `(full key, size in bytes)` for every object under `prefix`.
