@@ -57,15 +57,19 @@ The `migrate` service runs on every `up` and applies only pending migrations.
 Query results, monitor history, dashboard summaries, recent mail bodies and AI profile sample
 values now live in the object store (`UPLOAD_BUCKET`), not in Postgres. After you update, the
 worker copies existing inline data to the object store in the background and verifies each copy.
-Nothing is removed during that copy. Once the worker has logged `storage backfill: pass complete`
-for every area, free the inline copies:
+Nothing is removed during that copy. It can take a few minutes (the worker runs it every
+`STORAGE_BACKFILL_SECS`, default 60) and longer on large databases. The `storage backfill: pass
+complete` log line is emitted once per area and is not repeated after a worker restart, so don't
+wait for it. Run the dry run instead and check its output:
 
 ```bash
 docker compose -f docker-compose.prod.yml run --rm worker clear-inline-data            # dry run, only counts
 docker compose -f docker-compose.prod.yml run --rm worker clear-inline-data --confirm  # clears verified rows
 ```
 
-Only rows whose object-store copy re-verifies are cleared.
+When the `verified` counts match the rows you expect and `not_verified` and `no_copy` are 0 for
+every area, run `--confirm`. It re-verifies each row against the object store immediately before
+clearing it, so running it early is safe: it only clears verified rows.
 
 ### Result retention
 

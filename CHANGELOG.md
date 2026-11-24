@@ -26,9 +26,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`UPLOAD_BUCKET`) instead of Postgres.
 - Upgrade: once the backfill has finished, run `docker compose run --rm worker clear-inline-data`
   (a dry run that only counts), then `docker compose run --rm worker clear-inline-data --confirm`,
-  to free the inline copies. The backfill has finished when the worker has logged
-  `storage backfill: pass complete` for every area; the dry run's `verified` counts show what a
-  `--confirm` would clear.
+  to free the inline copies. The dry run's `verified` counts show what `--confirm` would clear; run
+  `--confirm` once they match the rows you expect and `not_verified` and `no_copy` are 0. It
+  re-verifies each row against the object store, so running it early is safe.
 - API responses carry `Cache-Control: no-store` by default.
 - Error text stored or returned to clients has customer values scrubbed.
 
