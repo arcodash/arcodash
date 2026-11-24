@@ -115,7 +115,7 @@ pub async fn clear_inline_data(
 }
 
 /// [`clear_inline_data`] restricted to one organization when `org_id` is set.
-pub(crate) async fn clear_inline_data_scoped(
+pub async fn clear_inline_data_scoped(
     db: &DatabaseConnection,
     resolver: &dyn OrgStorageResolver,
     confirm: bool,
@@ -146,7 +146,7 @@ struct Run<'a> {
     org_id: Option<i64>,
 }
 
-fn apply(report: &mut AreaReport, verified: bool, cleared: bool) {
+const fn apply(report: &mut AreaReport, verified: bool, cleared: bool) {
     if verified {
         report.verified += 1;
         if cleared {

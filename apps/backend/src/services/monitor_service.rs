@@ -423,10 +423,12 @@ struct TileRow {
     use_obs: Option<bool>,
 }
 
-/// Enrichment for the monitor-tile widget in one round trip: state, condition, and the first-row
-/// cell from the newest evidence: the latest observation's result when it outranks the last
-/// terminal run (runs that failed or produced a result win ties and older observations), else the
-/// run's. No authz; callers gate visibility first.
+/// Enrichment for the monitor-tile widget in one round trip.
+///
+/// Returns state, condition, and the first-row cell from the newest evidence: the latest
+/// observation's result when it outranks the last terminal run (runs that failed or produced a
+/// result win ties and older observations), else the run's. No authz; callers gate visibility
+/// first.
 pub async fn tile_data(
     db: &impl ConnectionTrait,
     results: crate::services::result_service::ResultReader<'_>,
@@ -514,15 +516,15 @@ pub async fn tile_data(
             .filter(|r| r.use_obs == Some(true))
             .and_then(|r| r.obs_at);
         // The stored f64 is a fallback for when there is no result row to read the cell from.
-        let observed = match row
+        let observed = if let Some(first) = row
             .and_then(|r| r.result_id)
             .and_then(|id| first_rows.get(&id))
         {
-            Some(row0) => column.as_deref().and_then(|col| row0.get(col).cloned()),
-            None => {
-                let stored_value = match (fresh_obs, row.and_then(|r| r.obs_id)) {
-                    (Some(at), Some(id)) if row.is_some_and(|r| r.obs_value.is_none()) => {
-                        let storage = match storages.entry(m.org_id) {
+            column.as_deref().and_then(|col| first.get(col).cloned())
+        } else {
+            let stored_value = match (fresh_obs, row.and_then(|r| r.obs_id)) {
+                (Some(at), Some(id)) if row.is_some_and(|r| r.obs_value.is_none()) => {
+                    let storage = match storages.entry(m.org_id) {
                             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                             std::collections::hash_map::Entry::Vacant(e) => e.insert(
                                 results
@@ -535,31 +537,30 @@ pub async fn tile_data(
                                     .ok(),
                             ),
                         };
-                        match storage {
-                            Some(storage) => arcodash_core::observation_store::load_for_rows(
-                                storage,
-                                m.id,
-                                &[(id, at.with_timezone(&Utc))],
-                            )
-                            .await
-                            .remove(&id),
-                            None => None,
-                        }
+                    match storage {
+                        Some(storage) => arcodash_core::observation_store::load_for_rows(
+                            storage,
+                            m.id,
+                            &[(id, at.with_timezone(&Utc))],
+                        )
+                        .await
+                        .remove(&id),
+                        None => None,
                     }
-                    _ => None,
-                };
-                fresh_obs.and_then(|_| {
-                    arcodash_core::observation_store::merged_value(
-                        row.and_then(|r| r.obs_value),
-                        stored_value.as_ref(),
-                    )
-                    .and_then(serde_json::Number::from_f64)
-                    .map(Value::Number)
-                })
-            }
+                }
+                _ => None,
+            };
+            fresh_obs.and_then(|_| {
+                arcodash_core::observation_store::merged_value(
+                    row.and_then(|r| r.obs_value),
+                    stored_value.as_ref(),
+                )
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number)
+            })
         };
         let last_checked_at = fresh_obs
-            .or(row.and_then(|r| r.finished_at))
+            .or_else(|| row.and_then(|r| r.finished_at))
             .map(|t| t.with_timezone(&Utc));
         let muted =
             arcodash_core::models::parse_monitor_options(m.id, &m.options).is_silenced(Utc::now());

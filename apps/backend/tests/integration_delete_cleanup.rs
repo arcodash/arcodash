@@ -218,7 +218,7 @@ async fn deleting_data_source_removes_results_and_profile() {
 #[tokio::test]
 async fn customer_storage_objects_are_never_deleted_on_delete() {
     let mem = Arc::new(MemoryBlobStore::default());
-    let app = skip_if_none!(app_with(mem.clone(), StorageMode::Customer).await);
+    let app = skip_if_none!(app_with(mem.clone(), StorageMode::OrgBucket).await);
     app.cleanup().await;
     let client = app.admin_client().await;
     let f = seed_monitors(&app, &client, &mem).await;

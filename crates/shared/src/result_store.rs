@@ -98,11 +98,11 @@ async fn resolve_reporting(
     resolver: &dyn OrgStorageResolver,
     org_id: i64,
 ) -> Result<OrgStorage, StorageError> {
-    let resolved = resolver.resolve(resolver_db, org_id).await;
-    if let Err(e @ StorageError::Unreachable { .. }) = &resolved {
+    let result = resolver.resolve(resolver_db, org_id).await;
+    if let Err(e @ StorageError::Unreachable { .. }) = &result {
         resolver.report_failure(resolver_db, org_id, e).await;
     }
-    resolved
+    result
 }
 
 async fn fetch_object(

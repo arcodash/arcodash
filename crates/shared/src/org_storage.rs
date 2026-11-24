@@ -71,7 +71,7 @@ pub enum StorageMode {
     /// The operator's own bucket.
     ArcoDash,
     /// A bucket supplied by the organization.
-    Customer,
+    OrgBucket,
 }
 
 #[derive(Clone)]
@@ -343,7 +343,7 @@ mod tests {
         );
         assert_eq!(mem.keys(), ["orgs/70/results/x"]);
 
-        let (c, cmem) = storage(StorageMode::Customer, "orgs/7/");
+        let (c, cmem) = storage(StorageMode::OrgBucket, "orgs/7/");
         for k in seed() {
             cmem.put(&k, Bytes::from_static(b"x"), "text/plain")
                 .await
@@ -404,19 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn customer_root_without_trailing_slash_is_normalized() {
-        let (s, _) = storage(StorageMode::Customer, "acme/arcodash");
+    fn org_bucket_root_without_trailing_slash_is_normalized() {
+        let (s, _) = storage(StorageMode::OrgBucket, "acme/arcodash");
         assert_eq!(s.key(StorageArea::Results, "x"), "acme/arcodash/results/x");
-        let (s, _) = storage(StorageMode::Customer, "");
+        let (s, _) = storage(StorageMode::OrgBucket, "");
         assert_eq!(s.key(StorageArea::Results, "x"), "results/x");
-        let (s, _) = storage(StorageMode::Customer, "/a//");
+        let (s, _) = storage(StorageMode::OrgBucket, "/a//");
         assert_eq!(s.root(), "a/");
     }
 
     #[test]
     fn manages_retention_only_in_arcodash_mode() {
         assert!(storage(StorageMode::ArcoDash, "r/").0.manages_retention());
-        assert!(!storage(StorageMode::Customer, "r/").0.manages_retention());
+        assert!(!storage(StorageMode::OrgBucket, "r/").0.manages_retention());
     }
 
     #[tokio::test]

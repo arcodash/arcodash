@@ -191,6 +191,7 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
                     )
                     .await;
                     *cursor = next;
+                    drop(cursor);
                     if stats != sweeper::ResultSweepStats::default() {
                         tracing::info!(
                             deleted = stats.deleted,

@@ -263,8 +263,10 @@ pub async fn load_for_rows(
         })
 }
 
-/// Newest explanation of the monitor's current incident: observations after the last
-/// non-triggered one, newest first, the first carrying an inline (legacy) or stored explanation.
+/// Newest explanation of the monitor's current incident.
+///
+/// Scans observations after the last non-triggered one, newest first, for the first carrying an
+/// inline (legacy) or stored explanation.
 /// Best-effort: any failure yields `None`.
 pub async fn latest_incident_explanation(
     db: &DatabaseConnection,

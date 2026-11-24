@@ -377,6 +377,7 @@ fn first_time_reporting_invalid(name: &str) -> bool {
 
 /// `RESULT_RETENTION_DAYS` (default 7), floored at 1 so a zero or negative value cannot expire
 /// results immediately.
+#[must_use]
 pub fn result_retention_days() -> i64 {
     env_parsed("RESULT_RETENTION_DAYS", 7_i64).max(1)
 }

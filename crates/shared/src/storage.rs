@@ -503,14 +503,13 @@ pub async fn delete_upload(
         Err(e) => Err(e),
     };
     match result {
-        Err(StorageError::NotFound) => Ok(()),
+        Err(StorageError::NotFound) | Ok(()) => Ok(()),
         Err(e) => {
             if matches!(e, StorageError::Unreachable { .. }) {
                 resolver.report_failure(db, org_id, &e).await;
             }
             Err(e)
         }
-        Ok(()) => Ok(()),
     }
 }
 
@@ -601,7 +600,7 @@ mod tests {
         use crate::test_support::blob::{MemoryBlobStore, StaticResolver};
         let mem = Arc::new(MemoryBlobStore::default());
         let resolver = StaticResolver::with_store(
-            crate::org_storage::StorageMode::Customer,
+            crate::org_storage::StorageMode::OrgBucket,
             mem.clone(),
             "acme/",
         );

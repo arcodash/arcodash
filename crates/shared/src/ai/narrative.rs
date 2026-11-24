@@ -384,7 +384,7 @@ pub async fn report_unreachable(
 }
 
 /// A narrative's text and the digest it was built from, as stored in its object.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NarrativeContent {
     pub summary: String,
     pub highlights: Value,

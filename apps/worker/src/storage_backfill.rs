@@ -451,7 +451,7 @@ async fn backfill_observations(
 }
 
 /// Whether the stored line carries every value the inline row holds.
-pub(crate) fn line_matches(
+pub fn line_matches(
     stored: Option<&ObservationValues>,
     value: Option<f64>,
     explanation: Option<&str>,

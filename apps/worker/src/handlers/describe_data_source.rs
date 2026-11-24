@@ -213,22 +213,21 @@ async fn store(
     // may have replaced it); only a row still holding inline values moves them out.
     let new = serde_json::to_value(&stripped)?;
     let txn = ctx.db.begin().await?;
-    let location = match &ds.ai_profile_values_location {
-        Some(l) => l.clone(),
-        None => {
-            txn.execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT 1 FROM data_sources WHERE id = $1 FOR UPDATE",
-                [ds.id.into()],
-            ))
-            .await?;
-            match save_profile_values(storage, ds.id, &values).await {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = txn.rollback().await;
-                    report_unreachable(&*ctx.storage, &ctx.db, ds.org_id, &e).await;
-                    return Err(e.into());
-                }
+    let location = if let Some(l) = &ds.ai_profile_values_location {
+        l.clone()
+    } else {
+        txn.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT 1 FROM data_sources WHERE id = $1 FOR UPDATE",
+            [ds.id.into()],
+        ))
+        .await?;
+        match save_profile_values(storage, ds.id, &values).await {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                report_unreachable(&*ctx.storage, &ctx.db, ds.org_id, &e).await;
+                return Err(e.into());
             }
         }
     };

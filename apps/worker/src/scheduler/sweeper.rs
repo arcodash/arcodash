@@ -864,7 +864,7 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
 
     let now = Utc::now();
     // `None`: storage lookup failed or is paused; the org is skipped for the whole sweep.
-    let mut managed: std::collections::HashMap<i64, Option<bool>> =
+    let mut retention_by_org: std::collections::HashMap<i64, Option<bool>> =
         std::collections::HashMap::new();
     for row in rows {
         let Ok(id) = row.try_get::<uuid::Uuid>("", "id") else {
@@ -888,20 +888,19 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
             tracing::error!(upload_id = %id, "sweeper: orphaned-upload query returned a non-orphan row, skipping");
             continue;
         }
-        let manages = match managed.get(&org_id) {
-            Some(m) => *m,
-            None => {
-                let m = match ctx.storage.resolve(&ctx.db, org_id).await {
-                    Ok(s) if s.writes_paused() => None,
-                    Ok(s) => Some(s.manages_retention()),
-                    Err(e) => {
-                        tracing::warn!(org_id, error = %e, "sweeper: org storage unavailable, skipping its orphaned uploads");
-                        None
-                    }
-                };
-                managed.insert(org_id, m);
-                m
-            }
+        let manages = if let Some(m) = retention_by_org.get(&org_id) {
+            *m
+        } else {
+            let m = match ctx.storage.resolve(&ctx.db, org_id).await {
+                Ok(s) if s.writes_paused() => None,
+                Ok(s) => Some(s.manages_retention()),
+                Err(e) => {
+                    tracing::warn!(org_id, error = %e, "sweeper: org storage unavailable, skipping its orphaned uploads");
+                    None
+                }
+            };
+            retention_by_org.insert(org_id, m);
+            m
         };
         let Some(manages) = manages else {
             continue;
@@ -946,7 +945,7 @@ enum Expiry {
 
 /// Counts from one retention sweep tick.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResultSweepStats {
+pub struct ResultSweepStats {
     pub deleted: usize,
     pub skipped_orgs: usize,
     pub failed_orgs: usize,
@@ -1004,14 +1003,14 @@ async fn expire_result(
 }
 
 /// Pages scanned per tick; bounds the work of one sweep.
-pub(crate) const RESULT_SWEEP_MAX_PAGES: usize = 20;
+pub const RESULT_SWEEP_MAX_PAGES: usize = 20;
 
 /// Consecutive database errors while expiring rows after which a tick gives up.
 const RESULT_SWEEP_MAX_DB_ERRORS: usize = 20;
 
 /// Position in the `(last_used_at, id)` scan order where the next sweep tick resumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SweepCursor {
+pub struct SweepCursor {
     pub last_used_at: sea_orm::prelude::DateTimeWithTimeZone,
     pub id: i64,
 }
@@ -1030,7 +1029,7 @@ pub async fn sweep_expired_results(ctx: &ExecuteQueryContext) -> usize {
 /// Sweeps in keyset-ordered pages of `limit` rows, at most `max_pages`, resuming after `start`.
 /// Returns the cursor for the next tick: `None` once the scan reached the end (or a page failed
 /// to load), so rows that are always skipped cannot starve those behind them.
-pub(crate) async fn sweep_expired_results_with_limit(
+pub async fn sweep_expired_results_with_limit(
     ctx: &ExecuteQueryContext,
     limit: i64,
     max_pages: usize,
@@ -1047,14 +1046,16 @@ pub(crate) async fn sweep_expired_results_with_limit(
     let mut db_errors = 0usize;
 
     for _ in 0..max_pages {
-        let (after_ts, after_id): (String, i64) = match cursor {
-            Some(c) => (
-                c.last_used_at
-                    .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-                c.id,
-            ),
-            None => ("-infinity".to_string(), 0),
-        };
+        let (after_ts, after_id): (String, i64) = cursor.map_or_else(
+            || ("-infinity".to_string(), 0),
+            |c| {
+                (
+                    c.last_used_at
+                        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    c.id,
+                )
+            },
+        );
         let Some(rows) = load_batch(
             &ctx.db,
             Statement::from_sql_and_values(
@@ -3466,7 +3467,7 @@ mod tests {
         let org = seed_org(&db, &format!("org-orphan-cust-{}", uuid::Uuid::new_v4())).await;
         let (ctx, mem) = ctx_with_mem_store(
             test_ctx(db.clone(), redis),
-            arcodash_core::org_storage::StorageMode::Customer,
+            arcodash_core::org_storage::StorageMode::OrgBucket,
         );
         let id = uuid::Uuid::new_v4();
         let rel = arcodash_core::storage::upload_rel_key("csv", id, "data.csv");
@@ -3760,7 +3761,7 @@ mod tests {
         let ds = seed_data_source(&db, org.id).await;
         let (ctx, store) = ctx_with_mem_store(
             test_ctx(db.clone(), redis),
-            arcodash_core::org_storage::StorageMode::Customer,
+            arcodash_core::org_storage::StorageMode::OrgBucket,
         );
         let row = seed_stored_result(&db, &store, org.id, ds.id, 30).await;
 
@@ -3848,7 +3849,7 @@ mod tests {
             let mode = if org_id == self.org_id {
                 arcodash_core::org_storage::StorageMode::ArcoDash
             } else {
-                arcodash_core::org_storage::StorageMode::Customer
+                arcodash_core::org_storage::StorageMode::OrgBucket
             };
             Ok(arcodash_core::org_storage::OrgStorage::new(
                 org_id,
@@ -3893,7 +3894,7 @@ mod tests {
         ) -> Result<arcodash_core::org_storage::OrgStorage, arcodash_core::org_storage::StorageError>
         {
             let mode = if org_id == self.customer_org {
-                arcodash_core::org_storage::StorageMode::Customer
+                arcodash_core::org_storage::StorageMode::OrgBucket
             } else {
                 arcodash_core::org_storage::StorageMode::ArcoDash
             };
@@ -4025,7 +4026,7 @@ mod tests {
             let mode = if org_id == self.org_id {
                 arcodash_core::org_storage::StorageMode::ArcoDash
             } else {
-                arcodash_core::org_storage::StorageMode::Customer
+                arcodash_core::org_storage::StorageMode::OrgBucket
             };
             Ok(arcodash_core::org_storage::OrgStorage::new(
                 org_id,

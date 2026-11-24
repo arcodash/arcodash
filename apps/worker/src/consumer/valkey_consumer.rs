@@ -201,7 +201,7 @@ async fn queue_loop(
         in_flight.spawn(async move {
             // `dispatch` is awaited inline so a timeout drops (and cancels) the future at its next
             // await; the run/job's lease-expiry + sweeper path recovers the rest.
-            if tokio::time::timeout(handler_timeout, dispatch(&task_ctx, message))
+            if tokio::time::timeout(handler_timeout, Box::pin(dispatch(&task_ctx, message)))
                 .await
                 .is_err()
             {
