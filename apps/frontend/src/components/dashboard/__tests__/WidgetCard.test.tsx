@@ -1,13 +1,24 @@
 /** Text widgets must render Markdown, not raw text (Add Widget dialog promises "text or markdown"). */
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type * as ReactRouterModule from "react-router";
 import { MemoryRouter } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { extensions } from "@/extensions";
 import { WidgetCard } from "../WidgetCard";
 import type { Widget } from "@/types/api";
 
-vi.mock("@/lib/api", () => ({ api: {} }));
+const navigateSpy = vi.fn();
+vi.mock("react-router", async (importOriginal) => {
+  const actual = await importOriginal<typeof ReactRouterModule>();
+  return { ...actual, useNavigate: () => navigateSpy };
+});
+vi.mock("@/lib/api", () => ({ api: {}, ApiError: class ApiError extends Error {} }));
+let canCreateMonitor = true;
+vi.mock("@/lib/permissions", () => ({
+  usePermissions: () => ({ has: (k: string) => (k === "create_monitor" ? canCreateMonitor : true) }),
+}));
 
 function textWidget(text: string): Widget {
   return {
@@ -23,12 +34,12 @@ function textWidget(text: string): Widget {
   };
 }
 
-function renderCard(widget: Widget, props: { publicView?: boolean; editMode?: boolean } = {}) {
+function renderCard(widget: Widget, props: { publicView?: boolean; editMode?: boolean; exploreSourceId?: number | null; dashboardSlug?: string } = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter>
       <QueryClientProvider client={qc}>
-        <WidgetCard widget={widget} editMode={false} onDelete={vi.fn()} {...props} />
+        <WidgetCard widget={widget} onDelete={vi.fn()} {...props} editMode={props.editMode ?? false} />
       </QueryClientProvider>
     </MemoryRouter>,
   );
@@ -102,10 +113,22 @@ describe("WidgetCard freshness on public views", () => {
     expect(screen.getByText(/Updated/)).toBeInTheDocument();
   });
 
+  it("has no tile footer", () => {
+    renderCard(vizWidget(3600), { publicView: true });
+
+    expect(screen.queryByTestId("tile-footer")).not.toBeInTheDocument();
+  });
+
   it("keeps the dot on private views for an unscheduled query", () => {
     renderCard(vizWidget(null));
 
     expect(screen.getByLabelText(/^Updated /)).toBeInTheDocument();
+  });
+
+  it("renders the age in a footer on private views", () => {
+    renderCard(vizWidget(null));
+
+    expect(screen.getByTestId("tile-footer")).toHaveTextContent("Updated");
   });
 });
 
@@ -131,9 +154,27 @@ describe("WidgetCard truncated title tooltip", () => {
 
     const el = screen.getByText("Text");
     expect(el.className).toContain("line-clamp-3");
-    expect(el.className).toContain("min-w-[min(8rem,100%)]");
+    expect(el.className).toContain("min-w-0");
     expect(el.className).toContain("break-words");
     expect(el.className).not.toContain("truncate");
+    expect(el.parentElement).toHaveClass("min-w-[min(8rem,100%)]");
+  });
+
+  it("moves the width floor to the title group when draggable", () => {
+    widths(100, 100);
+    const qc = new QueryClient();
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={qc}>
+          <WidgetCard widget={textWidget("x")} editMode onDelete={vi.fn()} />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+
+    const el = screen.getByText("Text");
+    expect(el.parentElement).toHaveClass("min-w-0");
+    expect(el.parentElement).not.toHaveClass("min-w-[min(8rem,100%)]");
+    expect(screen.getByTestId("widget-title-group")).toHaveClass("min-w-[min(8rem,100%)]");
   });
 
   it("lets editor actions wrap below the title rather than squeeze it", () => {
@@ -275,5 +316,160 @@ describe("WidgetCard result footnote slot", () => {
     renderCard(vizWidget(3600));
 
     expect(screen.queryByTestId("widget-result-footnote")).not.toBeInTheDocument();
+  });
+});
+
+describe("WidgetCard verified badge", () => {
+  const withVerified = (verified: boolean): Widget => ({
+    ...vizWidget(null),
+    visualization: {
+      type: "TABLE",
+      options: {},
+      query: { id: 5, name: "Q", data_source_id: 1, parameter_names: [], options: {}, verified, is_published: true },
+    },
+  } as unknown as Widget);
+
+  it("shows a shield when the query is verified", () => {
+    renderCard(withVerified(true));
+
+    const icon = screen.getByRole("img", { name: "Verified by an admin" });
+    expect(icon).toBeInTheDocument();
+    expect(icon).not.toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("shows nothing when the query is not verified", () => {
+    renderCard(withVerified(false));
+
+    expect(screen.queryByRole("img", { name: "Verified by an admin" })).not.toBeInTheDocument();
+  });
+});
+
+describe("WidgetCard check badge and bell", () => {
+  afterEach(() => {
+    canCreateMonitor = true;
+  });
+
+  function withQuery(isPublished: boolean): Widget {
+    return {
+      ...vizWidget(null),
+      visualization: {
+        id: 5,
+        name: "Viz",
+        type: "table",
+        options: {},
+        query: { id: 42, is_published: isPublished },
+      },
+    } as unknown as Widget;
+  }
+
+  it("shows the bell and add-a-check link for a published query", () => {
+    renderCard(withQuery(true));
+
+    expect(screen.getByLabelText("Add a monitor for Viz")).toHaveAttribute("href", "/monitors/new?query_id=42");
+    expect(screen.getByRole("link", { name: "No checks · add one" })).toBeInTheDocument();
+  });
+
+  it("carries the tile origin on the bell and the add-one link when the dashboard is known", () => {
+    renderCard({ ...withQuery(true), id: 7 } as Widget, { dashboardSlug: "sales-q3" });
+
+    const href = "/monitors/new?query_id=42&from=tile&dashboard=sales-q3&widget=7";
+    expect(screen.getByLabelText("Add a monitor for Viz")).toHaveAttribute("href", href);
+    expect(screen.getByRole("link", { name: "No checks · add one" })).toHaveAttribute("href", href);
+  });
+
+  it("shows neither for an unpublished query", () => {
+    renderCard(withQuery(false));
+
+    expect(screen.queryByLabelText("Add a monitor for Viz")).not.toBeInTheDocument();
+    expect(screen.getByText("No checks")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /No checks/ })).not.toBeInTheDocument();
+  });
+
+  it("shows neither on public views", () => {
+    renderCard(withQuery(true), { publicView: true });
+
+    expect(screen.queryByLabelText("Add a monitor for Viz")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No checks/)).not.toBeInTheDocument();
+  });
+
+  it("shows a plain label without create_monitor", () => {
+    canCreateMonitor = false;
+    renderCard(withQuery(true));
+
+    expect(screen.queryByLabelText("Add a monitor for Viz")).not.toBeInTheDocument();
+    expect(screen.getByText("No checks")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /No checks/ })).not.toBeInTheDocument();
+  });
+});
+
+describe("WidgetCard tile menu", () => {
+  const widget = {
+    ...vizWidget(null),
+    viewer_can_read_data: true,
+    visualization: {
+      id: 5,
+      name: "Viz",
+      type: "table",
+      options: {},
+      query: { id: 42, name: "Revenue by region", is_published: true },
+    },
+  } as unknown as Widget;
+
+  it("lists explore, monitor and open-query items and navigates to the explore editor", async () => {
+    navigateSpy.mockClear();
+    const user = userEvent.setup();
+    renderCard(widget, { exploreSourceId: 9 });
+
+    await user.click(screen.getByRole("button", { name: "Tile menu for Viz" }));
+    expect(screen.getByRole("menuitem", { name: /Explore this tile/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Add a monitor" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Open query" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("menuitem", { name: /Explore this tile/ }));
+    expect(navigateSpy).toHaveBeenCalledWith("/queries/new", {
+      state: {
+        explore: { queryId: 42, queryName: "Revenue by region" },
+        dataSourceId: 9,
+        sql: expect.stringContaining("FROM query_42"),
+      },
+    });
+  });
+
+  it("sends the menu's add-a-monitor item to the form with the tile origin", async () => {
+    navigateSpy.mockClear();
+    const user = userEvent.setup();
+    renderCard({ ...widget, id: 7 } as Widget, { dashboardSlug: "sales-q3" });
+
+    await user.click(screen.getByRole("button", { name: "Tile menu for Viz" }));
+    await user.click(screen.getByRole("menuitem", { name: "Add a monitor" }));
+    expect(navigateSpy).toHaveBeenCalledWith("/monitors/new?query_id=42&from=tile&dashboard=sales-q3&widget=7");
+  });
+
+  it("omits explore when the viewer cannot read the data", async () => {
+    const user = userEvent.setup();
+    renderCard({ ...widget, viewer_can_read_data: false } as Widget, { exploreSourceId: 9 });
+
+    await user.click(screen.getByRole("button", { name: "Tile menu for Viz" }));
+    expect(screen.getByRole("menuitem", { name: "Open query" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Explore this tile/ })).not.toBeInTheDocument();
+  });
+
+  it("omits explore when the org has no query-results source", async () => {
+    const user = userEvent.setup();
+    renderCard(widget, { exploreSourceId: null });
+
+    await user.click(screen.getByRole("button", { name: "Tile menu for Viz" }));
+    expect(screen.getByRole("menuitem", { name: "Open query" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Explore this tile/ })).not.toBeInTheDocument();
+  });
+
+  it("has no menu on public views", () => {
+    renderCard(widget, { publicView: true, exploreSourceId: 9 });
+    expect(screen.queryByRole("button", { name: "Tile menu for Viz" })).not.toBeInTheDocument();
+  });
+
+  it("has no menu in edit mode", () => {
+    renderCard(widget, { editMode: true, exploreSourceId: 9 });
+    expect(screen.queryByRole("button", { name: "Tile menu for Viz" })).not.toBeInTheDocument();
   });
 });

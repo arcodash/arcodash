@@ -105,6 +105,18 @@ export function isStale(ageSecs: number, cadenceSecs: number | null): boolean {
   return cadenceSecs != null && ageSecs > 1.5 * cadenceSecs;
 }
 
+/** Human wording for an expected refresh cadence: `hourly`, `daily`, `weekly`, else `every 15 min`. */
+export function cadenceLabel(secs: number): string {
+  if (secs === 3600) return "hourly";
+  if (secs === 86400) return "daily";
+  if (secs === 604800) return "weekly";
+  const m = Math.round(secs / 60);
+  if (m < 60) return `every ${Math.max(1, m)} min`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `every ${h}h`;
+  return `every ${Math.round(h / 24)}d`;
+}
+
 /** Whether a schedule whose last run finished at `finishedMs` is stale at `nowMs`. */
 export function isScheduleStale(
   schedule: Pick<Schedule, "spec" | "next_run_at">,
@@ -213,4 +225,30 @@ export function useNow(active: boolean): number {
     return () => clearInterval(id);
   }, [active]);
   return now;
+}
+
+/** How old a query result may be before a monitor check reruns the query: an interval schedule's
+ * own period, else the worker's `MONITOR_DEFAULT_STALENESS_SECS`. Manual checks carry no schedule,
+ * so they always get the default (`evaluate_monitor.rs` `resolve_staleness_secs`).
+ * ponytail: 900 mirrors the worker default; surface it from the API if an operator ever changes it. */
+export const MONITOR_DEFAULT_REUSE_SECS = 900;
+
+export function monitorReuseWindowSecs(spec: ScheduleSpec | null | undefined): number {
+  return spec?.kind === "interval" ? spec.every_secs : MONITOR_DEFAULT_REUSE_SECS;
+}
+
+/** `900` -> "15 min", `3600` -> "1 h", `5400` -> "90 min", `86400` -> "24 h". */
+export function windowLabel(secs: number): string {
+  if (secs % 3600 === 0) return `${secs / 3600} h`;
+  if (secs % 60 === 0) return `${secs / 60} min`;
+  return `${secs}s`;
+}
+
+/** "Last check: data from 3 min ago", from the newest finished check that
+ * evaluated a concrete result; null when no check has used one yet. */
+export function lastCheckResultLine(runs: Run[], nowMs: number): string | null {
+  const run = runs.find((r) => r.finished_at != null && r.data_age_secs != null);
+  if (!run) return null;
+  const resultMs = Date.parse(run.finished_at!) - run.data_age_secs! * 1000;
+  return `Last check: data from ${timeAgo(resultMs, nowMs)}`;
 }

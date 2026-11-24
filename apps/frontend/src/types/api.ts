@@ -82,6 +82,8 @@ export interface DataSourceTypeField {
   enum?: unknown[];
   /** File-picker accept string (e.g. ".csv"), only meaningful when `type === "file"`. */
   accept?: string;
+  /** `"textarea"` = multi-line input (e.g. PEM keys; a single-line input strips their newlines). */
+  "x-widget"?: string;
 }
 
 export interface UploadDataSourceResponse {
@@ -217,6 +219,9 @@ export interface Query {
   row_count: number | null;
   created_at: string;
   updated_at: string;
+  /** Set while an admin vouches for the query. */
+  verified_at: string | null;
+  verified_by: number | null;
   caller: Caller;
 }
 
@@ -422,6 +427,13 @@ export interface MonitorTile {
   last_check_error?: string | null;
 }
 
+export interface CheckSummary {
+  total: number;
+  ok: number;
+  triggered: number;
+  unevaluable: number;
+}
+
 export interface Widget {
   id: number;
   dashboard_id: number;
@@ -434,6 +446,10 @@ export interface Widget {
       /** Parameter tokens referenced by the served SQL — the SQL text itself is never sent here. */
       parameter_names: string[];
       options: QueryOptions;
+      /** An admin vouches for the query. */
+      verified: boolean;
+      /** Live right now; tiles of a draft or unpublished query offer no monitor actions. */
+      is_published: boolean;
     };
   };
   /** Pre-loaded cached result data — only present on public dashboard responses. */
@@ -441,6 +457,8 @@ export interface Widget {
   freshness?: WidgetFreshness | null;
   /** Only for monitor-bound widgets. */
   monitors?: MonitorTile[] | null;
+  /** Visible, non-silenced monitor counts for a viz widget's query; absent when none. */
+  check_summary?: CheckSummary | null;
   /** Whether the viewer can read the underlying query results; `true` for text widgets. */
   viewer_can_read_data: boolean;
   text: string | null;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
@@ -82,6 +82,29 @@ describe("PublicDashboardPage", () => {
     expect(screen.getByText(/Powered by/)).toBeInTheDocument();
     const brand = screen.getByRole("link", { name: "arcodash" });
     expect(brand.getAttribute("href")).toMatch(/^https:\/\/www\.arcodash\.com\/.*utm_content=powered-by/);
+  });
+
+  it("never shows the new results pill or polls the private dashboard", async () => {
+    let privateCalls = 0;
+    server.use(
+      http.get(`${BASE}/api/dashboards/public/:token`, () => HttpResponse.json(makeDashboard())),
+      http.get(`${BASE}/api/dashboards/:slug`, () => {
+        privateCalls += 1;
+        return HttpResponse.json({});
+      }),
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderPublic();
+      await screen.findByText("Sales Overview");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(61_000);
+      });
+      expect(screen.queryByText(/New results available/)).toBeNull();
+      expect(privateCalls).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("titles the tab with the dashboard's own name, not a static section noun", async () => {

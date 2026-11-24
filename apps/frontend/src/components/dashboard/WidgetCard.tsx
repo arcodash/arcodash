@@ -1,9 +1,15 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { GripVertical, X } from "lucide-react";
+import { Bell, FileCode, GripVertical, MoreHorizontal, Search, ShieldCheck, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import { Link } from "react-router";
+import { Link, useNavigate } from "react-router";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Loader } from "@/components/ui/loader";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ApiError, api, apiErrorMessage } from "@/lib/api";
@@ -11,9 +17,14 @@ import { usePollJob } from "@/lib/jobs";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { getViz, toVizData } from "@/components/visualizations/registry";
 import { ResultFootnote, hasResultFootnote } from "@/components/ResultFootnote";
+import { exploreState } from "@/lib/explore";
+import { usePermissions } from "@/lib/permissions";
+import { newMonitorHref } from "@/lib/monitorLinks";
 import { TileFreshnessDot } from "./TileFreshnessDot";
+import { TileCheckBadge } from "./TileCheckBadge";
 import { MonitorWidget, computeMonitorCardMeta, type MonitorCardMeta } from "./MonitorWidget";
 import type { Widget, ResultData, ParamValue } from "@/types/api";
+import { resolveWidgetParams } from "@/lib/widgetParams";
 import type { QueryResultData } from "@/components/visualizations/registry";
 
 interface Props {
@@ -28,42 +39,24 @@ interface Props {
   publicView?: boolean;
   /** Rings the tile briefly to mark a freshly added widget. */
   highlight?: boolean;
-}
-
-function isCompleteParamValue(value: ParamValue | undefined): boolean {
-  if (value == null) return false;
-  if (Array.isArray(value)) return value.length > 0;
-  if (typeof value === "object") return Boolean(value.start) && Boolean(value.end);
-  if (typeof value === "number") return true;
-  return value !== "";
-}
-
-/** Narrows the dashboard param bag to the tokens this widget's SQL uses, only if each has a
- * complete value; else `undefined` so a partial set (half-typed range, unrelated param) never
- * reaches `execute`. */
-export function resolveWidgetParams(
-  tokens: string[] | undefined,
-  dashboardParams: Record<string, ParamValue> | undefined,
-): Record<string, ParamValue> | undefined {
-  if (!tokens || tokens.length === 0 || !dashboardParams) return undefined;
-
-  const resolved: Record<string, ParamValue> = {};
-  for (const token of tokens) {
-    const value = dashboardParams[token];
-    if (!isCompleteParamValue(value)) return undefined;
-    resolved[token] = value;
-  }
-  return resolved;
+  /** Query Results data source id; tiles offer "Explore this tile" only when set. */
+  exploreSourceId?: number | null;
+  /** Dashboard this tile belongs to; carried into the new-monitor form so it can return here. */
+  dashboardSlug?: string;
+  /** Reports the `retrieved_at` of the latest result this tile has rendered. */
+  onResultShown?: (widgetId: number, retrievedAt: string) => void;
 }
 
 const VizWidget = memo(function VizWidget({
   widget,
   dashboardParams,
   refreshKey,
+  onShown,
 }: {
   widget: Widget;
   dashboardParams?: Record<string, ParamValue>;
   refreshKey?: number;
+  onShown?: (retrievedAt: string) => void;
 }) {
   const viz = widget.visualization;
   const preloaded = widget.query_result_data;
@@ -131,8 +124,16 @@ const VizWidget = memo(function VizWidget({
   }, [job.isSuccess, job.queryResultId]);
 
   const rawQueryResult = (
-    resultQuery.data as ({ query_result?: { data: ResultData } } & Record<string, unknown>) | undefined
+    resultQuery.data as
+      | ({ query_result?: { data: ResultData; retrieved_at?: string } } & Record<string, unknown>)
+      | undefined
   )?.query_result;
+
+  const shownRetrievedAt = rawQueryResult?.retrieved_at;
+  const settled = !hasParams && !resultQuery.isPlaceholderData;
+  useEffect(() => {
+    if (shownRetrievedAt && settled) onShown?.(shownRetrievedAt);
+  }, [shownRetrievedAt, settled, onShown]);
 
   const preloadedData = useMemo(() => (preloaded ? toVizData(preloaded) : null), [preloaded]);
   const fetchedData = useMemo(
@@ -247,7 +248,17 @@ function TextWidget({ text }: { text: string | null }) {
   );
 }
 
-function TruncatedTitle({ title, href, minW = "min-w-[min(8rem,100%)]" }: { title: string; href?: string; minW?: string }) {
+function TruncatedTitle({
+  title,
+  href,
+  minW = "min-w-[min(8rem,100%)]",
+  verified = false,
+}: {
+  title: string;
+  href?: string;
+  minW?: string;
+  verified?: boolean;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   return (
@@ -259,22 +270,127 @@ function TruncatedTitle({ title, href, minW = "min-w-[min(8rem,100%)]" }: { titl
       }}
     >
       <TooltipTrigger asChild>
-        {/* The clamp lives on a block wrapper so a link title clamps too (an inline <a> can't). */}
-        <div ref={ref} className={`${minW} flex-1 break-words font-serif text-base font-medium leading-snug line-clamp-3`}>
-          {href ? (
-            <Link
-              to={href}
-              className="outline-none after:absolute after:inset-0 after:content-[''] hover:underline"
-            >
-              {title}
-            </Link>
-          ) : (
-            title
+        <div className={`${minW} flex flex-1 items-start gap-1`}>
+          {/* The clamp lives on a block wrapper so a link title clamps too (an inline <a> can't). */}
+          <div ref={ref} className="min-w-0 flex-1 break-words font-serif text-base font-medium leading-snug line-clamp-3">
+            {href ? (
+              <Link
+                to={href}
+                className="outline-none after:absolute after:inset-0 after:content-[''] hover:underline"
+              >
+                {title}
+              </Link>
+            ) : (
+              title
+            )}
+          </div>
+          {verified && (
+            <ShieldCheck
+              role="img"
+              aria-label="Verified by an admin"
+              className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-600"
+            />
           )}
         </div>
       </TooltipTrigger>
       <TooltipContent>{title}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/** Private-view only: `usePermissions` hits the session endpoint, which public embeds must not. */
+function useCanAddMonitor(published: boolean): boolean {
+  const { has } = usePermissions();
+  return published && has("create_monitor");
+}
+
+function TileMenu({
+  query,
+  title,
+  exploreSourceId,
+  canReadData,
+  addMonitorHref,
+}: {
+  query: { id: number; name: string; is_published: boolean };
+  title: string;
+  exploreSourceId?: number | null;
+  canReadData: boolean;
+  addMonitorHref: string;
+}) {
+  const { has } = usePermissions();
+  const navigate = useNavigate();
+  const canMonitor = useCanAddMonitor(query.is_published);
+  const canExplore = exploreSourceId != null && canReadData && has("create_query");
+  return (
+    <div className="ml-auto flex shrink-0 items-center gap-0.5">
+      {canMonitor && (
+        <Button asChild variant="ghost" size="icon" className="h-6 w-6 shrink-0 text-muted-foreground">
+          <Link
+            to={addMonitorHref}
+            aria-label={`Add a monitor for ${title}`}
+            title={`Add a monitor for ${title}`}
+          >
+            <Bell className="h-3.5 w-3.5" />
+          </Link>
+        </Button>
+      )}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0 text-muted-foreground"
+            aria-label={`Tile menu for ${title}`}
+          >
+            <MoreHorizontal className="h-3.5 w-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          {canExplore && (
+            <DropdownMenuItem
+              onSelect={() => navigate("/queries/new", { state: exploreState(query.id, query.name, exploreSourceId) })}
+            >
+              <Search className="h-4 w-4" />
+              <span className="flex flex-col">
+                <span>Explore this tile</span>
+                <span className="text-xs text-muted-foreground">Draft query on the cached result</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+          {canMonitor && (
+            <DropdownMenuItem onSelect={() => navigate(addMonitorHref)}>
+              <Bell className="h-4 w-4" />
+              Add a monitor
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onSelect={() => navigate(`/queries/${query.id}`)}>
+            <FileCode className="h-4 w-4" />
+            Open query
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+function TileCheckSlot({
+  summary,
+  queryId,
+  published,
+  addMonitorHref,
+}: {
+  summary: Widget["check_summary"];
+  queryId: number;
+  published: boolean;
+  addMonitorHref: string;
+}) {
+  return (
+    <TileCheckBadge
+      summary={summary}
+      queryId={queryId}
+      canAddMonitor={useCanAddMonitor(published)}
+      addMonitorHref={addMonitorHref}
+    />
   );
 }
 
@@ -308,17 +424,35 @@ export const WidgetCard = memo(function WidgetCard({
   refreshKey,
   publicView,
   highlight,
+  exploreSourceId,
+  dashboardSlug,
+  onResultShown,
 }: Props) {
   // `widget.monitors` is present (even empty) whenever the widget is monitor-bound, so a public
   // widget whose monitors all fail the viewer gate stays a monitor card.
+  const [shownAt, setShownAt] = useState<string | null>(null);
+  const widgetId = widget.id;
+  const handleShown = useCallback(
+    (at: string) => {
+      setShownAt(at);
+      onResultShown?.(widgetId, at);
+    },
+    [widgetId, onResultShown],
+  );
   const isMonitor = isMonitorWidget(widget);
   const monitorMeta = isMonitor ? computeMonitorCardMeta(widget) : null;
   const title = monitorMeta ? monitorMeta.title : widgetTitle(widget);
 
+  const verified = widget.visualization?.query?.verified === true;
   const linkMonitors = !editMode && !publicView;
   const monitorHref =
     linkMonitors && monitorMeta?.monitorId != null ? `/monitors/${monitorMeta.monitorId}` : undefined;
+  const showFooter = !editMode && !publicView && widget.visualization_id != null;
   const chrome = CHROME[monitorMeta?.treatment ?? "neutral"];
+  const query = widget.visualization?.query;
+  const addMonitorHref = query
+    ? newMonitorHref(query.id, dashboardSlug ? { dashboardSlug, widgetId: widget.id } : undefined)
+    : "";
 
   return (
     <div
@@ -332,10 +466,10 @@ export const WidgetCard = memo(function WidgetCard({
         {draggable ? (
           <div data-testid="widget-title-group" className="flex min-w-[min(8rem,100%)] flex-1 items-start gap-1.5">
             <GripVertical aria-hidden className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <TruncatedTitle title={title} href={monitorHref} minW="min-w-0" />
+            <TruncatedTitle title={title} href={monitorHref} minW="min-w-0" verified={verified} />
           </div>
         ) : (
-          <TruncatedTitle title={title} href={monitorHref} />
+          <TruncatedTitle title={title} href={monitorHref} verified={verified} />
         )}
         {editMode && (
           <div className="ml-auto flex shrink-0 items-center gap-1">
@@ -351,29 +485,46 @@ export const WidgetCard = memo(function WidgetCard({
             </Button>
           </div>
         )}
-        {!editMode &&
+        {showFooter && query != null && <TileMenu query={query} title={title} exploreSourceId={exploreSourceId} canReadData={widget.viewer_can_read_data} addMonitorHref={addMonitorHref} />}
+        {publicView &&
+          !editMode &&
           widget.visualization_id != null &&
           widget.freshness &&
-          (!publicView || widget.freshness.expected_interval_secs != null) && (
-          <TileFreshnessDot freshness={widget.freshness} alwaysShowAge={publicView ?? false} />
-        )}
+          widget.freshness.expected_interval_secs != null && (
+            <TileFreshnessDot freshness={widget.freshness} />
+          )}
       </div>
       <div className="min-h-0 flex-1 overflow-hidden p-2">
         {widget.visualization_id != null ? (
-          <VizWidget widget={widget} dashboardParams={dashboardParams} refreshKey={refreshKey} />
+          <VizWidget widget={widget} dashboardParams={dashboardParams} refreshKey={refreshKey} onShown={handleShown} />
         ) : isMonitor ? (
           <MonitorWidget widget={widget} linkable={linkMonitors} />
         ) : (
           <TextWidget text={widget.text} />
         )}
       </div>
+      {showFooter && (
+        <div
+          data-testid="tile-footer"
+          className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs"
+        >
+          {widget.freshness && (
+            <TileFreshnessDot
+              freshness={shownAt ? { ...widget.freshness, retrieved_at: shownAt } : widget.freshness}
+            />
+          )}
+          {query != null && (
+            <TileCheckSlot summary={widget.check_summary} queryId={query.id} published={query.is_published} addMonitorHref={addMonitorHref} />
+          )}
+        </div>
+      )}
       {!editMode && widget.visualization_id != null && hasResultFootnote() && (
         <div
           data-testid="widget-result-footnote"
           className="min-w-0 truncate px-3 pb-2 text-xs text-muted-foreground"
         >
           <ResultFootnote
-            retrievedAt={widget.freshness?.retrieved_at}
+            retrievedAt={shownAt ?? widget.freshness?.retrieved_at}
             placement="widget"
             publicView={publicView}
           />

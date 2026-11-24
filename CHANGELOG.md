@@ -16,6 +16,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   values).
 - `RESULT_RETENTION_DAYS` (default 7): stored results unused for that long are deleted.
 - `STORAGE_BACKFILL_RETRY_SECS` (default 3600): wait before a backfill pass with skipped rows repeats.
+- Snowflake: encrypted private keys (`ENCRYPTED PRIVATE KEY`, AES or 3DES) with a new
+  `private_key_passphrase` field.
 
 ### Changed
 
@@ -29,6 +31,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--confirm` would clear.
 - API responses carry `Cache-Control: no-store` by default.
 - Error text stored or returned to clients has customer values scrubbed.
+
+### Fixed
+
+- Data source form renders multi-line fields (Snowflake private key, BigQuery service account
+  JSON) as a textarea, so pasted PEM keys keep their line breaks.
+
+## [0.2.0] - 2026-11-21
+
+### Added
+
+- Dashboard tiles show the age of the result they render, in a tile footer.
+- Dashboard header line with the oldest result on the page and a summary of the checks behind it.
+- Check badge and monitor bell on tiles whose query has checks; the bell opens the monitor with
+  the tile and dashboard as context and Baseline preselected.
+- Verified queries: admins can mark a query verified (recorded in the audit log); its tiles show
+  a shield.
+- Tile menu with Explore this tile, which opens the tile's data over Query Results.
+- New results pill on dashboards, refreshing only the tiles whose result changed.
+- Monitors show the data age the last check evaluated, and a Refresh data button that reruns the
+  watched query without evaluating the condition.
+
+### Changed
+
+- A monitor's latest incident collapses to one line once the monitor stops firing.
 
 ## [0.1.0] - 2026-11-08
 
@@ -51,5 +77,6 @@ Initial open-source release.
 - Admin area and audit log.
 - REST API.
 
-[Unreleased]: https://github.com/arcodash/arcodash/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/arcodash/arcodash/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/arcodash/arcodash/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/arcodash/arcodash/releases/tag/v0.1.0

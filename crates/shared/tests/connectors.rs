@@ -1543,6 +1543,7 @@ mod snowflake {
             "account": account,
             "user": user,
             "private_key": private_key,
+            "private_key_passphrase": std::env::var("TEST_SNOWFLAKE_PRIVATE_KEY_PASSPHRASE").ok(),
             "warehouse": std::env::var("TEST_SNOWFLAKE_WAREHOUSE").ok(),
             "database": std::env::var("TEST_SNOWFLAKE_DATABASE").ok(),
             "schema": std::env::var("TEST_SNOWFLAKE_SCHEMA").ok(),

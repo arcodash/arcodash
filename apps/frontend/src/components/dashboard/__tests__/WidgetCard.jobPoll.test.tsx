@@ -1,10 +1,13 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { MemoryRouter } from "react-router";
 import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { server } from "@/__tests__/msw-server";
 import { WidgetCard } from "../WidgetCard";
 import type { Widget } from "@/types/api";
+
+vi.mock("@/lib/permissions", () => ({ usePermissions: () => ({ has: () => true, hasAny: () => true }) }));
 
 const BASE = "http://localhost:8080";
 
@@ -21,7 +24,7 @@ function tableWidget(overrides: Partial<Widget> = {}): Widget {
       options: {},
       created_at: "2026-01-01T00:00:00.000Z",
       updated_at: "2026-01-01T00:00:00.000Z",
-      query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: [], options: {} },
+      query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: [], options: {}, verified: false, is_published: true },
     },
     query_result_data: null,
     viewer_can_read_data: true,
@@ -37,9 +40,9 @@ function tableWidget(overrides: Partial<Widget> = {}): Widget {
 function renderCard(widget: Widget) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <QueryClientProvider client={qc}>
+    <MemoryRouter><QueryClientProvider client={qc}>
       <WidgetCard widget={widget} editMode={false} onDelete={() => {}} />
-    </QueryClientProvider>,
+    </QueryClientProvider></MemoryRouter>,
   );
 }
 
@@ -226,9 +229,9 @@ describe("WidgetCard job-poll flow", () => {
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
-      <QueryClientProvider client={qc}>
+      <MemoryRouter><QueryClientProvider client={qc}>
         <WidgetCard widget={tableWidget()} editMode={false} onDelete={() => {}} refreshKey={0} />
-      </QueryClientProvider>,
+      </QueryClientProvider></MemoryRouter>,
     );
     await screen.findByText("1");
 
@@ -252,9 +255,9 @@ describe("WidgetCard job-poll flow", () => {
 
   function renderTick(qc: QueryClient, refreshKey: number) {
     return (
-      <QueryClientProvider client={qc}>
+      <MemoryRouter><QueryClientProvider client={qc}>
         <WidgetCard widget={tableWidget()} editMode={false} onDelete={() => {}} refreshKey={refreshKey} />
-      </QueryClientProvider>
+      </QueryClientProvider></MemoryRouter>
     );
   }
 
@@ -388,20 +391,20 @@ describe("WidgetCard job-poll flow", () => {
           options: {},
           created_at: "2026-01-01T00:00:00.000Z",
           updated_at: "2026-01-01T00:00:00.000Z",
-          query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: ["region"], options: {} },
+          query: { id: 5, name: "Signups query", data_source_id: 1, parameter_names: ["region"], options: {}, verified: false, is_published: true },
         },
       });
     }
     function renderParams(qc: QueryClient, region: string) {
       return (
-        <QueryClientProvider client={qc}>
+        <MemoryRouter><QueryClientProvider client={qc}>
           <WidgetCard
             widget={paramWidget()}
             editMode={false}
             onDelete={() => {}}
             dashboardParams={{ region }}
           />
-        </QueryClientProvider>
+        </QueryClientProvider></MemoryRouter>
       );
     }
 
@@ -436,5 +439,53 @@ describe("WidgetCard job-poll flow", () => {
     // running state.
     await waitFor(() => expect(screen.getByText(/running/i)).toBeInTheDocument());
     expect(screen.queryByText("1")).not.toBeInTheDocument();
+  });
+
+  describe("rendered result reporting", () => {
+    function resultAt(retrievedAt: string) {
+      return HttpResponse.json({
+        query_result: {
+          id: 1,
+          data_source_id: 1,
+          query: "SELECT 1",
+          query_hash: "h",
+          data: { columns: [{ name: "n", friendly_type: "integer" }], rows: [{ n: 7 }] },
+          runtime: 0.01,
+          retrieved_at: retrievedAt,
+        },
+      });
+    }
+
+    it("reports the rendered retrieved_at", async () => {
+      server.use(http.get(`${BASE}/api/queries/5/results`, () => resultAt("2026-11-15T10:00:00Z")));
+      const onResultShown = vi.fn();
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <MemoryRouter><QueryClientProvider client={qc}>
+          <WidgetCard widget={tableWidget()} editMode={false} onDelete={() => {}} onResultShown={onResultShown} />
+        </QueryClientProvider></MemoryRouter>,
+      );
+      await screen.findByText("7");
+      await waitFor(() => expect(onResultShown).toHaveBeenCalledWith(1, "2026-11-15T10:00:00Z"));
+    });
+
+    it("footer age follows the rendered result", async () => {
+      const now = Date.now();
+      server.use(
+        http.get(`${BASE}/api/queries/5/results`, () => resultAt(new Date(now - 2 * 3600_000).toISOString())),
+      );
+      const widget = tableWidget({
+        freshness: {
+          retrieved_at: new Date(now - 60_000).toISOString(),
+          expected_interval_secs: null,
+          last_run_status: "success",
+        },
+      });
+      renderCard(widget);
+      await screen.findByText("7");
+      const footer = await screen.findByTestId("tile-footer");
+      await waitFor(() => expect(footer).toHaveTextContent("2h ago"));
+      expect(footer).not.toHaveTextContent("1m ago");
+    });
   });
 });

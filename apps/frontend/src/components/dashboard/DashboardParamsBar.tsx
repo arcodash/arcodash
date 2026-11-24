@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import { AlertTriangle } from "lucide-react";
 import { Input } from "@/components/ui/input";
@@ -16,6 +16,8 @@ import type {
 interface Props {
   widgets: Widget[];
   onParamsChange: (params: Record<string, ParamValue>) => void;
+  /** Rendered last, right-aligned. */
+  trailing?: ReactNode;
 }
 
 interface ResolvedParam {
@@ -109,7 +111,7 @@ export function serializeValuesToSearch(values: Record<string, ParamValue>): Rec
   return out;
 }
 
-export function DashboardParamsBar({ widgets, onParamsChange }: Props) {
+export function DashboardParamsBar({ widgets, onParamsChange, trailing }: Props) {
   const resolved = useMemo(() => resolveDashboardParams(widgets), [widgets]);
   const definitions = useMemo(
     () => resolved.flatMap((r) => (r.definition ? [r.definition] : [])),
@@ -190,6 +192,7 @@ export function DashboardParamsBar({ widgets, onParamsChange }: Props) {
           </div>
         );
       })}
+      {trailing && <div className="ml-auto self-center">{trailing}</div>}
     </div>
   );
 }

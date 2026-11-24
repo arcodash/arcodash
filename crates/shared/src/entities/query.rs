@@ -44,6 +44,9 @@ pub struct Model {
     /// is untouched by this — it still means "ever published" for restore/history purposes; this
     /// column is the separate "is it live right now" bit. See `query_service::is_published`.
     pub unpublished_at: Option<DateTimeWithTimeZone>,
+    /// Admin attestation, independent of the publish lifecycle; both are set or cleared together.
+    pub verified_at: Option<DateTimeWithTimeZone>,
+    pub verified_by: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

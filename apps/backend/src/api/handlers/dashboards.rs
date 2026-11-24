@@ -88,6 +88,10 @@ pub struct QuerySummary {
     /// Served `options` (parameter definitions included), so the param bar can resolve each
     /// `{{token}}` without a second fetch.
     pub options: Value,
+    /// An admin vouches for the query.
+    pub verified: bool,
+    /// Live right now; tiles of a draft or unpublished query offer no monitor actions.
+    pub is_published: bool,
 }
 
 impl From<query::Model> for QuerySummary {
@@ -106,6 +110,8 @@ impl From<query::Model> for QuerySummary {
             data_source_id: resolved.data_source_id,
             parameter_names,
             options: resolved.options,
+            verified: q.verified_at.is_some(),
+            is_published: crate::services::query_service::is_published(&q),
         }
     }
 }
@@ -137,6 +143,10 @@ pub struct WidgetResponse {
     /// malformed; ids the viewer can't see are dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitors: Option<Vec<monitor_service::MonitorTile>>,
+    /// Monitor counts by state for a viz widget's query, over monitors the viewer can see and that
+    /// are not silenced; absent when there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_summary: Option<monitor_service::CheckSummary>,
     /// Whether the viewer can read this widget's query results (as `/api/queries/:id/results`);
     /// `true` for a text widget. Lets the frontend tell "never run" from "you can't see this".
     pub viewer_can_read_data: bool,
@@ -153,6 +163,7 @@ fn widget_response(
     freshness: Option<dashboard_service::WidgetFreshness>,
     viewer_can_read_data: bool,
     monitors: Option<Vec<monitor_service::MonitorTile>>,
+    check_summary: Option<monitor_service::CheckSummary>,
 ) -> WidgetResponse {
     let visualization = viz.map(|v| VizWithQuery {
         viz: VisualizationResponse::from(v),
@@ -169,6 +180,7 @@ fn widget_response(
         query_result_data,
         freshness,
         monitors,
+        check_summary,
         viewer_can_read_data,
         created_at: w.created_at.with_timezone(&Utc),
         updated_at: w.updated_at.with_timezone(&Utc),
@@ -389,6 +401,7 @@ async fn widget_responses_with_freshness(
         .collect();
     let fresh = dashboard_service::load_widget_freshness(db, &query_ids).await?;
     let access = dashboard_service::load_viewer_query_access(db, user, &query_ids).await?;
+    let checks = monitor_service::check_summaries(db, user.org_id, user, &query_ids).await?;
 
     // One visibility-filtered load and one enrichment call for all monitor tiles, sliced back per
     // widget in configured order.
@@ -431,17 +444,27 @@ async fn widget_responses_with_freshness(
                         .filter_map(|id| monitor_tiles.get(&id).cloned())
                         .collect::<Vec<_>>()
                 });
-            let (viz, q, freshness, can_read) = match item.viz_and_query {
+            let (viz, q, freshness, can_read, check) = match item.viz_and_query {
                 Some((v, q)) => {
                     let freshness = fresh.get(&v.query_id).cloned();
                     // No entry can't happen here; default to visible rather than falsely
                     // restricting.
                     let can_read = access.get(&v.query_id).copied().unwrap_or(true);
-                    (Some(v), q, freshness, can_read)
+                    let check = checks.get(&v.query_id).cloned();
+                    (Some(v), q, freshness, can_read, check)
                 }
-                None => (None, None, None, true),
+                None => (None, None, None, true, None),
             };
-            widget_response(item.widget, viz, q, None, freshness, can_read, monitors)
+            widget_response(
+                item.widget,
+                viz,
+                q,
+                None,
+                freshness,
+                can_read,
+                monitors,
+                check,
+            )
         })
         .collect())
 }

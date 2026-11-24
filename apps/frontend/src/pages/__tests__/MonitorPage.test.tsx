@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -216,5 +216,82 @@ describe("MonitorPage AI prefill", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText("detail")).toBeInTheDocument();
     expect(mocked.createQuery).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("MonitorPage tile origin", () => {
+  const suggestion = {
+    name: "Signups drop",
+    kind: "threshold" as const,
+    column: "signups",
+    sensitivity: null,
+    op: "<",
+    value: 40,
+    definition: "d",
+    why: "w",
+    confidence: "medium" as const,
+  };
+
+  function setupTile(search: string, state?: unknown, widgetQueryId = 7) {
+    mocked.listQueries.mockResolvedValue([{ id: 7, name: "Q7", latest_query_data_id: 1 }]);
+    mocked.listDataSources.mockResolvedValue({ data_sources: [{ id: 3, name: "Warehouse" }], can_create: true });
+    mocked.getLatestQueryResult.mockResolvedValue({
+      query_result: { data: { rows: [], columns: [{ name: "signups", friendly_type: "integer" }] } },
+    });
+    mocked.getDashboard.mockResolvedValue({
+      name: "Sales Q3",
+      slug: "sales-q3",
+      widgets: [{ id: 3, visualization: { name: "Revenue by region", query: { id: widgetQueryId } } }],
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[{ pathname: "/monitors/new", search, state }]}>
+          <Routes>
+            <Route path="/monitors/new" element={<MonitorPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("defaults to Threshold without from=tile", async () => {
+    setupTile("?query_id=7");
+    expect(await screen.findByRole("button", { name: "Threshold" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByText(/Started from/)).not.toBeInTheDocument();
+  });
+
+  it("preselects Baseline from a tile", async () => {
+    setupTile("?query_id=7&from=tile&dashboard=sales-q3&widget=3");
+    expect(await screen.findByRole("button", { name: "Baseline" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("Suggested for this tile")).toBeInTheDocument();
+    const note = await screen.findByRole("note");
+    await waitFor(() => expect(note.querySelector("strong")).toHaveTextContent("Revenue by region"));
+    expect(screen.getByRole("link", { name: "Sales Q3" })).toHaveAttribute("href", "/dashboard/sales-q3");
+    expect(note).toHaveTextContent("Query is prefilled.");
+  });
+
+  it("shows a generic note when the tile does not match", async () => {
+    setupTile("?query_id=7&from=tile&dashboard=sales-q3&widget=999");
+    expect(await screen.findByText("Started from a dashboard tile. Query is prefilled.")).toBeInTheDocument();
+    await waitFor(() => expect(mocked.getDashboard).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.getByText("Started from a dashboard tile. Query is prefilled.")).toBeInTheDocument();
+    expect(screen.queryByText("Sales Q3")).not.toBeInTheDocument();
+  });
+
+  it("shows a generic note when the tile belongs to a different query", async () => {
+    setupTile("?query_id=7&from=tile&dashboard=sales-q3&widget=3", undefined, 8);
+    expect(await screen.findByText("Started from a dashboard tile. Query is prefilled.")).toBeInTheDocument();
+    await waitFor(() => expect(mocked.getDashboard).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.getByText("Started from a dashboard tile. Query is prefilled.")).toBeInTheDocument();
+    expect(screen.queryByText("Sales Q3")).not.toBeInTheDocument();
+  });
+
+  it("lets an AI suggestion kind win over the tile default", async () => {
+    setupTile("?query_id=7&from=tile&dashboard=sales-q3&widget=3", { aiSuggestion: suggestion });
+    expect(await screen.findByDisplayValue("Signups drop")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Threshold" })).toHaveAttribute("aria-pressed", "true");
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { render as rtlRender, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import type { ReactElement } from "react";
@@ -6,6 +6,7 @@ import { MonitorWidget } from "../MonitorWidget";
 import { WidgetCard } from "../WidgetCard";
 import type { MonitorTile, Widget } from "@/types/api";
 
+vi.mock("@/lib/permissions", () => ({ usePermissions: () => ({ has: () => true, hasAny: () => true }) }));
 const render = (ui: ReactElement) => rtlRender(<MemoryRouter>{ui}</MemoryRouter>);
 
 function tile(overrides: Partial<MonitorTile> = {}): MonitorTile {

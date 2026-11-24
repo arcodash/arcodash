@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { ColumnResizeHandle } from "@/components/common/ColumnResizeHandle";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate, useSearchParams } from "react-router";
 import { BellRing, Clock, Plus, Sparkles, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -198,6 +198,9 @@ function MonitorCard({ monitor: a, schedule, unsubscribed, onDeleteClick }: RowP
 export function MonitorsPage() {
   const nameCol = useResizableColumn("arcodash.listcol.monitors.name");
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const queryIdParam = Number(searchParams.get("query_id"));
+  const queryId = Number.isInteger(queryIdParam) && queryIdParam > 0 ? queryIdParam : undefined;
   const qc = useQueryClient();
   const { has } = usePermissions();
   const canCreate = has("create_monitor");
@@ -216,8 +219,8 @@ export function MonitorsPage() {
   const { view, setView, isMobile } = useListView("list-view:monitors");
 
   const monitorsQuery = useQuery({
-    queryKey: ["monitors", scope],
-    queryFn: () => api.listMonitors(scope === "all" ? undefined : scope),
+    queryKey: ["monitors", scope, queryId],
+    queryFn: () => api.listMonitors(scope === "all" ? undefined : scope, queryId),
   });
   // Same queryKey shape as the monitor detail page's subscriptions fetch, so they share one cache
   // entry.
@@ -242,7 +245,7 @@ export function MonitorsPage() {
 
   // No `q=` param on GET /api/monitors; the full list is fetched, so search filters in memory.
   const filtered = (monitorsQuery.data ?? []).filter((m) => matchesSearch(debouncedSearch, m.name, m.query.name));
-  const filtersActive = search !== "" || scope !== "all";
+  const filtersActive = search !== "" || scope !== "all" || queryId != null;
 
   const deleteMutation = useMutation({
     mutationFn: (id: number) => api.deleteMonitor(id),
@@ -292,6 +295,25 @@ export function MonitorsPage() {
         onViewChange={setView}
         showViewToggle={!isMobile}
       />
+
+      {queryId != null && (
+        <button
+          type="button"
+          className="text-sm text-muted-foreground underline-offset-2 hover:underline"
+          onClick={() =>
+            setSearchParams(
+              (prev) => {
+                const next = new URLSearchParams(prev);
+                next.delete("query_id");
+                return next;
+              },
+              { replace: true },
+            )
+          }
+        >
+          Filtered to one query · clear
+        </button>
+      )}
 
       {monitorsQuery.isLoading && <PageLoader />}
       {monitorsQuery.isError && (

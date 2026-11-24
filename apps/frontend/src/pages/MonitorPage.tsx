@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, Bell, ChevronDown, SearchX, Sparkles, Workflow } from "lucide-react";
@@ -24,6 +24,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useTransientMessage } from "@/hooks/useTransientMessage";
 import { ApiError, api, apiErrorMessage } from "@/lib/api";
 import { RichText } from "@/components/monitors/richText";
+import { parseTileOrigin, resolveTileLabel } from "@/lib/tileOrigin";
 import { usePermissions } from "@/lib/permissions";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { exactTs, useNow } from "@/lib/scheduling";
@@ -138,7 +139,15 @@ export function MonitorPage() {
   // Pre-selects the query when arriving from its "Add monitor" link; a loaded monitor overwrites
   // it.
   const [queryId, setQueryId] = useState<string>(() => searchParams.get("query_id") ?? "");
-  const [kind, setKind] = useState<MonitorKind>("threshold");
+  const tileOrigin = useMemo(() => (isNew ? parseTileOrigin(searchParams) : null), [isNew, searchParams]);
+  const [kind, setKind] = useState<MonitorKind>(() => (tileOrigin ? "baseline" : "threshold"));
+  const tileDashboardQ = useQuery({
+    queryKey: ["dashboard", tileOrigin?.dashboardSlug, false],
+    queryFn: () => api.getDashboard(tileOrigin!.dashboardSlug, { draft: false }),
+    enabled: tileOrigin != null,
+    retry: false,
+  });
+  const tileLabel = tileOrigin ? resolveTileLabel(tileDashboardQ.data, tileOrigin, Number(searchParams.get("query_id"))) : null;
   const [sensitivity, setSensitivity] = useState<Sensitivity>("medium");
   const [column, setColumn] = useState("");
   const [op, setOp] = useState<string>(">");
@@ -713,6 +722,24 @@ export function MonitorPage() {
               </>
             )}
           </div>
+          {tileOrigin && (
+            <p role="note" className="mt-3 flex items-start gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-sm text-foreground">
+              <Bell className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>
+                {tileLabel ? (
+                  <>
+                    Started from the tile <strong>{tileLabel.tileTitle}</strong> on{" "}
+                    <Link to={`/dashboard/${tileOrigin.dashboardSlug}`} className="underline">
+                      {tileLabel.dashboardName}
+                    </Link>
+                    . Query is prefilled.
+                  </>
+                ) : (
+                  "Started from a dashboard tile. Query is prefilled."
+                )}
+              </span>
+            </p>
+          )}
         </div>
         {!isNew && monitorQuery.data && (
           <div className="flex flex-wrap shrink-0 items-center gap-2">
@@ -831,7 +858,13 @@ export function MonitorPage() {
       <FeedbackLine feedback={snoozeFeedback} />
       <FeedbackLine feedback={ackFeedback} />
 
-      {!isNew && latestIncident && <LatestIncidentCard observation={latestIncident} onViewRun={viewRun} />}
+      {!isNew && latestIncident && (
+        <LatestIncidentCard
+          observation={latestIncident}
+          onViewRun={viewRun}
+          firing={monitorQuery.data?.state === "triggered"}
+        />
+      )}
 
       {monitorQuery.isLoading && <PageLoader />}
 
@@ -937,7 +970,13 @@ export function MonitorPage() {
 
         <div>
           <p id="monitor-kind-label" className="text-sm font-medium">Alert type</p>
-          <MonitorKindToggle value={kind} onChange={setKind} disabled={!canSave} labelId="monitor-kind-label" />
+          <MonitorKindToggle
+            value={kind}
+            onChange={setKind}
+            disabled={!canSave}
+            labelId="monitor-kind-label"
+            suggested={tileOrigin ? "baseline" : undefined}
+          />
           <p className="mt-1 text-xs text-muted-foreground">
             {kind === "baseline"
               ? "Alerts when the value moves well outside its recent pattern. Needs 7 checks before it can alert."

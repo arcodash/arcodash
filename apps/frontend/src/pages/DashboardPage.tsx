@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTransientMessage } from "@/hooks/useTransientMessage";
 import { useParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { DropdownMenuItem, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { ActionBar, type ActionItem } from "@/components/common/ActionBar";
+import { DashboardHealthLine } from "@/components/dashboard/DashboardHealthLine";
 import { EmptyState } from "@/components/common/EmptyState";
 import { TagEditor } from "@/components/common/TagEditor";
 import { UnpublishedBadge } from "@/components/common/StateBadge";
@@ -18,7 +19,9 @@ import { cn } from "@/lib/utils";
 import { api, apiErrorMessage } from "@/lib/api";
 import { effectiveState, publishDialogCopy } from "@/lib/effectiveState";
 import { DashboardGrid } from "@/components/dashboard/DashboardGrid";
-import { DashboardParamsBar } from "@/components/dashboard/DashboardParamsBar";
+import { NewResultsPill } from "@/components/dashboard/NewResultsPill";
+import { newResultsEnabled, staleTileIds, useLatestWidgets } from "@/lib/newResults";
+import { DashboardParamsBar, resolveDashboardParams } from "@/components/dashboard/DashboardParamsBar";
 import { AddWidgetDialog } from "@/components/dashboard/AddWidgetDialog";
 import { AddWithAiBar, type WidgetCreated } from "@/components/dashboard/AddWithAiBar";
 import { ShareEmbedDialog } from "@/components/share/ShareEmbedDialog";
@@ -83,6 +86,18 @@ export function DashboardPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const [dashboardParams, setDashboardParams] = useState<Record<string, ParamValue>>({});
+  const [shown, setShown] = useState<Record<number, string>>({});
+  const [tileRefreshKeys, setTileRefreshKeys] = useState<Record<number, number>>({});
+  const [stateSlug, setStateSlug] = useState(slug);
+  if (stateSlug !== slug) {
+    setStateSlug(slug);
+    setShown({});
+    setTileRefreshKeys({});
+  }
+  const onResultShown = useCallback(
+    (id: number, at: string) => setShown((p) => (p[id] === at ? p : { ...p, [id]: at })),
+    [],
+  );
 
   const [embedOpen, setEmbedOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -99,6 +114,33 @@ export function DashboardPage() {
     queryFn: () => api.getDashboard(slug!, { draft: editMode }),
     enabled: slug != null,
   });
+
+  const latest = useLatestWidgets(slug, newResultsEnabled({ slug, editMode, refreshInterval }));
+  const staleIds = latest && !editMode ? staleTileIds(latest, shown, dashboardParams) : [];
+  function showNew() {
+    if (staleIds.length === 0) return;
+    const polled = new Map((latest ?? []).map((w) => [w.id, w.freshness?.retrieved_at]));
+    setTileRefreshKeys((p) => {
+      const next = { ...p };
+      for (const id of staleIds) next[id] = (next[id] ?? 0) + 1;
+      return next;
+    });
+    setShown((p) => {
+      const next = { ...p };
+      for (const id of staleIds) {
+        const at = polled.get(id);
+        if (at) next[id] = at;
+      }
+      return next;
+    });
+    void qc.invalidateQueries({ queryKey: ["dashboard", slug, false], exact: true });
+    document
+      .querySelector<HTMLElement>(`[data-widget-id="${staleIds[0]}"]`)
+      ?.focus({ preventScroll: true });
+  }
+
+  const sourcesQ = useQuery({ queryKey: ["data-sources"], queryFn: () => api.listDataSources(), enabled: has("create_query") });
+  const exploreSourceId = sourcesQ.data?.data_sources.find((d) => d.type === "query_results")?.id ?? null;
 
   const narrativesEnabled = clientConfig?.ai_dashboard_narratives === true;
   const dashboardId = dashQ.data?.id;
@@ -282,6 +324,7 @@ export function DashboardPage() {
     return <p className="text-destructive">{apiErrorMessage(dashQ.error, "Failed to load dashboard")}</p>;
 
   const dashboard = dashQ.data!;
+  const hasParams = resolveDashboardParams(dashboard.widgets).length > 0;
   const canEdit = dashboard.caller.can_edit;
   // `can_share` mirrors `can_edit` server-side; object_role alone would let an owner without
   // edit_dashboard still manage sharing.
@@ -539,6 +582,17 @@ export function DashboardPage() {
             menuExtra={refreshMenuExtra}
           />
 
+          {!editMode && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <DashboardHealthLine widgets={dashboard.widgets} />
+              {!hasParams && (
+                <div className="ml-auto">
+                  <NewResultsPill count={staleIds.length} onShow={showNew} />
+                </div>
+              )}
+            </div>
+          )}
+
           {canEdit && !editMode && state.pending && (
             <p className="text-xs text-muted-foreground">
               You're viewing the published version. Switch to Edit to see your draft.
@@ -559,7 +613,11 @@ export function DashboardPage() {
         </button>
       )}
 
-      <DashboardParamsBar widgets={dashboard.widgets} onParamsChange={setDashboardParams} />
+      <DashboardParamsBar
+        widgets={dashboard.widgets}
+        onParamsChange={setDashboardParams}
+        trailing={!editMode && hasParams ? <NewResultsPill count={staleIds.length} onShow={showNew} /> : undefined}
+      />
 
       {canEdit && editMode && (
         <div
@@ -675,8 +733,11 @@ export function DashboardPage() {
           onDeleteWidget={setPendingDeleteWidgetId}
           dashboardParams={dashboardParams}
           refreshKey={refreshKey}
+          tileRefreshKeys={tileRefreshKeys}
+          onResultShown={onResultShown}
           dashboardSlug={slug}
           highlightWidgetId={highlightWidgetId}
+          exploreSourceId={exploreSourceId}
         />
       )}
 
