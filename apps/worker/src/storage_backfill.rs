@@ -18,7 +18,7 @@ use arcodash_core::entities::dashboard_narrative;
 use arcodash_core::mail_notify::mail_body_key;
 use arcodash_core::models::DataSourceAiProfile;
 
-use arcodash_core::observation_store::{load_observations, upsert_observation, ObservationValues};
+use arcodash_core::observation_store::{load_observations, upsert_observations, ObservationValues};
 use arcodash_core::org_storage::{OrgStorage, StorageArea};
 use arcodash_core::result_store::{decode_result, save_result, verify_digest};
 
@@ -109,7 +109,7 @@ impl<'a> OrgCache<'a> {
                 Ok(s) if s.writes_paused() => None,
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::warn!(org_id, error = %e, "storage backfill: org storage unavailable, skipping");
+                    tracing::warn!(org_id, error = %format_args!("{e:#}"), "storage backfill: org storage unavailable, skipping");
                     None
                 }
             };
@@ -149,7 +149,10 @@ async fn finish_pass(conn: &mut redis::aio::ConnectionManager, keys: &Keys) -> a
                     .context("set reset time")?;
             }
             Some(at) if at <= now => {
-                let _: () = conn.del(&keys.all()[..]).await.context("reset pass")?;
+                // One key per DEL: a clustered Valkey refuses multi-key commands across slots.
+                for key in keys.all() {
+                    let _: () = conn.del(key).await.context("reset pass")?;
+                }
             }
             Some(_) => {}
         }
@@ -302,7 +305,7 @@ async fn backfill_results(
             Err(e) => {
                 skipped = true;
                 orgs.fail(row.org_id);
-                tracing::warn!(query_result_id = row.id, error = %e, "storage backfill: result copy failed");
+                tracing::warn!(query_result_id = row.id, error = %format_args!("{e:#}"), "storage backfill: result copy failed");
             }
         }
     }
@@ -446,7 +449,7 @@ async fn backfill_observations(
             Ok(n) => written += n,
             Err(e) => {
                 skipped = true;
-                tracing::warn!(monitor_id, error = %e, "storage backfill: observation copy failed");
+                tracing::warn!(monitor_id, error = %format_args!("{e:#}"), "storage backfill: observation copy failed");
             }
         }
     }
@@ -480,20 +483,20 @@ async fn copy_observations(
     };
     let (from, to) = (first.observed_at, last.observed_at);
     let existing = load_observations(storage, monitor_id, from, to).await?;
-    let mut written = 0usize;
-    for row in &sorted {
-        let stored = existing.get(&row.id);
-        if line_matches(stored, row.value, row.explanation.as_deref()) {
-            continue;
-        }
-        let values = ObservationValues {
+    let missing: Vec<ObservationValues> = sorted
+        .iter()
+        .filter(|row| !line_matches(existing.get(&row.id), row.value, row.explanation.as_deref()))
+        .map(|row| ObservationValues {
             id: row.id,
             observed_at: row.observed_at,
             value: row.value,
             explanation: row.explanation.clone(),
-        };
-        upsert_observation(&ctx.db, storage, monitor_id, &values).await?;
-        written += 1;
+        })
+        .collect();
+    let written = missing.len();
+    if written > 0 {
+        // One write per month file: per-line rewrites trip the object store's per-object rate limit.
+        upsert_observations(&ctx.db, storage, monitor_id, &missing).await?;
     }
     if written > 0 {
         let after = load_observations(storage, monitor_id, from, to).await?;
@@ -558,7 +561,7 @@ async fn backfill_narratives(
             Err(e) => {
                 skipped = true;
                 orgs.fail(row.org_id);
-                tracing::warn!(narrative_id = row.id, error = %e, "storage backfill: narrative copy failed");
+                tracing::warn!(narrative_id = row.id, error = %format_args!("{e:#}"), "storage backfill: narrative copy failed");
             }
         }
     }
@@ -668,7 +671,7 @@ async fn backfill_mail(
             Err(e) => {
                 skipped = true;
                 orgs.fail(org_id);
-                tracing::warn!(delivery_id = id, error = %e, "storage backfill: mail body copy failed");
+                tracing::warn!(delivery_id = id, error = %format_args!("{e:#}"), "storage backfill: mail body copy failed");
             }
         }
     }
@@ -753,7 +756,7 @@ async fn backfill_ai_profiles(
             Err(e) => {
                 skipped = true;
                 orgs.fail(org_id);
-                tracing::warn!(data_source_id = id, error = %e, "storage backfill: AI profile copy failed");
+                tracing::warn!(data_source_id = id, error = %format_args!("{e:#}"), "storage backfill: AI profile copy failed");
             }
         }
     }
