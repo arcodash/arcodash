@@ -69,7 +69,7 @@ tokio-cron-scheduler = "0.15.1"
 lettre = { version = "0.11.23", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 reqwest = { version = "0.13.5", features = ["json", "rustls", "form", "query"] }
 csv = "1.4"
-rust_xlsxwriter = "0.102"
+rust_xlsxwriter = "0.103"
 # Capped by sqlx-sqlite's `libsqlite3-sys <0.38`: rusqlite 0.40+ conflicts.
 rusqlite = { version = "0.39", features = ["bundled"] }
 # SQL Server: tiberius is the only mature pure-Rust TDS driver. It uses rustls (not the default
