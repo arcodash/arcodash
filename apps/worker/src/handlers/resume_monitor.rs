@@ -20,6 +20,10 @@ pub async fn handle(
     query_run_status: String,
 ) {
     if let Err(e) = resume(ctx, org_id, run_id, query_run_id, &query_run_status).await {
+        if crate::handlers::evaluate_monitor::is_storage_switching(&e) {
+            crate::handlers::evaluate_monitor::defer_for_storage_switch(ctx, run_id).await;
+            return;
+        }
         tracing::error!(run_id, error = %e, "resume_monitor failed");
     }
 }

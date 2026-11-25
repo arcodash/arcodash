@@ -93,6 +93,45 @@ pub async fn claim_pending_run(db: &impl ConnectionTrait, run_id: i64) -> anyhow
     Ok(false)
 }
 
+/// Delay before a run deferred by a storage switch is eligible for re-enqueue.
+pub const STORAGE_DEFER_SECS: u64 = 60;
+
+/// Redis key gating re-pushes of an already-enqueued `pending` run.
+pub fn requeue_cooldown_key(run_id: i64) -> String {
+    format!("arcodash:requeue-cooldown:run:{run_id}")
+}
+
+/// Return a `running` run to `pending` without finalizing it (no failure counted, schedule
+/// untouched). The run is parked (`enqueued_at` cleared, so it neither counts against its data
+/// source's concurrency cap nor ages toward the abandoned-pending timeout); the requeue cooldown
+/// keeps the stale-pending sweep from re-enqueuing it sooner than [`STORAGE_DEFER_SECS`] later.
+/// `Ok(false)`: the run was no longer `running`.
+pub async fn defer_run(ctx: &ExecuteQueryContext, run_id: i64) -> anyhow::Result<bool> {
+    let mut conn = ctx.redis.clone();
+    if let Err(e) = redis::AsyncCommands::set_ex::<_, _, ()>(
+        &mut conn,
+        requeue_cooldown_key(run_id),
+        Utc::now().to_rfc3339(),
+        STORAGE_DEFER_SECS,
+    )
+    .await
+    {
+        tracing::warn!(run_id, error = %e, "run_lifecycle: failed to arm the deferral cooldown");
+    }
+    let res = ctx
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE runs \
+             SET status = 'pending', started_at = NULL, worker_id = NULL, \
+                 lease_expires_at = NULL, waiting_on_run_id = NULL, enqueued_at = NULL \
+             WHERE id = $1 AND status = 'running'",
+            [run_id.into()],
+        ))
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// Spawn a heartbeat guard extending `lease_expires_at` every `run_lease_secs/3` while the run
 /// stays `running`; dropping the guard stops renewal.
 pub fn spawn_heartbeat(db: DatabaseConnection, run_id: i64) -> arcodash_conveyor::HeartbeatGuard {
@@ -207,7 +246,11 @@ async fn finalize_run_matching(
             [
                 outcome.status.as_db_str().into(),
                 outcome.row_count.into(),
-                outcome.error.clone().into(),
+                outcome
+                    .error
+                    .as_deref()
+                    .map(arcodash_core::scrub::scrub_error_values)
+                    .into(),
                 outcome.query_result_id.into(),
                 outcome.data_age_secs.into(),
                 outcome.condition_met.into(),
@@ -1309,6 +1352,39 @@ mod tests {
             status.status,
             JobStatus::Cancelled,
             "Skipped's lossy mapping to Cancelled (the closest non-error terminal status)"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_run_stores_scrubbed_error() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let (_q, run_id) = seed_query_run(&db, "finalize-scrub", "running").await;
+        let job_id = format!("finalize-scrub-{}", uuid::Uuid::new_v4());
+        set_job_id(&db, run_id, &job_id).await;
+
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let raw = "Key (email)=(bob@x.com) already exists.";
+        finalize_run(
+            &ctx,
+            run_id,
+            RunOutcome::terminal(RunStatus::Failed, Some(raw.to_string())),
+        )
+        .await
+        .unwrap();
+
+        let row = query_row(&db, "SELECT error FROM runs WHERE id = $1", [run_id.into()]).await;
+        let error: String = row.try_get("", "error").unwrap();
+        assert_eq!(error, "Key (email)=(…) already exists.");
+        let job = queue::get_job_status(&redis, &job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.error.as_deref(),
+            Some("Key (email)=(…) already exists.")
         );
     }
 

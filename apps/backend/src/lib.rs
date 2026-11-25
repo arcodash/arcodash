@@ -63,6 +63,9 @@ pub struct AppExtensions {
     pub reserved_org_settings_keys: Vec<&'static str>,
     /// Replaces the built-in login system; `None` keeps it.
     pub external_auth: Option<ExternalAuth>,
+    /// Resolves each organization's object storage; `None` keeps the shared-bucket default. The
+    /// `ConnectorRegistry` in `AppState` must be built with this same resolver.
+    pub storage_resolver: Option<Arc<dyn arcodash_core::org_storage::OrgStorageResolver>>,
 }
 
 /// `GET /api/session` is the one org-optional path every binary needs; shared so embedders don't
@@ -79,6 +82,7 @@ impl Default for AppExtensions {
             entitlements: None,
             reserved_org_settings_keys: Vec::new(),
             external_auth: None,
+            storage_resolver: None,
         }
     }
 }
@@ -87,6 +91,9 @@ impl Default for AppExtensions {
 pub fn build_app(mut state: AppState, cors: CorsLayer, ext: AppExtensions) -> Router {
     if let Some(entitlements) = ext.entitlements {
         state.entitlements = entitlements;
+    }
+    if let Some(resolver) = ext.storage_resolver {
+        state.storage = resolver;
     }
     state.reserved_org_settings_keys = Arc::new(ext.reserved_org_settings_keys);
     if let Some(ext_auth) = &ext.external_auth {
@@ -104,7 +111,15 @@ pub fn build_app(mut state: AppState, cors: CorsLayer, ext: AppExtensions) -> Ro
         .route("/health", get(health))
         .route("/ping", get(ping))
         .route("/metrics", get(metrics::metrics))
-        .nest("/api", api::router::router(&state).merge(ext.api_router))
+        // Applied to the nested router so extension routes get it too; a handler's own
+        // `Cache-Control` wins.
+        .nest(
+            "/api",
+            api::router::router(&state)
+                .merge(ext.api_router)
+                .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
+                .layer(axum::middleware::map_response(default_no_store)),
+        )
         // Tower applies later `.layer()` calls as outer wrappers, so org resolution runs BEFORE
         // CSRF validation. Deliberate: reordering changes the failure mode for
         // org-exempt/org-optional paths, and org-first is what enables org-aware CSRF rejection
@@ -192,12 +207,63 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
         .into_response()
 }
 
+/// Result data must never sit in a shared cache, so `/api` responses default to `no-store`.
+async fn default_no_store(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request as HttpRequest, StatusCode};
     use tower::ServiceExt;
+
+    fn cache_control_app() -> Router {
+        let api = Router::new()
+            .route("/plain", get(|| async { "x" }))
+            .route(
+                "/own",
+                get(|| async {
+                    (
+                        [(axum::http::header::CACHE_CONTROL, "private, max-age=60")],
+                        "x",
+                    )
+                }),
+            )
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(axum::middleware::map_response(default_no_store));
+        Router::new().nest("/api", api)
+    }
+
+    async fn cache_control_of(uri: &str) -> Vec<String> {
+        let resp = cache_control_app()
+            .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        resp.headers()
+            .get_all(axum::http::header::CACHE_CONTROL)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn no_store_is_added_when_absent() {
+        assert_eq!(cache_control_of("/api/plain").await, vec!["no-store"]);
+        assert_eq!(cache_control_of("/api/missing").await, vec!["no-store"]);
+    }
+
+    #[tokio::test]
+    async fn handler_set_cache_control_is_not_overwritten() {
+        assert_eq!(
+            cache_control_of("/api/own").await,
+            vec!["private, max-age=60"]
+        );
+    }
 
     async fn always_panics() -> &'static str {
         panic!("boom")

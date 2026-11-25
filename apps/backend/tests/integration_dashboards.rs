@@ -2558,8 +2558,10 @@ mod freshness {
             )),
             data_location: Set(None),
             data_size_bytes: Set(None),
+            data_sha256: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set(retrieved_at.into()),
+            last_used_at: Set(retrieved_at.into()),
             created_at: Set(now.into()),
             updated_at: Set(now.into()),
         }

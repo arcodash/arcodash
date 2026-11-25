@@ -6,6 +6,32 @@ use crate::error::ApiError;
 
 pub use arcodash_core::ai::context::*;
 
+/// The data source's profile with sampled values restored from the org's object storage.
+///
+/// # Errors
+///
+/// An unreachable or switching store surfaces as 503/409.
+pub async fn load_usable_profile(
+    state: &crate::state::AppState,
+    org_id: i64,
+    ds: &arcodash_core::entities::data_source::Model,
+) -> Result<Option<arcodash_core::models::DataSourceAiProfile>, ApiError> {
+    let storage = state.storage.resolve(&state.db, org_id).await?;
+    match usable_profile_loaded(ds, &storage).await {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            arcodash_core::ai::narrative::report_unreachable(
+                &*state.storage,
+                &state.db,
+                org_id,
+                &e,
+            )
+            .await;
+            Err(e.into())
+        }
+    }
+}
+
 /// The caller's most recent non-archived saved queries on this source.
 pub(crate) async fn load_recent_queries(
     db: &Db,

@@ -111,7 +111,10 @@ pub async fn finalize(
     );
     let mut values: Vec<sea_orm::Value> = vec![
         status.into(),
-        error.into(),
+        error
+            .as_deref()
+            .map(arcodash_core::scrub::scrub_error_values)
+            .into(),
         terminal.into(),
         id.into(),
         run_lifecycle::worker_id().into(),
@@ -145,7 +148,11 @@ pub async fn fail_retrying(
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             &sql,
-            [error.into(), attempt.into(), id.into()],
+            [
+                arcodash_core::scrub::scrub_error_values(&error).into(),
+                attempt.into(),
+                id.into(),
+            ],
         ))
         .await?;
     Ok(res.rows_affected() > 0)
@@ -322,6 +329,45 @@ mod tests {
         assert!(row.lease_expires_at.is_none());
         assert!(row.worker_id.is_none());
         assert!(row.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delivery_failure_error_is_scrubbed() {
+        let Some(db) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let raw = "Key (email)=(bob@x.com) already exists.";
+        let id = seed_notification_row(&db).await;
+        assert!(claim(&db, NOTIFICATION_DELIVERIES, id).await.unwrap());
+        finalize(
+            &db,
+            NOTIFICATION_DELIVERIES,
+            id,
+            "failed",
+            Some(raw.to_string()),
+            Some(1),
+            true,
+        )
+        .await
+        .unwrap();
+        let row = notification_row(&db, id).await;
+        assert_eq!(
+            row.error.as_deref(),
+            Some("Key (email)=(…) already exists.")
+        );
+
+        let retrying = seed_retrying_notification_row(&db).await;
+        assert!(
+            fail_retrying(&db, NOTIFICATION_DELIVERIES, retrying, raw.to_string(), 2)
+                .await
+                .unwrap()
+        );
+        let row = notification_row(&db, retrying).await;
+        assert_eq!(
+            row.error.as_deref(),
+            Some("Key (email)=(…) already exists.")
+        );
     }
 
     #[tokio::test]

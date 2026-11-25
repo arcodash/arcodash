@@ -25,7 +25,7 @@ use super::{
     classify_run_query_error, connect_err, guard_targets, query_timeout_secs, NetworkTarget,
     QueryExecutionResult, QueryRunner, TableSchema,
 };
-use crate::storage::ObjectStore;
+use crate::org_storage::OrgStorageResolver;
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
@@ -218,17 +218,19 @@ impl QueryRunner for LoggingConnector {
 }
 
 impl ConnectorRegistry {
-    /// Build the full application registry. `store` backs the upload-based CSV/SQLite connectors
-    /// (`ObjectStore::from_env()`).
-    pub fn with_db(db: DatabaseConnection, store: Arc<ObjectStore>) -> Self {
+    /// Build the full application registry; `storage` backs the upload-based CSV/SQLite connectors.
+    pub fn with_db(db: DatabaseConnection, storage: Arc<dyn OrgStorageResolver>) -> Self {
         let mut r = Self::new();
 
         r.register(Arc::new(PostgresConnector::new()));
-        r.register(Arc::new(QueryResultsConnector::new(db.clone())));
+        r.register(Arc::new(QueryResultsConnector::new(
+            db.clone(),
+            storage.clone(),
+        )));
         r.register(Arc::new(MySqlConnector::mysql()));
         r.register(Arc::new(MySqlConnector::mariadb()));
         r.register(Arc::new(MySqlConnector::tidb()));
-        r.register(Arc::new(SqliteConnector::new(db.clone(), store.clone())));
+        r.register(Arc::new(SqliteConnector::new(db.clone(), storage.clone())));
         r.register(Arc::new(RedshiftConnector::new()));
         r.register(Arc::new(CockroachDbConnector::new()));
         r.register(Arc::new(ClickHouseConnector));
@@ -238,7 +240,7 @@ impl ConnectorRegistry {
         r.register(Arc::new(PrometheusConnector));
         r.register(Arc::new(InfluxDbConnector));
         r.register(Arc::new(JsonConnector));
-        r.register(Arc::new(CsvConnector::new(db, store)));
+        r.register(Arc::new(CsvConnector::new(db, storage)));
         r.register(Arc::new(MssqlConnector));
         r.register(Arc::new(BigQueryConnector));
         r.register(Arc::new(SnowflakeConnector));
@@ -259,6 +261,7 @@ impl Default for ConnectorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ObjectStore;
     use serde_json::json;
 
     /// The full registry; `bucket` only has to satisfy `ObjectStore::from_env`.
@@ -270,7 +273,10 @@ mod tests {
         unsafe {
             std::env::remove_var("UPLOAD_BUCKET");
         }
-        ConnectorRegistry::with_db(DatabaseConnection::default(), store)
+        ConnectorRegistry::with_db(
+            DatabaseConnection::default(),
+            Arc::new(crate::org_storage::DefaultStorageResolver::new(store)),
+        )
     }
 
     #[test]

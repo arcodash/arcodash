@@ -191,7 +191,7 @@ async fn record_delivery_failed_event(
             "destination_id": (destination_id != -1).then_some(destination_id),
             "destination_name": destination_name,
             "state": state,
-            "error": error,
+            "error": error.map(arcodash_core::scrub::scrub_error_values),
             "attempt": attempt,
         }),
     )
@@ -407,7 +407,9 @@ async fn handle_inner(
                             tracing::warn!(
                                 "send_notification: missing 'to' address for email destination"
                             );
-                            Outcome::failed_permanent("email destination is missing a 'to' address")
+                            Outcome::failed_permanent(
+                                "email destination is missing a \"to\" address",
+                            )
                         }
                     }
                     Ok(opts) => {
@@ -488,7 +490,10 @@ async fn handle_inner(
             destination_id: Set((destination_id != -1).then_some(destination_id)),
             state: Set(new_state.clone()),
             status: Set(recorded_status.to_string()),
-            error: Set(outcome.error),
+            error: Set(outcome
+                .error
+                .as_deref()
+                .map(arcodash_core::scrub::scrub_error_values)),
             attempt_number: Set(attempt as i32),
             // No evaluation run id is available on the fallback path.
             run_id: Set(None),
@@ -640,7 +645,7 @@ impl TypedTaskHandler for SendNotificationHandler {
         Ok(match result {
             Ok(_) => TaskOutcome::Success { result_ref: None },
             Err(e) => TaskOutcome::Failed {
-                error: format!("{e:#}"),
+                error: arcodash_core::scrub::scrub_error_values(&format!("{e:#}")),
             },
         })
     }
@@ -995,7 +1000,7 @@ pub fn format_observed_cell(cell: &serde_json::Value) -> String {
 /// Fallback only: re-resolves the monitor's current result at send time, for payloads that predate
 /// the `observed` field (live producers capture the value at evaluation time, since re-resolving
 /// can drift from what fired the alert). Returns `"no value"` when the result is absent and
-/// `"(unavailable)"` on a DB error; never `null`/blank.
+/// `"(unavailable)"` on a DB or storage error; never `null`/blank.
 async fn observed_value(
     ctx: &ExecuteQueryContext,
     monitor: &monitor::Model,
@@ -1026,10 +1031,21 @@ async fn observed_value(
             return "(unavailable)".to_string();
         }
     };
-    let cell = qr
-        .data
-        .as_ref()
-        .and_then(|d| d.get("rows"))
+    let data = match arcodash_core::result_store::load_result(&ctx.db, &ctx.db, &*ctx.storage, &qr)
+        .await
+    {
+        Ok(Some(data)) => data,
+        Ok(None) => return "no value".to_string(),
+        Err(e) => {
+            tracing::warn!(
+                monitor_id = monitor.id, error = %e,
+                "send_notification: failed to read the monitor's stored result for the email body"
+            );
+            return "(unavailable)".to_string();
+        }
+    };
+    let cell = data
+        .get("rows")
         .and_then(|r| r.as_array())
         .and_then(|rows| rows.first())
         .and_then(|row| row.get(column));
@@ -1824,6 +1840,54 @@ mod org_scoping_tests {
         assert_eq!(observed_value(&ctx, &reloaded, org.id).await, "no value");
     }
 
+    /// A result whose storage is unreachable renders "(unavailable)", not "no value".
+    #[tokio::test]
+    async fn observed_value_unreachable_storage_is_unavailable() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(&db, &format!("org-observed-down-{suffix}")).await;
+        let subscriber = seed_user(&db, org.id, vec![]).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let qr = crate::scheduler::test_support::seed_query_result(
+            &db,
+            org.id,
+            ds.id,
+            chrono::Utc::now(),
+            serde_json::json!({ "net_revenue": 1.0 }),
+        )
+        .await;
+        let q = crate::scheduler::test_support::seed_query(&db, org.id, ds.id).await;
+        crate::scheduler::test_support::set_latest_query_data(&db, q.id, qr.id).await;
+        exec_sql(
+            &db,
+            "UPDATE query_results SET data = NULL, data_location = 'results/gone.json' WHERE id = $1",
+            [qr.id.into()],
+        )
+        .await;
+        let mon = crate::scheduler::test_support::seed_monitor(
+            &db,
+            org.id,
+            q.id,
+            subscriber.id,
+            serde_json::json!({ "column": "net_revenue" }),
+        )
+        .await;
+
+        let mut ctx = test_ctx(db.clone(), redis);
+        ctx.storage = Arc::new(
+            arcodash_core::test_support::blob::StaticResolver::with_store(
+                arcodash_core::org_storage::StorageMode::ArcoDash,
+                Arc::new(arcodash_core::test_support::blob::FailingBlobStore::default()),
+                "org-root",
+            ),
+        );
+        assert_eq!(observed_value(&ctx, &mon, org.id).await, "(unavailable)");
+    }
+
     /// A forced delivery failure (a webhook to an address nothing listens on, since an unconfigured
     /// mailer makes email succeed trivially) must record `status = "failed"`, never `"sent"`, with
     /// a redacted non-empty `error`. Called with `attempt = MAX_ATTEMPTS` to exercise the terminal
@@ -2019,8 +2083,10 @@ mod mailpit_alert_tests {
             )),
             data_location: Set(None),
             data_size_bytes: Set(None),
+            data_sha256: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set(now),
+            last_used_at: Set(now),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
@@ -2435,7 +2501,7 @@ mod retry_tests {
         assert_eq!(rows[0].attempt_number, 1);
         assert_eq!(
             rows[0].error.as_deref(),
-            Some("email destination is missing a 'to' address")
+            Some("email destination is missing a \"to\" address")
         );
     }
 
@@ -2876,6 +2942,43 @@ mod delivery_failed_audit_event_tests {
             .await
             .unwrap()
             .len()
+    }
+
+    #[tokio::test]
+    async fn failed_event_error_is_scrubbed() {
+        let Some((db, _redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(
+            &db,
+            &format!("org-failed-event-scrub-{}", uuid::Uuid::new_v4()),
+        )
+        .await;
+        let (monitor_model, _) = seed_org_with_monitor(&db, org.id).await;
+        record_delivery_failed_event(
+            &db,
+            org.id,
+            monitor_model.id,
+            -1,
+            "dest",
+            "failed",
+            Some("Key (email)=(bob@x.com) already exists."),
+            3,
+        )
+        .await;
+        let ev = event::Entity::find()
+            .filter(event::Column::OrgId.eq(org.id))
+            .filter(event::Column::Action.eq("notification_delivery_failed"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = ev.additional_properties["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(err, "Key (email)=(…) already exists.");
     }
 
     #[tokio::test]

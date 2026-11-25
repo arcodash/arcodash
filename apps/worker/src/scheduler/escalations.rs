@@ -44,6 +44,7 @@ pub async fn run_due_escalations(
     entitlements: &dyn arcodash_core::entitlements::OrgEntitlements,
     queue: &dyn Queue,
     conveyor: Option<&Conveyor>,
+    storage: &dyn arcodash_core::org_storage::OrgStorageResolver,
 ) -> anyhow::Result<EscalationSummary> {
     let rows = db
         .query_all_raw(Statement::from_string(
@@ -188,8 +189,13 @@ pub async fn run_due_escalations(
         summary.escalated += 1;
         crate::health::ESCALATIONS_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let explanation =
-            crate::handlers::explain_alert::latest_explanation(db, m.monitor_id).await;
+        let explanation = arcodash_core::observation_store::latest_incident_explanation(
+            db,
+            storage,
+            m.org_id,
+            m.monitor_id,
+        )
+        .await;
         if let Err(e) = enqueue_send_notification(
             queue,
             conveyor,
@@ -238,11 +244,12 @@ mod tests {
     //! without `TEST_DATABASE_URL`/`TEST_REDIS_URL`).
     use super::*;
     use crate::scheduler::test_support::{
-        exec_sql, query_row, seed_data_source, seed_org, seed_query, setup, BlockOrg,
+        exec_sql, seed_data_source, seed_org, seed_query, setup, BlockOrg,
     };
     use arcodash_core::entities::{escalation_step, notification_destination, organization};
     use arcodash_core::entitlements::{OrgEntitlements, Unrestricted};
     use arcodash_core::queue::ValkeyQueue;
+    use futures::FutureExt;
     use redis::AsyncCommands;
     use sea_orm::ActiveModelTrait;
     use std::sync::Arc;
@@ -335,9 +342,15 @@ mod tests {
         entitlements: &dyn OrgEntitlements,
     ) {
         let queue = ValkeyQueue::new(redis.clone());
-        run_due_escalations(db, entitlements, &queue, None)
-            .await
-            .unwrap();
+        run_due_escalations(
+            db,
+            entitlements,
+            &queue,
+            None,
+            &crate::scheduler::test_support::test_storage(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn seed_step(
@@ -729,8 +742,8 @@ mod tests {
     }
 
     /// The step CAS and delivery insert share one transaction: if the insert fails (forced via a
-    /// primary-key collision on the next `notification_deliveries` id), the advance must roll back
-    /// too.
+    /// per-monitor `BEFORE INSERT` trigger on `notification_deliveries`), the advance must roll back
+    /// too. The trigger only fires for this test's monitor, so other due monitors are unaffected.
     #[tokio::test]
     async fn failed_delivery_insert_rolls_back_the_escalation_step_advance() {
         let Some((db, redis)) = setup().await else {
@@ -742,25 +755,47 @@ mod tests {
         let (mon, dest_id) = seed_due_monitor(&db, org.id).await;
         seed_step(&db, org.id, mon.id, 1, 5, dest_id).await;
 
-        let claimed_id: i64 = query_row(
-            &db,
-            "SELECT nextval('notification_deliveries_id_seq') AS id",
-            [],
-        )
-        .await
-        .try_get("", "id")
-        .unwrap();
-        let blocked_id = claimed_id + 1;
+        let tag = suffix.simple().to_string();
+        let fn_name = format!("esc_txn_fail_{tag}");
         exec_sql(
             &db,
-            "INSERT INTO notification_deliveries \
-             (id, org_id, monitor_id, state, status, attempt_number, created_at) \
-             VALUES ($1, $2, $3, 'triggered', 'pending', 1, now())",
-            [blocked_id.into(), org.id.into(), mon.id.into()],
+            &format!(
+                "CREATE FUNCTION {fn_name}() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+                 BEGIN \
+                   IF NEW.monitor_id = {mon_id} THEN \
+                     RAISE EXCEPTION 'forced delivery insert failure'; \
+                   END IF; \
+                   RETURN NEW; \
+                 END $f$",
+                mon_id = mon.id
+            ),
+            [],
+        )
+        .await;
+        exec_sql(
+            &db,
+            &format!(
+                "CREATE TRIGGER {fn_name} BEFORE INSERT ON notification_deliveries \
+                 FOR EACH ROW EXECUTE FUNCTION {fn_name}()"
+            ),
+            [],
         )
         .await;
 
-        tick(&db, &redis).await;
+        let r = std::panic::AssertUnwindSafe(tick(&db, &redis))
+            .catch_unwind()
+            .await;
+
+        exec_sql(
+            &db,
+            &format!("DROP TRIGGER IF EXISTS {fn_name} ON notification_deliveries"),
+            [],
+        )
+        .await;
+        exec_sql(&db, &format!("DROP FUNCTION IF EXISTS {fn_name}()"), []).await;
+        if let Err(p) = r {
+            std::panic::resume_unwind(p);
+        }
 
         let reloaded = reload(&db, mon.id).await;
         assert_eq!(

@@ -1,4 +1,5 @@
 mod ai_sink;
+mod clear_inline;
 mod consumer;
 mod conveyor_schedules;
 mod delivery_lifecycle;
@@ -7,6 +8,7 @@ mod health;
 mod heartbeat;
 mod run_lifecycle;
 mod scheduler;
+mod storage_backfill;
 
 use std::sync::Arc;
 
@@ -67,13 +69,35 @@ async fn assert_table_rls_bypass_role(
 /// Deployment-supplied behavior the worker consults while processing work.
 pub struct WorkerExtensions {
     pub entitlements: Arc<dyn OrgEntitlements>,
+    /// Resolves each organization's object storage; `None` keeps the shared-bucket default.
+    pub storage_resolver: Option<Arc<dyn arcodash_core::org_storage::OrgStorageResolver>>,
 }
 
 impl Default for WorkerExtensions {
     fn default() -> Self {
         Self {
             entitlements: Arc::new(Unrestricted),
+            storage_resolver: None,
         }
+    }
+}
+
+pub use clear_inline::{clear_inline_data, parse_clear_args, AreaReport, ClearArgs, ClearReport};
+
+/// Entry point of the worker binary: `clear-inline-data [--confirm] [--batch N]` runs the admin
+/// command, no argument runs the worker.
+///
+/// # Errors
+///
+/// Unknown command, or the failure of the command or worker.
+pub async fn run_cli(ext: WorkerExtensions) -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.split_first() {
+        None => run(ext).await,
+        Some((cmd, rest)) if cmd == "clear-inline-data" => {
+            clear_inline::run_command(ext.storage_resolver, rest).await
+        }
+        Some((cmd, _)) => anyhow::bail!("unknown command `{cmd}`; available: clear-inline-data"),
     }
 }
 
@@ -122,19 +146,27 @@ pub async fn run(ext: WorkerExtensions) -> anyhow::Result<()> {
             .await
             .context("failed to ensure upload bucket exists against the storage emulator")?;
     }
+    let storage = ext.storage_resolver.unwrap_or_else(|| {
+        Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            store.clone(),
+        ))
+    });
     let ctx = Arc::new(ExecuteQueryContext {
-        connectors: Arc::new(ConnectorRegistry::with_db(db.clone(), store.clone())),
+        connectors: Arc::new(ConnectorRegistry::with_db(db.clone(), storage.clone())),
         queue: Arc::new(ValkeyQueue::new(redis.clone())),
         db,
         redis,
+        #[cfg(test)]
         store,
         encryption_key,
         mailer: build_mailer(&config),
         mail_from: config.mail_from.clone(),
         entitlements: ext.entitlements,
+        storage,
         base_url: config.base_url.clone(),
         query_timeout_secs: config.query_timeout_secs,
         max_query_rows: config.max_query_rows,
+        result_retention_days: config.result_retention_days,
         conveyor: std::sync::OnceLock::new(),
         ai: Some(Arc::new(ai_sink::AiRuntime {
             config: Arc::new(config.clone()),
@@ -510,8 +542,8 @@ mod graceful_drain_tests {
     //! Real subprocess SIGTERM test: (a) an in-flight fast-tier job still completes, and (b) a
     //! long-tier job that can't finish inside its drain grace doesn't hang exit. Spawns the
     //! compiled worker binary to exercise the real shutdown wiring. Needs real Postgres + Redis +
-    //! target Postgres (skips without
-    //! `TEST_DATABASE_URL`/`TEST_REDIS_URL`/`TEST_TARGET_DATABASE_URL`).
+    //! target Postgres + a storage emulator (skips without
+    //! `TEST_DATABASE_URL`/`TEST_REDIS_URL`/`TEST_TARGET_DATABASE_URL`/`STORAGE_EMULATOR_HOST`).
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -561,6 +593,10 @@ mod graceful_drain_tests {
     async fn sigterm_drains_fast_job_and_caps_wait_on_long_job() {
         let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
             eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let Ok(storage_emulator) = std::env::var("STORAGE_EMULATOR_HOST") else {
+            eprintln!("skipping: STORAGE_EMULATOR_HOST not set");
             return;
         };
         let redis_url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL required");
@@ -649,6 +685,7 @@ mod graceful_drain_tests {
             .env("ENCRYPTION_KEY", &encryption_key_hex)
             .env("COOKIE_SECRET", "sigterm-test-cookie-secret")
             .env("UPLOAD_BUCKET", "sigterm-test-bucket")
+            .env("STORAGE_EMULATOR_HOST", &storage_emulator)
             .env("WORKER_QUEUES", "queries,scheduled_queries")
             .env("FAST_CONCURRENCY", "2")
             .env("LONG_CONCURRENCY", "1")
@@ -703,7 +740,8 @@ mod graceful_drain_tests {
             fast_status.status,
             JobStatus::Success,
             "fast-tier job must complete before the process exits, not be killed mid-flight by \
-             the old fire-and-forget spawn"
+             the old fire-and-forget spawn (error: {:?})",
+            fast_status.error
         );
 
         let long_status = core_queue::get_job_status(&redis, &long_job_id)

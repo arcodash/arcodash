@@ -14,6 +14,7 @@ pub mod monitor_suggestions;
 pub mod narrative;
 pub mod openai;
 pub mod pricing;
+pub mod profile_values;
 pub mod settings;
 pub mod usage;
 pub mod viz;
@@ -402,6 +403,7 @@ mod tests {
             ai_profile: None,
             ai_profile_built_at: None,
             ai_profile_last_error: None,
+            ai_profile_values_location: None,
             created_at: now,
             updated_at: now,
         }

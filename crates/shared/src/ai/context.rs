@@ -38,6 +38,24 @@ pub fn usable_profile(ds: &data_source::Model) -> Option<DataSourceAiProfile> {
     pruned_profile(ds.ai_profile.as_ref()?, cached_schema(ds).as_ref())
 }
 
+/// [`usable_profile`] with the sampled values restored from object storage.
+///
+/// # Errors
+///
+/// The storage error when the values object cannot be read.
+pub async fn usable_profile_loaded(
+    ds: &data_source::Model,
+    storage: &crate::org_storage::OrgStorage,
+) -> Result<Option<DataSourceAiProfile>, crate::org_storage::StorageError> {
+    let Some(mut profile) = super::profile_values::load_ai_profile(storage, ds).await? else {
+        return Ok(None);
+    };
+    if let Some(schema) = cached_schema(ds) {
+        prune_to_schema(&mut profile, &schema);
+    }
+    Ok(Some(profile))
+}
+
 fn pruned_profile(
     raw: &serde_json::Value,
     schema: Option<&DataSourceSchema>,

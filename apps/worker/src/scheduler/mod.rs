@@ -23,7 +23,9 @@ use crate::handlers::execute_query::ExecuteQueryContext;
 const LEADER_LOCK_KEY_MONITORS: &str = "arcodash:scheduler:leader:monitors";
 const LEADER_LOCK_KEY_DIGEST: &str = "arcodash:scheduler:leader:digest";
 const LEADER_LOCK_KEY_UPLOAD_SWEEP: &str = "arcodash:scheduler:leader:upload_sweep";
+const LEADER_LOCK_KEY_RESULT_SWEEP: &str = "arcodash:scheduler:leader:result_sweep";
 const LEADER_LOCK_KEY_SCHEMA_DAILY: &str = "arcodash:scheduler:leader:schema_daily";
+const LEADER_LOCK_KEY_STORAGE_BACKFILL: &str = "arcodash:scheduler:leader:storage_backfill";
 /// TTL for the once-per-user-per-day digest idempotence guard; two days so the key outlives the day
 /// it names.
 const DIGEST_SENT_GUARD_TTL_SECS: u64 = 172_800;
@@ -65,6 +67,32 @@ fn upload_sweep_secs() -> u64 {
     let configured: u64 =
         arcodash_core::config::env_parsed("UPLOAD_SWEEP_SECS", UPLOAD_SWEEP_SECS_DEFAULT);
     configured.max(UPLOAD_SWEEP_SECS_MIN)
+}
+
+/// Default interval for the expired-result sweep (1 hour); floored at 60s.
+const RESULT_SWEEP_SECS_DEFAULT: u64 = 3600;
+const RESULT_SWEEP_SECS_MIN: u64 = 60;
+
+const STORAGE_BACKFILL_SECS_DEFAULT: u64 = 60;
+const STORAGE_BACKFILL_SECS_MIN: u64 = 10;
+const STORAGE_BACKFILL_BATCH_DEFAULT: i64 = 200;
+
+/// `STORAGE_BACKFILL_SECS`: interval of the inline-data backfill, floored at 10s.
+fn storage_backfill_secs() -> u64 {
+    arcodash_core::config::env_parsed("STORAGE_BACKFILL_SECS", STORAGE_BACKFILL_SECS_DEFAULT)
+        .max(STORAGE_BACKFILL_SECS_MIN)
+}
+
+/// `STORAGE_BACKFILL_BATCH`: rows per area per backfill tick; at least 1.
+fn storage_backfill_batch() -> i64 {
+    arcodash_core::config::env_parsed("STORAGE_BACKFILL_BATCH", STORAGE_BACKFILL_BATCH_DEFAULT)
+        .max(1)
+}
+
+fn result_sweep_secs() -> u64 {
+    let configured: u64 =
+        arcodash_core::config::env_parsed("RESULT_SWEEP_SECS", RESULT_SWEEP_SECS_DEFAULT);
+    configured.max(RESULT_SWEEP_SECS_MIN)
 }
 
 /// Acquire or renew this replica's lock for `domain_key`. Contention and a Redis error both count
@@ -145,6 +173,66 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
             ),
         ),
     ));
+    let sweep_cursor: Arc<tokio::sync::Mutex<Option<sweeper::SweepCursor>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    jobs.push((
+        "result sweep",
+        Job::new_repeated_async(
+            Duration::from_secs(result_sweep_secs()),
+            leader_tick(&ctx, &lock_id, LEADER_LOCK_KEY_RESULT_SWEEP, move |ctx| {
+                let cursor = sweep_cursor.clone();
+                async move {
+                    let mut cursor = cursor.lock().await;
+                    let (stats, next) = sweeper::sweep_expired_results_with_limit(
+                        &ctx,
+                        sweeper::sweep_batch_limit(),
+                        sweeper::RESULT_SWEEP_MAX_PAGES,
+                        *cursor,
+                    )
+                    .await;
+                    *cursor = next;
+                    drop(cursor);
+                    if stats != sweeper::ResultSweepStats::default() {
+                        tracing::info!(
+                            deleted = stats.deleted,
+                            skipped_orgs = stats.skipped_orgs,
+                            failed_orgs = stats.failed_orgs,
+                            "sweeper: expired results"
+                        );
+                    }
+                }
+            }),
+        ),
+    ));
+    jobs.push((
+        "storage backfill",
+        Job::new_repeated_async(
+            Duration::from_secs(storage_backfill_secs()),
+            leader_tick(
+                &ctx,
+                &lock_id,
+                LEADER_LOCK_KEY_STORAGE_BACKFILL,
+                |ctx| async move {
+                    match crate::storage_backfill::backfill_batch(&ctx, storage_backfill_batch())
+                        .await
+                    {
+                        Ok(stats) if !stats.is_empty() => {
+                            tracing::info!(
+                                results = stats.results,
+                                observations = stats.observations,
+                                narratives = stats.narratives,
+                                mail = stats.mail,
+                                ai_profiles = stats.ai_profiles,
+                                "storage backfill: copied inline data"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(error = %e, "storage backfill failed"),
+                    }
+                },
+            ),
+        ),
+    ));
     jobs.push((
         "daily schema",
         Job::new_async(
@@ -196,7 +284,9 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
         LEADER_LOCK_KEY_MONITORS,
         LEADER_LOCK_KEY_DIGEST,
         LEADER_LOCK_KEY_UPLOAD_SWEEP,
+        LEADER_LOCK_KEY_RESULT_SWEEP,
         LEADER_LOCK_KEY_SCHEMA_DAILY,
+        LEADER_LOCK_KEY_STORAGE_BACKFILL,
     ] {
         release_leader_lock(&ctx.redis, key, &lock_id).await;
     }
@@ -210,7 +300,7 @@ fn leader_tick<F, Fut>(
     tick: F,
 ) -> impl FnMut(uuid::Uuid, JobScheduler) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync
 where
-    F: Fn(Arc<ExecuteQueryContext>) -> Fut + Copy + Send + Sync + 'static,
+    F: Fn(Arc<ExecuteQueryContext>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let ctx = ctx.clone();
@@ -218,6 +308,7 @@ where
     move |_, _| {
         let ctx = ctx.clone();
         let lock_id = lock_id.clone();
+        let tick = tick.clone();
         Box::pin(async move {
             if acquire_leader_lock(&ctx.redis, lock_key, &lock_id).await {
                 tick(ctx).await;
@@ -234,6 +325,7 @@ async fn escalation_tick(ctx: Arc<ExecuteQueryContext>) {
         ctx.entitlements.as_ref(),
         ctx.queue.as_ref(),
         ctx.conveyor.get().map(std::convert::AsRef::as_ref),
+        ctx.storage.as_ref(),
     )
     .await
     {
@@ -379,11 +471,12 @@ pub(crate) mod test_support {
         db: DatabaseConnection,
         redis: redis::aio::ConnectionManager,
     ) -> ExecuteQueryContext {
+        let store = test_store();
         ExecuteQueryContext {
             db,
             redis: redis.clone(),
             connectors: Arc::new(ConnectorRegistry::default()),
-            store: test_store(),
+            store,
             encryption_key: [0u8; 32],
             queue: Arc::new(ValkeyQueue::new(redis)),
             mailer: None,
@@ -391,9 +484,17 @@ pub(crate) mod test_support {
             base_url: "http://localhost:3000".to_string(),
             query_timeout_secs: 300,
             max_query_rows: 10_000,
+            result_retention_days: 7,
             conveyor: std::sync::OnceLock::new(),
             ai: None,
             entitlements: std::sync::Arc::new(arcodash_core::entitlements::Unrestricted),
+            storage: std::sync::Arc::new(
+                arcodash_core::test_support::blob::StaticResolver::with_store(
+                    arcodash_core::org_storage::StorageMode::ArcoDash,
+                    Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default()),
+                    "orgs/test/",
+                ),
+            ),
         }
     }
 
@@ -513,6 +614,15 @@ pub(crate) mod test_support {
             query_timeout_secs: 30,
             ..test_ctx(db, redis)
         }
+    }
+
+    /// In-memory org storage for scheduler tests.
+    pub(crate) fn test_storage() -> arcodash_core::test_support::blob::StaticResolver {
+        arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default()),
+            "orgs/test/",
+        )
     }
 
     /// `ObjectStore::from_env()` against the emulator, defaulting `UPLOAD_BUCKET` when unset.
@@ -773,8 +883,10 @@ pub(crate) mod test_support {
             data: Set(Some(serde_json::json!({ "rows": [row] }))),
             data_location: Set(None),
             data_size_bytes: Set(None),
+            data_sha256: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set(retrieved_at.into()),
+            last_used_at: Set(retrieved_at.into()),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()

@@ -92,7 +92,10 @@ const fn is_site_local_v6(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfec0
 }
 
-fn is_blocked(ip: IpAddr) -> bool {
+/// Whether `ip` is in a range outbound connections must not reach (loopback, private, link-local,
+/// metadata, CGNAT, ULA, multicast, reserved, and IPv4-embedding IPv6 forms).
+#[must_use]
+pub fn is_blocked(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback()

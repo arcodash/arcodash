@@ -8,11 +8,11 @@ use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use arcodash_core::entities::{favorite, group, query, query_result, user};
+use arcodash_core::entities::{favorite, group, monitor, query, query_result, user};
 use arcodash_core::events::record_event;
 
 use crate::api::handlers::jobs::JobResponse;
@@ -24,6 +24,7 @@ use crate::db::Db;
 use crate::error::ApiError;
 use crate::extract::{Json, Path};
 use crate::middleware::rate_limit::UserKeyedLimiter;
+use crate::services::object_cleanup::{self, DeletedObject};
 use crate::services::query_service::RevertTarget;
 use crate::services::result_service::ResultFormat;
 use crate::services::{
@@ -628,6 +629,7 @@ pub async fn refresh(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -671,6 +673,7 @@ pub async fn run(
         ));
     }
     query_service::ensure_run_data_source_access(&db, &user, resolved.data_source_id, id).await?;
+    state.result_reader().ensure_writable(user.org_id).await?;
     let (run, already) = run_service::run_now(
         &db,
         state.queue.clone(),
@@ -708,12 +711,31 @@ pub async fn consumers(
 
 /// `DELETE /api/queries/<id>`.
 pub async fn delete(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     let existing = query_service::get_for_user(&db, user.org_id, &user, id).await?;
+    let org_id = existing.org_id;
+    let monitor_ids = monitor::Entity::find()
+        .filter(monitor::Column::QueryId.eq(existing.id))
+        .select_only()
+        .column(monitor::Column::Id)
+        .into_tuple::<i64>()
+        .all(&db)
+        .await?;
     query_service::delete(&db, &user, existing).await?;
+    // Stored results are shared by query text and data source, so they expire through retention.
+    if !monitor_ids.is_empty() {
+        db.after_commit(Box::pin(object_cleanup::run(
+            state.storage.clone(),
+            state.db.clone(),
+            org_id,
+            DeletedObject::Monitors(monitor_ids),
+        )))
+        .await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -860,6 +882,7 @@ pub async fn execute_saved(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -893,6 +916,7 @@ pub struct LatestResultQuery {
 /// draft run alongside the published SQL. `published_only=true` opts an editor out of draft-first
 /// (dashboard widgets).
 pub async fn latest_result(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
@@ -914,7 +938,9 @@ pub async fn latest_result(
         query_service::resolve_serving_content(&q).latest_query_data_id
     }
     .ok_or_else(|| ApiError::not_found("no results yet for this query"))?;
-    let result = result_service::get(&db, user.org_id, &user, result_id).await?;
+    let result =
+        result_service::get_with_data(&db, state.result_reader(), user.org_id, &user, result_id)
+            .await?;
 
     Ok(Json(QueryResultEnvelope {
         query_result: QueryResultResponse::from(result),
@@ -952,6 +978,7 @@ pub async fn execute_ad_hoc(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -995,6 +1022,7 @@ pub async fn parameter_values(
         &db,
         state.queue.as_ref(),
         state.conveyor.as_deref(),
+        state.result_reader(),
         &state.redis,
         user.org_id,
         &user,
@@ -1041,6 +1069,7 @@ pub async fn list_visualizations(
 /// (`download_limiter`): `route_layer` can't gate half a merged route, and the JSON branch is hit
 /// by every job-backed widget.
 pub async fn get_or_download_result(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id_str): Path<String>,
@@ -1057,7 +1086,9 @@ pub async fn get_or_download_result(
             ));
         }
         let id = parse_id(raw_id)?;
-        let result = result_service::get(&db, user.org_id, &user, id).await?;
+        let result =
+            result_service::get_with_data(&db, state.result_reader(), user.org_id, &user, id)
+                .await?;
         let fmt = match format_ext {
             "csv" => ResultFormat::Csv,
             "tsv" => ResultFormat::Tsv,
@@ -1097,7 +1128,8 @@ pub async fn get_or_download_result(
     }
 
     let id = parse_id(&id_str)?;
-    let result = result_service::get(&db, user.org_id, &user, id).await?;
+    let result =
+        result_service::get_with_data(&db, state.result_reader(), user.org_id, &user, id).await?;
     Ok(Json(QueryResultEnvelope {
         query_result: QueryResultResponse::from(result),
     })

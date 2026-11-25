@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { ResultFootnote, hasResultFootnote } from "@/components/ResultFootnote";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -1704,7 +1705,7 @@ export function QueryEditorPage() {
                 >
                   <div className="flex items-center justify-between">
                     <p
-                      className="flex items-center gap-2 text-sm text-muted-foreground"
+                      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground"
                       title={exactTs(Date.parse(result.retrieved_at))}
                     >
                       {isStale && (
@@ -1717,8 +1718,11 @@ export function QueryEditorPage() {
                         </Badge>
                       )}
                       {result.data.rows.length} row{result.data.rows.length === 1 ? "" : "s"} ·{" "}
-                      {(result.data.runtime_seconds ?? result.runtime).toFixed(3)}s · Updated{" "}
+                      {(result.data.runtime_seconds ?? result.runtime ?? 0).toFixed(3)}s · Updated{" "}
                       {timeAgo(Date.parse(result.retrieved_at), now)}
+                      {hasResultFootnote() && (
+                        <ResultFootnote retrievedAt={result.retrieved_at} placement="editor" />
+                      )}
                     </p>
                     <div className="flex items-center gap-2">
                       {queryId != null &&

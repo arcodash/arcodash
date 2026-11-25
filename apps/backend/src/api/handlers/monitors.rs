@@ -20,7 +20,7 @@ use crate::auth::CurrentUser;
 use crate::authz::authorize::{self, Action, Caller, MonitorVerb};
 use crate::db::Db;
 use crate::error::ApiError;
-use crate::services::{monitor_service, run_service};
+use crate::services::{monitor_service, object_cleanup, run_service};
 use crate::state::AppState;
 
 /// The `caller` block for monitor `id`, from the Edit-tier `evaluate(...)` the mutation gates use.
@@ -389,12 +389,21 @@ pub async fn update(
 }
 
 pub async fn delete(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     let existing = monitor_service::get_for_user(&db, user.org_id, &user, id).await?;
+    let org_id = existing.org_id;
     monitor_service::delete(&db, &user, existing).await?;
+    db.after_commit(Box::pin(object_cleanup::run(
+        state.storage.clone(),
+        state.db.clone(),
+        org_id,
+        object_cleanup::DeletedObject::Monitors(vec![id]),
+    )))
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -617,6 +626,7 @@ pub struct ObservationResponse {
 /// `GET /api/monitors/:id/observations?limit=` — newest `limit` (default 100, 1..=500),
 /// oldest-first.
 pub async fn list_observations(
+    State(state): State<AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
@@ -632,14 +642,49 @@ pub async fn list_observations(
         .all(&db)
         .await?;
     rows.reverse();
+    let range = rows.first().zip(rows.last()).map(|(first, last)| {
+        (
+            first.observed_at.with_timezone(&Utc),
+            last.observed_at.with_timezone(&Utc),
+        )
+    });
+    let stored = match range {
+        Some((from, to)) => {
+            let storage = state.storage.resolve(&state.db, user.org_id).await?;
+            match arcodash_core::observation_store::load_observations(&storage, a.id, from, to)
+                .await
+            {
+                Ok(stored) => stored,
+                Err(e) => {
+                    if matches!(
+                        e,
+                        arcodash_core::org_storage::StorageError::Unreachable { .. }
+                    ) {
+                        state
+                            .storage
+                            .report_failure(&state.db, user.org_id, &e)
+                            .await;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        None => std::collections::HashMap::new(),
+    };
     Ok(Json(
         rows.into_iter()
-            .map(|o| ObservationResponse {
-                observed_at: o.observed_at.with_timezone(&Utc),
-                value: o.value,
-                state: o.state,
-                explanation: o.explanation,
-                run_id: o.run_id,
+            .map(|o| {
+                let values = stored.get(&o.id);
+                ObservationResponse {
+                    observed_at: o.observed_at.with_timezone(&Utc),
+                    value: arcodash_core::observation_store::merged_value(o.value, values),
+                    state: o.state,
+                    explanation: arcodash_core::observation_store::merged_explanation(
+                        o.explanation,
+                        values,
+                    ),
+                    run_id: o.run_id,
+                }
             })
             .collect::<Vec<_>>(),
     ))

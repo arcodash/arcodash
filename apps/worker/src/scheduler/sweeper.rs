@@ -5,10 +5,12 @@ use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
-    Statement,
+    Statement, TransactionTrait,
 };
 
-use arcodash_core::entities::{data_source_upload, monitor, run};
+use arcodash_core::entities::{data_source_upload, mail_delivery, monitor, run};
+use arcodash_core::mail_notify::load_body;
+use arcodash_core::org_storage::{OrgStorage, StorageArea, StorageError};
 use arcodash_core::queue::{JobMessage, QueueName};
 
 use crate::delivery_lifecycle;
@@ -164,7 +166,8 @@ const REQUEUE_COOLDOWN_SECS: u64 = 300;
 
 /// Retries `pending` runs older than [`STALE_PENDING_SECS`] via `try_enqueue_run`, which re-checks
 /// the concurrency cap. Already-enqueued rows are gated behind [`REQUEUE_COOLDOWN_SECS`] in Redis
-/// to avoid duplicate envelopes; never-enqueued rows retry every sweep.
+/// to avoid duplicate envelopes; deferred rows wait out their cooldown, and other never-enqueued
+/// rows retry every sweep.
 pub async fn requeue_stale_pending(ctx: &ExecuteQueryContext) -> usize {
     let rows: Vec<run::Model> = match run::Entity::find()
         .from_raw_sql(Statement::from_sql_and_values(
@@ -189,9 +192,22 @@ pub async fn requeue_stale_pending(ctx: &ExecuteQueryContext) -> usize {
     let mut reclaimed = 0usize;
     for run in rows {
         let id = run.id;
-        if run.enqueued_at.is_some() {
+        if run.enqueued_at.is_none() {
+            // Parked by a deferral: wait out its cooldown (check only; enqueueing re-stamps it).
             let mut conn = ctx.redis.clone();
-            let key = format!("arcodash:requeue-cooldown:run:{id}");
+            match conn
+                .exists::<_, bool>(run_lifecycle::requeue_cooldown_key(id))
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(run_id = id, error = %e, "sweeper: deferral cooldown check failed, re-enqueuing anyway");
+                }
+            }
+        } else {
+            let mut conn = ctx.redis.clone();
+            let key = run_lifecycle::requeue_cooldown_key(id);
             let claimed: Result<Option<String>, _> = conn
                 .set_options(
                     &key,
@@ -389,6 +405,10 @@ async fn stale_fallback_eval(
     waiter_id: i64,
 ) {
     if let Err(e) = stale_fallback_eval_inner(ctx, org_id, monitor_id, waiter_id).await {
+        if crate::handlers::evaluate_monitor::is_storage_switching(&e) {
+            crate::handlers::evaluate_monitor::defer_for_storage_switch(ctx, waiter_id).await;
+            return;
+        }
         tracing::error!(run_id = waiter_id, error = %e, "sweeper: stale-fallback eval failed");
         match run_lifecycle::finalize_run_with_retry(
             ctx,
@@ -587,7 +607,13 @@ pub async fn requeue_stale_pending_notifications(ctx: &ExecuteQueryContext) -> u
         };
 
         let explanation = if state == "triggered" {
-            crate::handlers::explain_alert::latest_explanation(&ctx.db, monitor_id).await
+            arcodash_core::observation_store::latest_incident_explanation(
+                &ctx.db,
+                ctx.storage.as_ref(),
+                org_id,
+                monitor_id,
+            )
+            .await
         } else {
             None
         };
@@ -624,14 +650,14 @@ pub async fn requeue_stale_pending_notifications(ctx: &ExecuteQueryContext) -> u
     reclaimed
 }
 
-/// Same recovery for `mail_deliveries` (`pending` and `retrying`); the full `send_mail` payload lives
-/// in the row.
+/// Same recovery for `mail_deliveries` (`pending` and `retrying`); the `send_mail` body is loaded
+/// from object storage (or the legacy inline column).
 pub async fn requeue_stale_pending_mail(ctx: &ExecuteQueryContext) -> usize {
     let Some(rows) = load_batch(
         &ctx.db,
         Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id, org_id, task_type, entity_id, to_email, subject, body_html \
+            "SELECT id, org_id, task_type, entity_id, to_email, subject, body_html, body_location \
              FROM mail_deliveries \
              WHERE lease_expires_at IS NULL \
                AND ((status = 'pending' \
@@ -653,6 +679,7 @@ pub async fn requeue_stale_pending_mail(ctx: &ExecuteQueryContext) -> usize {
     };
 
     let mut reclaimed = 0usize;
+    let mut storages: std::collections::HashMap<i64, OrgStorage> = std::collections::HashMap::new();
     for row in rows {
         let Ok(id) = row.try_get::<i64>("", "id") else {
             tracing::error!(
@@ -687,16 +714,70 @@ pub async fn requeue_stale_pending_mail(ctx: &ExecuteQueryContext) -> usize {
                 }
             }
             "send_mail" => {
-                let (Ok(Some(to)), Ok(Some(subject)), Ok(Some(body_html))) = (
+                let (Ok(Some(to)), Ok(Some(subject))) = (
                     row.try_get::<Option<String>>("", "to_email"),
                     row.try_get::<Option<String>>("", "subject"),
-                    row.try_get::<Option<String>>("", "body_html"),
                 ) else {
                     tracing::warn!(
                         delivery_id = id,
                         "sweeper: send_mail row missing payload, cannot recover"
                     );
                     continue;
+                };
+                let storage = match storages.entry(org_id) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        match ctx.storage.resolve(&ctx.db, org_id).await {
+                            Ok(s) => v.insert(s),
+                            Err(e) => {
+                                tracing::warn!(delivery_id = id, org_id, error = %e, "sweeper: send_mail storage unavailable, retrying next sweep");
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let mut location = row
+                    .try_get::<Option<String>>("", "body_location")
+                    .ok()
+                    .flatten();
+                let inline = row
+                    .try_get::<Option<String>>("", "body_html")
+                    .ok()
+                    .flatten();
+                let probed_key = arcodash_core::mail_notify::mail_body_key(id);
+                let probing = location.is_none() && inline.is_none();
+                if probing {
+                    location = Some(probed_key.clone());
+                }
+                let body_html = match load_body(storage, location.as_deref(), inline.as_deref())
+                    .await
+                {
+                    Ok(b) => {
+                        if probing {
+                            if let Err(e) =
+                                mail_delivery::set_body_location(&ctx.db, id, &probed_key).await
+                            {
+                                tracing::warn!(delivery_id = id, error = %e, "sweeper: failed to record a rescued mail body location");
+                            }
+                        }
+                        b
+                    }
+                    Err(StorageError::NotFound) => {
+                        tracing::warn!(
+                            delivery_id = id,
+                            "sweeper: send_mail body missing, marking failed"
+                        );
+                        mail_delivery::fail_body_missing(&ctx.db, id).await;
+                        if let Err(e) = storage.delete(StorageArea::Emails, &probed_key).await {
+                            tracing::warn!(delivery_id = id, error = %e, "sweeper: failed to delete a failed mail's body object");
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        ctx.storage.report_failure(&ctx.db, org_id, &e).await;
+                        tracing::warn!(delivery_id = id, org_id, error = %e, "sweeper: send_mail body unavailable, retrying next sweep");
+                        continue;
+                    }
                 };
                 JobMessage::SendMail {
                     org_id,
@@ -762,13 +843,14 @@ fn is_orphan_upload(
 }
 
 /// Runs from `run_aux_ticks` against the admin/pooled db so it sees every org. Deletes the object
-/// before the row, so a failed object delete is retried next tick.
+/// before the row, so a failed object delete is retried next tick. Objects in storage the
+/// organization supplies are left in place; only the row is removed.
 pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
     let Some(rows) = load_batch(
         &ctx.db,
         Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id, object_key, data_source_id, created_at FROM data_source_uploads \
+            "SELECT id, org_id, object_key, data_source_id, created_at FROM data_source_uploads \
              WHERE data_source_id IS NULL \
                AND created_at < now() - ($1 || ' seconds')::interval",
             [ORPHAN_UPLOAD_AGE_SECS.into()],
@@ -781,6 +863,9 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
     };
 
     let now = Utc::now();
+    // `None`: storage lookup failed or is paused; the org is skipped for the whole sweep.
+    let mut retention_by_org: std::collections::HashMap<i64, Option<bool>> =
+        std::collections::HashMap::new();
     for row in rows {
         let Ok(id) = row.try_get::<uuid::Uuid>("", "id") else {
             tracing::error!(
@@ -788,7 +873,8 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
             );
             continue;
         };
-        let (Ok(object_key), Ok(data_source_id), Ok(created_at)) = (
+        let (Ok(org_id), Ok(object_key), Ok(data_source_id), Ok(created_at)) = (
+            row.try_get::<i64>("", "org_id"),
             row.try_get::<String>("", "object_key"),
             row.try_get::<Option<i64>>("", "data_source_id"),
             row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "created_at"),
@@ -802,9 +888,35 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
             tracing::error!(upload_id = %id, "sweeper: orphaned-upload query returned a non-orphan row, skipping");
             continue;
         }
-        if let Err(e) = ctx.store.delete(&object_key).await {
-            tracing::error!(upload_id = %id, error = %e, "sweeper: failed to delete orphaned upload object, leaving row for retry");
+        let manages = if let Some(m) = retention_by_org.get(&org_id) {
+            *m
+        } else {
+            let m = match ctx.storage.resolve(&ctx.db, org_id).await {
+                Ok(s) if s.writes_paused() => None,
+                Ok(s) => Some(s.manages_retention()),
+                Err(e) => {
+                    tracing::warn!(org_id, error = %e, "sweeper: org storage unavailable, skipping its orphaned uploads");
+                    None
+                }
+            };
+            retention_by_org.insert(org_id, m);
+            m
+        };
+        let Some(manages) = manages else {
             continue;
+        };
+        if manages {
+            if let Err(e) =
+                arcodash_core::storage::delete_upload(&*ctx.storage, &ctx.db, org_id, &object_key)
+                    .await
+            {
+                if matches!(e, arcodash_core::org_storage::StorageError::Switching) {
+                    tracing::info!(upload_id = %id, "sweeper: org storage is switching, leaving orphaned upload for retry");
+                } else {
+                    tracing::error!(upload_id = %id, error = %e, "sweeper: failed to delete orphaned upload object, leaving row for retry");
+                }
+                continue;
+            }
         }
         if let Err(e) = data_source_upload::Entity::delete_by_id(id)
             .exec(&ctx.db)
@@ -813,6 +925,235 @@ pub async fn sweep_orphan_uploads(ctx: &ExecuteQueryContext) {
             tracing::error!(upload_id = %id, error = %e, "sweeper: failed to delete orphaned upload row after its object was already deleted");
         }
     }
+}
+
+/// A stored result row selected for expiry.
+struct ExpiredCandidate {
+    id: i64,
+    org_id: i64,
+    data_source_id: i64,
+    query_hash: String,
+}
+
+/// Outcome of expiring one stored result.
+#[derive(Debug, PartialEq, Eq)]
+enum Expiry {
+    Deleted,
+    Kept,
+    StorageFailed,
+}
+
+/// Counts from one retention sweep tick.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResultSweepStats {
+    pub deleted: usize,
+    pub skipped_orgs: usize,
+    pub failed_orgs: usize,
+}
+
+/// Deletes one stale result's row and object under the same advisory lock `execute_query` holds
+/// while writing, re-checking staleness so a concurrent read or refresh wins. On an object-delete
+/// failure the row is kept for the next sweep.
+async fn expire_result(
+    ctx: &ExecuteQueryContext,
+    storage: &arcodash_core::org_storage::OrgStorage,
+    candidate: &ExpiredCandidate,
+    retention_days: i64,
+) -> Result<Expiry, sea_orm::DbErr> {
+    let txn = ctx.db.begin().await?;
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        [format!(
+            "{}:{}:{}",
+            candidate.org_id, candidate.data_source_id, candidate.query_hash
+        )
+        .into()],
+    ))
+    .await?;
+    let deleted = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM query_results \
+             WHERE id = $1 AND data IS NULL \
+               AND last_used_at < now() - make_interval(days => $2::int) \
+             RETURNING data_location",
+            [candidate.id.into(), retention_days.into()],
+        ))
+        .await?;
+    let Some(row) = deleted else {
+        txn.rollback().await?;
+        return Ok(Expiry::Kept);
+    };
+    if let Some(location) = row.try_get::<Option<String>>("", "data_location")? {
+        match storage
+            .delete(arcodash_core::org_storage::StorageArea::Results, &location)
+            .await
+        {
+            Ok(()) | Err(arcodash_core::org_storage::StorageError::NotFound) => {}
+            Err(e) => {
+                tracing::warn!(org_id = candidate.org_id, result_id = candidate.id, error = %e, "sweeper: failed to delete expired result object, keeping row for retry");
+                txn.rollback().await?;
+                return Ok(Expiry::StorageFailed);
+            }
+        }
+    }
+    txn.commit().await?;
+    Ok(Expiry::Deleted)
+}
+
+/// Pages scanned per tick; bounds the work of one sweep.
+pub const RESULT_SWEEP_MAX_PAGES: usize = 20;
+
+/// Consecutive database errors while expiring rows after which a tick gives up.
+const RESULT_SWEEP_MAX_DB_ERRORS: usize = 20;
+
+/// Position in the `(last_used_at, id)` scan order where the next sweep tick resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepCursor {
+    pub last_used_at: sea_orm::prelude::DateTimeWithTimeZone,
+    pub id: i64,
+}
+
+/// Deletes stored results (row and object) unused for `result_retention_days`. Skips legacy
+/// inline rows and organizations whose bucket the operator does not manage. Returns the number of
+/// rows deleted.
+#[cfg(test)]
+pub async fn sweep_expired_results(ctx: &ExecuteQueryContext) -> usize {
+    sweep_expired_results_with_limit(ctx, sweep_batch_limit(), RESULT_SWEEP_MAX_PAGES, None)
+        .await
+        .0
+        .deleted
+}
+
+/// Sweeps in keyset-ordered pages of `limit` rows, at most `max_pages`, resuming after `start`.
+/// Returns the cursor for the next tick: `None` once the scan reached the end (or a page failed
+/// to load), so rows that are always skipped cannot starve those behind them.
+pub async fn sweep_expired_results_with_limit(
+    ctx: &ExecuteQueryContext,
+    limit: i64,
+    max_pages: usize,
+    start: Option<SweepCursor>,
+) -> (ResultSweepStats, Option<SweepCursor>) {
+    let retention_days = ctx.result_retention_days;
+    let mut stats = ResultSweepStats::default();
+    let mut storages: std::collections::HashMap<
+        i64,
+        Option<arcodash_core::org_storage::OrgStorage>,
+    > = std::collections::HashMap::new();
+    let mut failed_orgs: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut cursor = start;
+    let mut db_errors = 0usize;
+
+    for _ in 0..max_pages {
+        let (after_ts, after_id): (String, i64) = cursor.map_or_else(
+            || ("-infinity".to_string(), 0),
+            |c| {
+                (
+                    c.last_used_at
+                        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    c.id,
+                )
+            },
+        );
+        let Some(rows) = load_batch(
+            &ctx.db,
+            Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id, org_id, data_source_id, query_hash, last_used_at FROM query_results \
+                 WHERE data IS NULL AND data_location IS NOT NULL \
+                   AND last_used_at < now() - make_interval(days => $1::int) \
+                   AND last_used_at >= $3::text::timestamptz \
+                   AND (last_used_at, id) > ($3::text::timestamptz, $4::bigint) \
+                 ORDER BY last_used_at, id LIMIT $2",
+                [
+                    retention_days.into(),
+                    limit.into(),
+                    after_ts.into(),
+                    after_id.into(),
+                ],
+            ),
+            "expired results",
+        )
+        .await
+        else {
+            return (stats, None);
+        };
+        let page_len = rows.len();
+
+        for row in rows {
+            let (Ok(id), Ok(last_used_at)) = (
+                row.try_get::<i64>("", "id"),
+                row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "last_used_at"),
+            ) else {
+                tracing::error!("sweeper: malformed expired-result row, skipping");
+                continue;
+            };
+            cursor = Some(SweepCursor { last_used_at, id });
+            let (Ok(org_id), Ok(data_source_id), Ok(query_hash)) = (
+                row.try_get::<i64>("", "org_id"),
+                row.try_get::<i64>("", "data_source_id"),
+                row.try_get::<String>("", "query_hash"),
+            ) else {
+                tracing::error!("sweeper: malformed expired-result row, skipping");
+                continue;
+            };
+            if let std::collections::hash_map::Entry::Vacant(slot) = storages.entry(org_id) {
+                let usable = match ctx.storage.resolve(&ctx.db, org_id).await {
+                    Ok(s) if s.manages_retention() && !s.writes_paused() => Some(s),
+                    Ok(_) => {
+                        stats.skipped_orgs += 1;
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(org_id, error = %e, "sweeper: cannot resolve storage for result retention, skipping org");
+                        stats.skipped_orgs += 1;
+                        None
+                    }
+                };
+                slot.insert(usable);
+            }
+            let Some(Some(storage)) = storages.get(&org_id) else {
+                continue;
+            };
+            let candidate = ExpiredCandidate {
+                id,
+                org_id,
+                data_source_id,
+                query_hash,
+            };
+            match expire_result(ctx, storage, &candidate, retention_days).await {
+                Ok(outcome) => {
+                    db_errors = 0;
+                    match outcome {
+                        Expiry::Deleted => stats.deleted += 1,
+                        Expiry::Kept => {}
+                        Expiry::StorageFailed => {
+                            if failed_orgs.insert(org_id) {
+                                stats.failed_orgs += 1;
+                            }
+                            storages.insert(org_id, None);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(org_id, result_id = id, error = %e, "sweeper: failed to expire result");
+                    db_errors += 1;
+                    if db_errors >= RESULT_SWEEP_MAX_DB_ERRORS {
+                        tracing::error!(
+                            "sweeper: stopping result sweep after repeated database errors"
+                        );
+                        return (stats, cursor);
+                    }
+                }
+            }
+        }
+
+        if usize::try_from(limit).map_or(true, |l| page_len < l) {
+            return (stats, None);
+        }
+    }
+    (stats, cursor)
 }
 
 /// A conveyor task can go terminal while its `runs` row stays `pending`/`running` (separate tables,
@@ -1838,6 +2179,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_fallback_defers_during_storage_switch() {
+        use arcodash_core::test_support::blob::{MemoryBlobStore, StaticResolver};
+        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let _guard = SWEEP_ENV_LOCK.lock().await;
+        for resolver in [
+            StaticResolver::with_store(
+                arcodash_core::org_storage::StorageMode::ArcoDash,
+                std::sync::Arc::new(MemoryBlobStore::default()),
+                "orgs/test/",
+            )
+            .switching(),
+            StaticResolver::with_store(
+                arcodash_core::org_storage::StorageMode::ArcoDash,
+                std::sync::Arc::new(MemoryBlobStore::default()),
+                "orgs/test/",
+            )
+            .paused(),
+        ] {
+            let suffix = uuid::Uuid::new_v4();
+            let org = seed_org(&db, &format!("org-ceiling-switch-{suffix}")).await;
+            let ds = seed_data_source(&db, org.id).await;
+            let q = seed_published_query(&db, org.id, ds.id).await;
+            let qr = seed_query_result(
+                &db,
+                org.id,
+                ds.id,
+                Utc::now() - chrono::Duration::seconds(500),
+                serde_json::json!({"value": 10.0}),
+            )
+            .await;
+            set_published_latest_query_data(&db, q.id, qr.id).await;
+            let mon = seed_monitor(
+                &db,
+                org.id,
+                q.id,
+                q.user_id,
+                serde_json::json!({"column": "value", "op": ">", "value": 50.0, "max_fresh_wait_secs": 1}),
+            )
+            .await;
+            let target_id = seed_query_run(&db, &q, "running", None).await;
+            let waiter_id =
+                seed_run(&db, org.id, "monitor", mon.id, None, None, "running", None).await;
+            let ctx = ExecuteQueryContext {
+                storage: std::sync::Arc::new(resolver),
+                ..test_ctx(db.clone(), redis.clone())
+            };
+            park_waiter(
+                &db,
+                waiter_id,
+                target_id,
+                Utc::now() - chrono::Duration::seconds(5),
+            )
+            .await;
+
+            sweep_waiting_runs(&ctx).await;
+
+            assert_eq!(
+                run_status(&db, waiter_id).await,
+                "pending",
+                "a storage switch must defer the detached waiter, not fail it"
+            );
+            let deliveries = arcodash_core::entities::notification_delivery::Entity::find()
+                .filter(
+                    arcodash_core::entities::notification_delivery::Column::MonitorId.eq(mon.id),
+                )
+                .count(&db)
+                .await
+                .unwrap();
+            assert_eq!(deliveries, 0);
+            exec_sql(
+                &db,
+                "UPDATE runs SET status = 'success' WHERE id = ANY($1)",
+                [vec![waiter_id, target_id].into()],
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
     async fn sweep_waiting_runs_hard_timeout_fails_an_always_wait_monitor() {
         let Some((db, redis)) = setup().await else {
             eprintln!("skipping: TEST_DATABASE_URL not set");
@@ -2416,7 +2840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_stale_pending_mail_rebuilds_send_mail_with_full_payload() {
+    async fn requeue_stale_pending_mail_loads_body_from_storage() {
         let Some((db, redis)) = setup().await else {
             eprintln!("skipping: TEST_DATABASE_URL not set");
             return;
@@ -2427,16 +2851,31 @@ mod tests {
         let to = format!("stale-mail-{suffix}@test.local");
         let subject = "stale subject".to_string();
         let body_html = "<p>stale body</p>".to_string();
-        let delivery_id =
-            mail_delivery::insert_pending_mail(&db, org.id, &to, &subject, &body_html)
-                .await
-                .unwrap();
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let storage = ctx.storage.resolve(&db, org.id).await.unwrap();
+        let delivery_id = arcodash_core::mail_notify::enqueue_send_mail(
+            &db,
+            &storage,
+            &arcodash_core::test_support::RecordingQueue::default(),
+            None,
+            org.id,
+            to.clone(),
+            subject.clone(),
+            body_html.clone(),
+        )
+        .await
+        .unwrap();
+        let row = mail_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.body_html, None);
         backdate_created_at(&db, "mail_deliveries", delivery_id, STALE_PENDING_SECS + 30).await;
 
         let key = queue::QueueName::Default.queue_key();
         drain(&redis, &key).await;
 
-        let ctx = test_ctx(db.clone(), redis.clone());
         requeue_stale_pending_mail(&ctx).await;
 
         let job = find_and_remove_job(&redis, &key, |j| {
@@ -2459,6 +2898,78 @@ mod tests {
             }
             other => panic!("expected SendMail, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn requeue_stale_pending_mail_rescues_orphaned_body() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(&db, &format!("org-mail-orphan-{suffix}")).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let storage = ctx.storage.resolve(&db, org.id).await.unwrap();
+        let delivery_id = mail_delivery::insert_pending_mail(&db, org.id, "to@test.local", "s")
+            .await
+            .unwrap();
+        let rel = arcodash_core::mail_notify::mail_body_key(delivery_id);
+        storage
+            .put(
+                StorageArea::Emails,
+                &rel,
+                "<p>orphan</p>".as_bytes().to_vec().into(),
+                "text/html; charset=utf-8",
+            )
+            .await
+            .unwrap();
+        backdate_created_at(&db, "mail_deliveries", delivery_id, STALE_PENDING_SECS + 30).await;
+
+        let key = queue::QueueName::Default.queue_key();
+        drain(&redis, &key).await;
+        requeue_stale_pending_mail(&ctx).await;
+
+        let job = find_and_remove_job(&redis, &key, |j| {
+            matches!(j, queue::JobMessage::SendMail { delivery_id: Some(id), .. } if *id == delivery_id)
+        })
+        .await
+        .expect("an orphaned body must be rescued and the mail re-enqueued");
+        match job {
+            queue::JobMessage::SendMail { body_html, .. } => {
+                assert_eq!(body_html, "<p>orphan</p>");
+            }
+            other => panic!("expected SendMail, got {other:?}"),
+        }
+        let row = mail_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.body_location.as_deref(), Some(rel.as_str()));
+        assert_eq!(row.status, "pending");
+        let _ = storage.delete(StorageArea::Emails, &rel).await;
+    }
+
+    #[tokio::test]
+    async fn requeue_stale_pending_mail_fails_row_whose_body_is_gone() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let org = seed_org(&db, &format!("org-mail-body-gone-{suffix}")).await;
+        let delivery_id = mail_delivery::insert_pending_mail(&db, org.id, "to@test.local", "s")
+            .await
+            .unwrap();
+        backdate_created_at(&db, "mail_deliveries", delivery_id, STALE_PENDING_SECS + 30).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        requeue_stale_pending_mail(&ctx).await;
+        let row = mail_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
     }
 
     /// Moves a `mail_deliveries` row to `retrying` with a backdated `started_at` and no live lease.
@@ -2859,7 +3370,10 @@ mod tests {
         let suffix = uuid::Uuid::new_v4();
         let org = seed_org(&db, &format!("org-orphan-sweep-{suffix}")).await;
         let ds = seed_data_source(&db, org.id).await;
-        let ctx = test_ctx(db.clone(), redis.clone());
+        let mut ctx = test_ctx(db.clone(), redis.clone());
+        ctx.storage = std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            ctx.store.clone(),
+        ));
 
         // (a) unlinked, older than the 24h cutoff — must be swept.
         let (orphan_id, orphan_key) = seed_upload(&db, &ctx.store, org.id, None, 25).await;
@@ -2911,6 +3425,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_orphan_uploads_skips_paused_orgs() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-orphan-paused-{}", uuid::Uuid::new_v4())).await;
+        let mut ctx = test_ctx(db.clone(), redis.clone());
+        let paused = std::sync::Arc::new(
+            arcodash_core::test_support::blob::StaticResolver::with_store(
+                arcodash_core::org_storage::StorageMode::ArcoDash,
+                std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default()),
+                "orgs/test/",
+            )
+            .paused(),
+        );
+        ctx.storage = paused;
+        let (first, _) = seed_upload(&db, &ctx.store, org.id, None, 25).await;
+        let (second, _) = seed_upload(&db, &ctx.store, org.id, None, 26).await;
+
+        sweep_orphan_uploads(&ctx).await;
+
+        for id in [first, second] {
+            assert!(
+                data_source_upload::Entity::find_by_id(id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a paused org's orphaned uploads must be left for a later sweep"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_uploads_leaves_objects_in_unmanaged_storage() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-orphan-cust-{}", uuid::Uuid::new_v4())).await;
+        let (ctx, mem) = ctx_with_mem_store(
+            test_ctx(db.clone(), redis),
+            arcodash_core::org_storage::StorageMode::OrgBucket,
+        );
+        let id = uuid::Uuid::new_v4();
+        let rel = arcodash_core::storage::upload_rel_key("csv", id, "data.csv");
+        let abs = format!("orgs/test/uploads/{rel}");
+        arcodash_core::org_storage::BlobStore::put(
+            &*mem,
+            &abs,
+            bytes::Bytes::from_static(b"a\n1\n"),
+            "text/csv",
+        )
+        .await
+        .unwrap();
+        data_source_upload::ActiveModel {
+            id: Set(id),
+            org_id: Set(org.id),
+            object_key: Set(rel),
+            filename: Set("data.csv".to_string()),
+            byte_size: Set(4),
+            content_type: Set("text/csv".to_string()),
+            created_by: Set(None),
+            data_source_id: Set(None),
+            created_at: Set((chrono::Utc::now() - chrono::Duration::hours(25)).into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        sweep_orphan_uploads(&ctx).await;
+
+        assert!(
+            data_source_upload::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "row must be swept"
+        );
+        assert!(mem.keys().contains(&abs), "object must be kept");
+        assert_eq!(mem.deletes(), 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_uploads_deletes_relative_key_objects() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-orphan-rel-{}", uuid::Uuid::new_v4())).await;
+        let (ctx, mem) = ctx_with_mem_store(
+            test_ctx(db.clone(), redis),
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+        );
+        let id = uuid::Uuid::new_v4();
+        let rel = arcodash_core::storage::upload_rel_key("csv", id, "data.csv");
+        let abs = format!("orgs/test/uploads/{rel}");
+        arcodash_core::org_storage::BlobStore::put(
+            &*mem,
+            &abs,
+            bytes::Bytes::from_static(b"a\n1\n"),
+            "text/csv",
+        )
+        .await
+        .unwrap();
+        // A same-named object in the default store must never be touched for a relative key.
+        let decoy = format!("orgs/{}/uploads/{rel}", org.id);
+        ctx.store.ensure_bucket().await.expect("ensure test bucket");
+        ctx.store
+            .put(&decoy, bytes::Bytes::from_static(b"a\n1\n"), "text/csv")
+            .await
+            .unwrap();
+        data_source_upload::ActiveModel {
+            id: Set(id),
+            org_id: Set(org.id),
+            object_key: Set(rel),
+            filename: Set("data.csv".to_string()),
+            byte_size: Set(4),
+            content_type: Set("text/csv".to_string()),
+            created_by: Set(None),
+            data_source_id: Set(None),
+            created_at: Set((chrono::Utc::now() - chrono::Duration::hours(25)).into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        sweep_orphan_uploads(&ctx).await;
+
+        assert!(
+            mem.keys().is_empty(),
+            "object must be deleted via org storage"
+        );
+        assert!(
+            data_source_upload::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "row must be swept"
+        );
+        assert!(
+            ctx.store.get(&decoy).await.is_ok(),
+            "the default store must not be touched for a relative key"
+        );
+        ctx.store.delete(&decoy).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn reconcile_run_task_divergence_counts_a_terminal_task_whose_run_never_followed() {
         let Some((db, redis)) = setup().await else {
             eprintln!("skipping: TEST_DATABASE_URL not set");
@@ -2949,5 +3613,459 @@ mod tests {
             "seeding a task whose run is still pending must move the counter by at least 1, got {}",
             after - before
         );
+    }
+
+    async fn seed_stored_result(
+        db: &sea_orm::DatabaseConnection,
+        store: &arcodash_core::test_support::blob::MemoryBlobStore,
+        org_id: i64,
+        ds_id: i64,
+        age_days: i64,
+    ) -> arcodash_core::entities::query_result::Model {
+        use arcodash_core::entities::query_result;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        let when = Utc::now() - chrono::Duration::days(age_days);
+        let location = format!("{org_id}/{}.json.gz", uuid::Uuid::new_v4());
+        let now = sea_orm::prelude::DateTimeWithTimeZone::from(Utc::now());
+        let row = query_result::ActiveModel {
+            org_id: Set(org_id),
+            data_source_id: Set(ds_id),
+            query_hash: Set(format!("hash-{}", uuid::Uuid::new_v4())),
+            query: Set("SELECT 1".to_string()),
+            data: Set(None),
+            data_location: Set(Some(location.clone())),
+            data_size_bytes: Set(Some(3)),
+            data_sha256: Set(None),
+            runtime: Set(Some(0.01)),
+            retrieved_at: Set(when.into()),
+            last_used_at: Set(when.into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        arcodash_core::org_storage::BlobStore::put(
+            store,
+            &format!("orgs/test/results/{location}"),
+            bytes::Bytes::from_static(b"abc"),
+            "application/gzip",
+        )
+        .await
+        .unwrap();
+        row
+    }
+
+    fn ctx_with_mem_store(
+        ctx: ExecuteQueryContext,
+        mode: arcodash_core::org_storage::StorageMode,
+    ) -> (
+        ExecuteQueryContext,
+        std::sync::Arc<arcodash_core::test_support::blob::MemoryBlobStore>,
+    ) {
+        let store =
+            std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default());
+        let ctx = ExecuteQueryContext {
+            storage: std::sync::Arc::new(
+                arcodash_core::test_support::blob::StaticResolver::with_store(
+                    mode,
+                    store.clone(),
+                    "orgs/test/",
+                ),
+            ),
+            ..ctx
+        };
+        (ctx, store)
+    }
+
+    async fn result_exists(db: &sea_orm::DatabaseConnection, id: i64) -> bool {
+        arcodash_core::entities::query_result::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn sweep_deletes_object_and_row_after_retention() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-result-sweep-{}", uuid::Uuid::new_v4())).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let (ctx, store) = ctx_only_org_managed(test_ctx(db.clone(), redis), org.id);
+        let row = seed_stored_result(&db, &store, org.id, ds.id, 8).await;
+
+        let deleted = sweep_expired_results(&ctx).await;
+
+        assert_eq!(deleted, 1);
+        assert!(!result_exists(&db, row.id).await, "row must be deleted");
+        assert!(store.keys().is_empty(), "object must be deleted");
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_recently_used_results() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-result-sweep-{}", uuid::Uuid::new_v4())).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let (ctx, store) = ctx_with_mem_store(
+            test_ctx(db.clone(), redis),
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+        );
+        let row = seed_stored_result(&db, &store, org.id, ds.id, 6).await;
+
+        sweep_expired_results(&ctx).await;
+
+        assert!(result_exists(&db, row.id).await);
+        assert_eq!(store.keys().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_never_touches_inline_legacy_rows() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-result-sweep-{}", uuid::Uuid::new_v4())).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let (ctx, store) = ctx_only_org_managed(test_ctx(db.clone(), redis), org.id);
+        let row = seed_query_result(
+            &db,
+            org.id,
+            ds.id,
+            Utc::now() - chrono::Duration::days(30),
+            serde_json::json!({"a": 1}),
+        )
+        .await;
+
+        sweep_expired_results(&ctx).await;
+
+        assert!(
+            result_exists(&db, row.id).await,
+            "inline rows are never swept"
+        );
+        assert_eq!(store.deletes(), 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_customer_storage_orgs() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-result-sweep-{}", uuid::Uuid::new_v4())).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let (ctx, store) = ctx_with_mem_store(
+            test_ctx(db.clone(), redis),
+            arcodash_core::org_storage::StorageMode::OrgBucket,
+        );
+        let row = seed_stored_result(&db, &store, org.id, ds.id, 30).await;
+
+        sweep_expired_results(&ctx).await;
+
+        assert!(result_exists(&db, row.id).await);
+        assert_eq!(store.keys().len(), 1);
+        assert_eq!(store.deletes(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_pointer_is_nulled_after_sweep() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-result-sweep-{}", uuid::Uuid::new_v4())).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let q = seed_query(&db, org.id, ds.id).await;
+        let (ctx, store) = ctx_only_org_managed(test_ctx(db.clone(), redis), org.id);
+        let row = seed_stored_result(&db, &store, org.id, ds.id, 8).await;
+        set_latest_query_data(&db, q.id, row.id).await;
+
+        sweep_expired_results(&ctx).await;
+
+        let q = arcodash_core::entities::query::Entity::find_by_id(q.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.latest_query_data_id, None);
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_row_refreshed_concurrently() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-result-sweep-{}", uuid::Uuid::new_v4())).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let (ctx, store) = ctx_with_mem_store(
+            test_ctx(db.clone(), redis),
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+        );
+        let row = seed_stored_result(&db, &store, org.id, ds.id, 8).await;
+        let candidate = ExpiredCandidate {
+            id: row.id,
+            org_id: org.id,
+            data_source_id: ds.id,
+            query_hash: row.query_hash.clone(),
+        };
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE query_results SET last_used_at = now() WHERE id = $1",
+            [row.id.into()],
+        ))
+        .await
+        .unwrap();
+        let storage = ctx.storage.resolve(&ctx.db, org.id).await.unwrap();
+
+        let outcome = expire_result(&ctx, &storage, &candidate, 7).await.unwrap();
+
+        assert_eq!(outcome, Expiry::Kept);
+        assert!(result_exists(&db, row.id).await);
+        assert_eq!(store.keys().len(), 1);
+        assert_eq!(store.deletes(), 0);
+    }
+
+    /// ArcoDash-managed for `org_id` only; every other org is customer-managed and never swept,
+    /// so leftovers from other tests cannot touch the store.
+    struct OnlyOrgManaged {
+        org_id: i64,
+        store: std::sync::Arc<dyn arcodash_core::org_storage::BlobStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl arcodash_core::org_storage::OrgStorageResolver for OnlyOrgManaged {
+        async fn resolve(
+            &self,
+            _db: &sea_orm::DatabaseConnection,
+            org_id: i64,
+        ) -> Result<arcodash_core::org_storage::OrgStorage, arcodash_core::org_storage::StorageError>
+        {
+            let mode = if org_id == self.org_id {
+                arcodash_core::org_storage::StorageMode::ArcoDash
+            } else {
+                arcodash_core::org_storage::StorageMode::OrgBucket
+            };
+            Ok(arcodash_core::org_storage::OrgStorage::new(
+                org_id,
+                mode,
+                self.store.clone(),
+                "orgs/test/",
+            ))
+        }
+    }
+
+    fn ctx_only_org_managed(
+        ctx: ExecuteQueryContext,
+        org_id: i64,
+    ) -> (
+        ExecuteQueryContext,
+        std::sync::Arc<arcodash_core::test_support::blob::MemoryBlobStore>,
+    ) {
+        let store =
+            std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default());
+        let ctx = ExecuteQueryContext {
+            storage: std::sync::Arc::new(OnlyOrgManaged {
+                org_id,
+                store: store.clone(),
+            }),
+            ..ctx
+        };
+        (ctx, store)
+    }
+
+    /// ArcoDash-managed for every org except `customer_org`.
+    struct SplitResolver {
+        customer_org: i64,
+        store: std::sync::Arc<dyn arcodash_core::org_storage::BlobStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl arcodash_core::org_storage::OrgStorageResolver for SplitResolver {
+        async fn resolve(
+            &self,
+            _db: &sea_orm::DatabaseConnection,
+            org_id: i64,
+        ) -> Result<arcodash_core::org_storage::OrgStorage, arcodash_core::org_storage::StorageError>
+        {
+            let mode = if org_id == self.customer_org {
+                arcodash_core::org_storage::StorageMode::OrgBucket
+            } else {
+                arcodash_core::org_storage::StorageMode::ArcoDash
+            };
+            Ok(arcodash_core::org_storage::OrgStorage::new(
+                org_id,
+                mode,
+                self.store.clone(),
+                "orgs/test/",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_is_not_starved_by_skipped_orgs() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let org_a = seed_org(&db, &format!("org-result-sweep-a-{suffix}")).await;
+        let ds_a = seed_data_source(&db, org_a.id).await;
+        let org_b = seed_org(&db, &format!("org-result-sweep-b-{suffix}")).await;
+        let ds_b = seed_data_source(&db, org_b.id).await;
+        let store =
+            std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default());
+        let ctx = ExecuteQueryContext {
+            storage: std::sync::Arc::new(SplitResolver {
+                customer_org: org_a.id,
+                store: store.clone(),
+            }),
+            ..test_ctx(db.clone(), redis)
+        };
+        let mut a_rows = Vec::new();
+        for _ in 0..3 {
+            a_rows.push(seed_stored_result(&db, &store, org_a.id, ds_a.id, 30).await);
+        }
+        let b_row = seed_stored_result(&db, &store, org_b.id, ds_b.id, 8).await;
+        let b_key = format!("orgs/test/results/{}", b_row.data_location.clone().unwrap());
+
+        let start = Some(SweepCursor {
+            last_used_at: a_rows[0].last_used_at - chrono::Duration::milliseconds(1),
+            id: 0,
+        });
+
+        sweep_expired_results_with_limit(&ctx, 2, RESULT_SWEEP_MAX_PAGES, start).await;
+
+        assert!(
+            !result_exists(&db, b_row.id).await,
+            "org B row must be swept"
+        );
+        assert!(
+            !store.keys().contains(&b_key),
+            "org B object must be deleted"
+        );
+        for row in &a_rows {
+            assert!(
+                result_exists(&db, row.id).await,
+                "customer-managed row stays"
+            );
+        }
+        assert_eq!(store.keys().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sweep_cursor_survives_ticks() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let org_a = seed_org(&db, &format!("org-result-sweep-a-{suffix}")).await;
+        let ds_a = seed_data_source(&db, org_a.id).await;
+        let org_b = seed_org(&db, &format!("org-result-sweep-b-{suffix}")).await;
+        let ds_b = seed_data_source(&db, org_b.id).await;
+        let store =
+            std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default());
+        let ctx = ExecuteQueryContext {
+            storage: std::sync::Arc::new(SplitResolver {
+                customer_org: org_a.id,
+                store: store.clone(),
+            }),
+            ..test_ctx(db.clone(), redis)
+        };
+        let mut a_rows = Vec::new();
+        for _ in 0..3 {
+            a_rows.push(seed_stored_result(&db, &store, org_a.id, ds_a.id, 100).await);
+        }
+        let b_row = seed_stored_result(&db, &store, org_b.id, ds_b.id, 99).await;
+        let b_key = format!("orgs/test/results/{}", b_row.data_location.clone().unwrap());
+        let start = Some(SweepCursor {
+            last_used_at: a_rows[0].last_used_at - chrono::Duration::milliseconds(1),
+            id: 0,
+        });
+
+        let (_, cursor) = sweep_expired_results_with_limit(&ctx, 1, 2, start).await;
+
+        assert!(
+            result_exists(&db, b_row.id).await,
+            "page cap not yet reached org B"
+        );
+        assert!(cursor.is_some(), "a capped tick returns its position");
+
+        sweep_expired_results_with_limit(&ctx, 1, 2, cursor).await;
+
+        assert!(
+            !result_exists(&db, b_row.id).await,
+            "org B row must be swept"
+        );
+        assert!(
+            !store.keys().contains(&b_key),
+            "org B object must be deleted"
+        );
+    }
+
+    /// Failing ArcoDash storage for one org; every other org is customer-managed and skipped.
+    struct FailingForOrg {
+        org_id: i64,
+        failing: std::sync::Arc<arcodash_core::test_support::blob::FailingBlobStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl arcodash_core::org_storage::OrgStorageResolver for FailingForOrg {
+        async fn resolve(
+            &self,
+            _db: &sea_orm::DatabaseConnection,
+            org_id: i64,
+        ) -> Result<arcodash_core::org_storage::OrgStorage, arcodash_core::org_storage::StorageError>
+        {
+            let mode = if org_id == self.org_id {
+                arcodash_core::org_storage::StorageMode::ArcoDash
+            } else {
+                arcodash_core::org_storage::StorageMode::OrgBucket
+            };
+            Ok(arcodash_core::org_storage::OrgStorage::new(
+                org_id,
+                mode,
+                self.failing.clone(),
+                "orgs/test/",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_stops_org_after_storage_failure() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let org = seed_org(&db, &format!("org-result-sweep-{}", uuid::Uuid::new_v4())).await;
+        let ds = seed_data_source(&db, org.id).await;
+        let failing =
+            std::sync::Arc::new(arcodash_core::test_support::blob::FailingBlobStore::default());
+        let ctx = ExecuteQueryContext {
+            storage: std::sync::Arc::new(FailingForOrg {
+                org_id: org.id,
+                failing: failing.clone(),
+            }),
+            ..test_ctx(db.clone(), redis)
+        };
+        let seed_store = arcodash_core::test_support::blob::MemoryBlobStore::default();
+        let r1 = seed_stored_result(&db, &seed_store, org.id, ds.id, 30).await;
+        let r2 = seed_stored_result(&db, &seed_store, org.id, ds.id, 29).await;
+
+        let (stats, _) =
+            sweep_expired_results_with_limit(&ctx, 10, RESULT_SWEEP_MAX_PAGES, None).await;
+
+        assert!(result_exists(&db, r1.id).await);
+        assert!(result_exists(&db, r2.id).await);
+        assert_eq!(failing.deletes(), 1);
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.failed_orgs, 1);
     }
 }

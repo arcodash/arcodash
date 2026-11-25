@@ -94,7 +94,7 @@ pub async fn dispatch(ctx: &ExecuteQueryContext, message: JobMessage) {
             user_id,
             delivery_id,
         } => {
-            send_digest::handle(ctx, org_id, user_id, delivery_id).await;
+            Box::pin(send_digest::handle(ctx, org_id, user_id, delivery_id)).await;
         }
         JobMessage::SendMail {
             org_id,

@@ -79,6 +79,8 @@ pub struct AppState {
     /// The embedding deployment's login system, if it replaces the built-in one. Filled from
     /// `AppExtensions::external_auth`.
     pub external_auth: Option<Arc<crate::ExternalAuth>>,
+    /// Resolves an organization's object storage; filled from `AppExtensions::storage_resolver`.
+    pub storage: Arc<dyn arcodash_core::org_storage::OrgStorageResolver>,
 }
 
 impl FromRef<AppState> for Config {
@@ -88,6 +90,14 @@ impl FromRef<AppState> for Config {
 }
 
 impl AppState {
+    #[must_use]
+    pub fn result_reader(&self) -> crate::services::result_service::ResultReader<'_> {
+        crate::services::result_service::ResultReader {
+            resolver: self.storage.as_ref(),
+            pool: &self.db,
+        }
+    }
+
     /// `provider` claim this deployment mints and accepts on session cookies.
     #[must_use]
     pub fn session_provider(&self) -> &'static str {

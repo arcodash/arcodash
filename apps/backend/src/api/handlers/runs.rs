@@ -141,12 +141,14 @@ async fn find_authorized_run(
 /// `GET /api/runs/:id/result.csv` — streams the run's `query_results` row as CSV. 404s "result no
 /// longer retained" for a failed run or one whose result has since been GC'd.
 pub async fn result_csv(
+    State(state): State<crate::state::AppState>,
     db: Db,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     let run = find_authorized_run(&db, &user, id, EntityAction::Read).await?;
-    let (bytes, filename) = run_service::run_result_csv(&db, &user, &run).await?;
+    let (bytes, filename) =
+        run_service::run_result_csv(&db, state.result_reader(), &user, &run).await?;
     record_event(
         &db,
         user.org_id,

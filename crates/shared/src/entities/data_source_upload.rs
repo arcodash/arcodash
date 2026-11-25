@@ -1,6 +1,6 @@
 //! An uploaded CSV/SQLite file backing a file-upload data source.
 //!
-//! `object_key` points at the actual bytes in `ObjectStore` (`crate::storage`); this row is what a
+//! `object_key` is the file's key in the org's Uploads area (`crate::storage::get_upload`); this row is what a
 //! connector resolves an `upload_id` to before fetching them. `data_source_id` is NULL until the
 //! upload is linked to a saved data source, and is cleared (not cascaded) when that data source is
 //! deleted — the worker's orphan sweep reclaims rows/objects that stay NULL past its age cutoff.

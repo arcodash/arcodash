@@ -155,8 +155,10 @@ async fn first_publish_fills_published_columns_and_seeds_result_pointer() {
         data: Set(Some(serde_json::json!({"columns": [], "rows": []}))),
         data_location: Set(None),
         data_size_bytes: Set(None),
+        data_sha256: Set(None),
         runtime: Set(None),
         retrieved_at: Set(chrono::Utc::now().into()),
+        last_used_at: Set(chrono::Utc::now().into()),
         created_at: NotSet,
         updated_at: NotSet,
     }
@@ -813,8 +815,10 @@ async fn latest_result_and_execute_saved_serve_published_after_unpublished_draft
         data: Set(Some(serde_json::json!({"columns": [], "rows": []}))),
         data_location: Set(None),
         data_size_bytes: Set(None),
+        data_sha256: Set(None),
         runtime: Set(None),
         retrieved_at: Set(chrono::Utc::now().into()),
+        last_used_at: Set(chrono::Utc::now().into()),
         created_at: NotSet,
         updated_at: NotSet,
     }

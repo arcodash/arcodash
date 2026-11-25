@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement};
 use uuid::Uuid;
 
@@ -16,9 +16,11 @@ use arcodash_core::events::record_event;
 use arcodash_core::models::{parse_monitor_options, MonitorOptions};
 use arcodash_core::monitor_eval::EvaluateMonitorPayload;
 use arcodash_core::notify::{enqueue_send_notification, SendNotificationParams};
+use arcodash_core::observation_store;
+use arcodash_core::org_storage::StorageError;
 use arcodash_core::schedule_spec::ScheduleSpec;
 
-use crate::handlers::execute_query::ExecuteQueryContext;
+use crate::handlers::execute_query::{ExecuteQueryContext, STORAGE_UNREACHABLE_REASON};
 use crate::handlers::explain_alert;
 use crate::handlers::resume_monitor;
 use crate::handlers::send_notification::{format_number, format_observed_cell};
@@ -60,12 +62,31 @@ pub async fn handle(ctx: &ExecuteQueryContext, org_id: i64, monitor_id: i64, run
     let _heartbeat = run_lifecycle::spawn_heartbeat(ctx.db.clone(), rid);
 
     if let Err(e) = drive_fresh_evaluation(ctx, org_id, monitor_id, rid).await {
+        if is_storage_switching(&e) {
+            defer_for_storage_switch(ctx, rid).await;
+            return;
+        }
         tracing::error!(monitor_id, run_id = rid, error = %e, "evaluate_monitor: freshness protocol failed");
         // Any error escaping the protocol finalizes the run failed so it never stays 'running'.
         if let Err(e) = finalize_terminal(ctx, rid, RunStatus::Failed, Some(format!("{e:#}"))).await
         {
             tracing::error!(monitor_id, run_id = rid, error = %e, "evaluate_monitor: failed to finalize a failed run");
         }
+    }
+}
+
+pub fn is_storage_switching(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<StorageError>(),
+        Some(StorageError::Switching)
+    )
+}
+
+/// Returns the run to `pending` so the stale-pending sweep re-runs the check after the switch.
+pub async fn defer_for_storage_switch(ctx: &ExecuteQueryContext, run_id: i64) {
+    tracing::info!(run_id, "evaluate_monitor: storage switching, run deferred");
+    if let Err(e) = run_lifecycle::defer_run(ctx, run_id).await {
+        tracing::error!(run_id, error = %e, "evaluate_monitor: failed to defer a run during a storage switch");
     }
 }
 
@@ -112,8 +133,8 @@ async fn handle_inner(
     let Some((monitor, _)) = load_checkable_monitor(&ctx.db, org_id, monitor_id).await? else {
         return Ok(());
     };
-    let eval = evaluate_state(&ctx.db, &monitor, org_id).await?;
-    let observation_id = record_observation(&ctx.db, org_id, monitor.id, None, &eval).await;
+    let eval = evaluate_state(&ctx.db, &*ctx.storage, &monitor, org_id).await?;
+    let observation_id = record_observation(ctx, org_id, monitor.id, None, &eval).await;
     apply_transition_and_notify(ctx, org_id, &monitor, None, &eval, observation_id).await
 }
 
@@ -250,7 +271,13 @@ pub async fn evaluate_and_finalize(
     run_id: i64,
     evaluated: Option<(i64, i64)>,
 ) -> anyhow::Result<()> {
-    let eval = evaluate_state(&ctx.db, monitor, org_id).await?;
+    // A paused or switching store parks the check; an unreachable one is mapped to `unevaluable`.
+    match ctx.storage.resolve(&ctx.db, org_id).await {
+        Ok(s) if s.writes_paused() => return Err(StorageError::Switching.into()),
+        Err(StorageError::Switching) => return Err(StorageError::Switching.into()),
+        _ => {}
+    }
+    let eval = evaluate_state(&ctx.db, &*ctx.storage, monitor, org_id).await?;
     let won = run_lifecycle::finalize_run(
         ctx,
         run_id,
@@ -276,7 +303,7 @@ pub async fn evaluate_and_finalize(
         );
         return Ok(());
     }
-    let observation_id = record_observation(&ctx.db, org_id, monitor.id, Some(run_id), &eval).await;
+    let observation_id = record_observation(ctx, org_id, monitor.id, Some(run_id), &eval).await;
     apply_transition_and_notify(ctx, org_id, monitor, Some(run_id), &eval, observation_id).await
 }
 
@@ -286,7 +313,7 @@ const MAX_OBSERVATIONS: i64 = 500;
 /// Appends one history point for a real check and trims to the newest `MAX_OBSERVATIONS`.
 /// Best-effort.
 async fn record_observation(
-    db: &sea_orm::DatabaseConnection,
+    ctx: &ExecuteQueryContext,
     org_id: i64,
     monitor_id: i64,
     run_id: Option<i64>,
@@ -295,16 +322,16 @@ async fn record_observation(
     if eval.state == "unknown" {
         return None;
     }
+    let db = &ctx.db;
     let inserted = db
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO monitor_observations \
              (org_id, monitor_id, observed_at, value, state, run_id, query_result_id) \
-             VALUES ($1, $2, now(), $3, $4, $5, $6) RETURNING id",
+             VALUES ($1, $2, now(), NULL, $3, $4, $5) RETURNING id, observed_at",
             [
                 org_id.into(),
                 monitor_id.into(),
-                eval.value.into(),
                 eval.state.as_str().into(),
                 run_id.into(),
                 eval.query_result_id.into(),
@@ -312,15 +339,20 @@ async fn record_observation(
         ))
         .await
         .and_then(|r| r.ok_or_else(|| sea_orm::DbErr::RecordNotFound("observation id".into())))
-        .and_then(|r| r.try_get::<i64>("", "id"));
-    let id = match inserted {
-        Ok(id) => id,
+        .and_then(|r| {
+            Ok((
+                r.try_get::<i64>("", "id")?,
+                r.try_get::<chrono::DateTime<Utc>>("", "observed_at")?,
+            ))
+        });
+    let (id, observed_at) = match inserted {
+        Ok(row) => row,
         Err(e) => {
             tracing::warn!(monitor_id, error = %e, "record_observation: insert failed");
             return None;
         }
     };
-    if let Err(e) = db
+    let pruned = db
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "DELETE FROM monitor_observations WHERE monitor_id = $1 \
@@ -330,29 +362,100 @@ async fn record_observation(
              )",
             [monitor_id.into(), MAX_OBSERVATIONS.into()],
         ))
-        .await
-    {
+        .await;
+    if let Err(e) = &pruned {
         tracing::warn!(monitor_id, error = %e, "record_observation: prune failed");
+    }
+    let oldest = if pruned.is_ok() {
+        oldest_observation(db, monitor_id).await
+    } else {
+        None
+    };
+    match ctx.storage.resolve(db, org_id).await {
+        Ok(storage) => {
+            let values = observation_store::ObservationValues {
+                id,
+                observed_at,
+                value: eval.value,
+                explanation: None,
+            };
+            if let Err(e) =
+                observation_store::append_observation(db, &storage, monitor_id, &values, oldest)
+                    .await
+            {
+                tracing::warn!(monitor_id, error = %e, "record_observation: storing values failed");
+            }
+            if let Some(oldest) = oldest {
+                if (oldest.year(), oldest.month()) < (observed_at.year(), observed_at.month()) {
+                    if let Err(e) =
+                        observation_store::prune_months_before(&storage, monitor_id, oldest).await
+                    {
+                        tracing::warn!(monitor_id, error = %e, "record_observation: stored prune failed");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(monitor_id, error = %e, "record_observation: storage unavailable");
+        }
     }
     Some(id)
 }
 
-/// Best-effort write of an alert explanation onto its observation row.
+/// Timestamp of the oldest retained observation. Best-effort.
+async fn oldest_observation(
+    db: &sea_orm::DatabaseConnection,
+    monitor_id: i64,
+) -> Option<chrono::DateTime<Utc>> {
+    db.query_one_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT min(observed_at) AS oldest FROM monitor_observations WHERE monitor_id = $1",
+        [monitor_id.into()],
+    ))
+    .await
+    .inspect_err(|e| tracing::warn!(monitor_id, error = %e, "oldest_observation: query failed"))
+    .ok()
+    .flatten()
+    .and_then(|r| {
+        r.try_get::<Option<chrono::DateTime<Utc>>>("", "oldest")
+            .ok()
+            .flatten()
+    })
+}
+
+/// Best-effort write of an alert explanation into the observation's stored values.
 async fn persist_explanation(
     ctx: &ExecuteQueryContext,
+    org_id: i64,
     monitor_id: i64,
     observation_id: i64,
     text: String,
 ) {
-    if let Err(e) = ctx
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE monitor_observations SET explanation = $1 WHERE id = $2",
-            [text.into(), observation_id.into()],
-        ))
-        .await
-    {
+    let result: anyhow::Result<()> = async {
+        let row = ctx
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT observed_at FROM monitor_observations WHERE id = $1",
+                [observation_id.into()],
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("observation row missing"))?;
+        let observed_at = row.try_get::<chrono::DateTime<Utc>>("", "observed_at")?;
+        let storage = ctx.storage.resolve(&ctx.db, org_id).await?;
+        observation_store::set_explanation(
+            &ctx.db,
+            &storage,
+            monitor_id,
+            observation_id,
+            observed_at,
+            &text,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
         tracing::warn!(monitor_id, error = %e, "evaluate_monitor: failed to persist explanation");
     }
 }
@@ -365,14 +468,19 @@ async fn backfill_incident_explanation(
     observation_id: Option<i64>,
 ) {
     let Some(id) = observation_id else { return };
-    if explain_alert::latest_explanation(&ctx.db, monitor.id)
-        .await
-        .is_some()
+    if arcodash_core::observation_store::latest_incident_explanation(
+        &ctx.db,
+        ctx.storage.as_ref(),
+        monitor.org_id,
+        monitor.id,
+    )
+    .await
+    .is_some()
     {
         return;
     }
     if let Some(text) = explain_alert::explanation_for(ctx, monitor, eval, observation_id).await {
-        persist_explanation(ctx, monitor.id, id, text).await;
+        persist_explanation(ctx, monitor.org_id, monitor.id, id, text).await;
     }
 }
 
@@ -481,7 +589,7 @@ async fn apply_transition_and_notify(
         None
     };
     if let (Some(text), Some(id)) = (&explanation, observation_id) {
-        persist_explanation(ctx, monitor.id, id, text.clone()).await;
+        persist_explanation(ctx, monitor.org_id, monitor.id, id, text.clone()).await;
     }
 
     for sub in &subs {
@@ -674,17 +782,36 @@ impl Evaluation {
 /// `"unknown"` = no result resolved; `"unevaluable"` = a result exists but the condition couldn't
 /// be computed (`reason` says why). `observed` is the compared cell's display string, set only for
 /// `"triggered"`/`"ok"`; `value` and `query_result_id` identify the reading.
+///
+/// # Errors
+///
+/// Database failure, or the result's storage switching (an unreachable bucket evaluates as
+/// `"unevaluable"`).
 async fn evaluate_state(
     db: &sea_orm::DatabaseConnection,
+    resolver: &dyn arcodash_core::org_storage::OrgStorageResolver,
     monitor: &monitor::Model,
     org_id: i64,
 ) -> anyhow::Result<Evaluation> {
     crate::health::MONITOR_EVALS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let Some((qr_id, data)) = resolve_result_row(db, monitor, org_id)
-        .await?
-        .and_then(|qr| Some((qr.id, qr.data?)))
-    else {
+    let Some(qr) = resolve_result_row(db, monitor, org_id).await? else {
         return Ok(Evaluation::new("unknown", None, None, None, None));
+    };
+    let qr_id = qr.id;
+    let data = match arcodash_core::result_store::load_result(db, db, resolver, &qr).await {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(Evaluation::new("unknown", None, None, None, None)),
+        // A failed object read was already reported by the result store.
+        Err(StorageError::Unreachable { .. }) => {
+            return Ok(Evaluation::new(
+                "unevaluable",
+                Some(STORAGE_UNREACHABLE_REASON.into()),
+                None,
+                None,
+                Some(qr_id),
+            ));
+        }
+        Err(err) => return Err(err.into()),
     };
     let unevaluable = |reason: String| -> anyhow::Result<Evaluation> {
         Ok(Evaluation::new(
@@ -720,22 +847,12 @@ async fn evaluate_state(
         let sensitivity: arcodash_core::models::Sensitivity = option("sensitivity")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "BASELINE_WINDOW is a small constant"
-        )]
-        let mut history: Vec<f64> = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT value FROM monitor_observations \
-                 WHERE monitor_id = $1 AND value IS NOT NULL \
-                 ORDER BY observed_at DESC, id DESC LIMIT $2",
-                [monitor.id.into(), (BASELINE_WINDOW as i64).into()],
-            ))
-            .await?
-            .iter()
-            .map(|r| r.try_get::<f64>("", "value"))
-            .collect::<Result<_, _>>()?;
+        let mut history: Vec<f64> =
+            explain_alert::recent_values(db, resolver, org_id, monitor.id, None, BASELINE_WINDOW)
+                .await?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
         history.reverse();
         match baseline_verdict(&history, cell_val, sensitivity.z_threshold()) {
             BaselineVerdict::Outlier { z, median, .. } => (
@@ -762,6 +879,7 @@ async fn evaluate_state(
         };
         (if triggered { "triggered" } else { "ok" }, observed)
     };
+    // `ok`/`triggered` always carry the numeric cell; `unevaluable` never does.
     Ok(Evaluation::new(
         state,
         None,
@@ -794,7 +912,7 @@ impl TypedTaskHandler for EvaluateMonitorHandler {
             match handle_inner(&self.ctx, p.org_id, p.monitor_id).await {
                 Ok(()) => TaskOutcome::Success { result_ref: None },
                 Err(e) => TaskOutcome::Failed {
-                    error: format!("{e:#}"),
+                    error: arcodash_core::scrub::scrub_error_values(&format!("{e:#}")),
                 },
             },
         )
@@ -817,6 +935,55 @@ mod fixtures {
             return None;
         };
         Some(arcodash_core::db::connect(&url).await.unwrap())
+    }
+
+    pub(super) fn test_resolver() -> arcodash_core::test_support::blob::StaticResolver {
+        resolver_over(std::sync::Arc::new(
+            arcodash_core::test_support::blob::MemoryBlobStore::default(),
+        ))
+    }
+
+    pub(super) fn resolver_over(
+        store: std::sync::Arc<arcodash_core::test_support::blob::MemoryBlobStore>,
+    ) -> arcodash_core::test_support::blob::StaticResolver {
+        arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            store,
+            "org-root",
+        )
+    }
+
+    /// Moves the result row's inline data to an object in `resolver`'s store; `write_object`
+    /// false leaves the pointer dangling.
+    pub(super) async fn externalize_result(
+        db: &sea_orm::DatabaseConnection,
+        resolver: &arcodash_core::test_support::blob::StaticResolver,
+        qr_id: i64,
+        write_object: bool,
+    ) {
+        use arcodash_core::org_storage::OrgStorageResolver;
+        let qr = query_result::Entity::find_by_id(qr_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        let location =
+            arcodash_core::result_store::result_rel_key(qr.data_source_id, &qr.query_hash);
+        if write_object {
+            let storage = resolver.resolve(db, qr.org_id).await.unwrap();
+            arcodash_core::result_store::save_result(
+                &storage,
+                qr.data_source_id,
+                &qr.query_hash,
+                qr.data.as_ref().unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut am: query_result::ActiveModel = qr.into();
+        am.data = Set(None);
+        am.data_location = Set(Some(location));
+        am.update(db).await.unwrap();
     }
 
     /// `value > 50` on column `value`.
@@ -972,7 +1139,10 @@ mod org_scoping_tests {
 
         // Attack: an org-A monitor pointing at org B's query.
         let base_monitor = mem_monitor(org_a.id, query_b.id, over_50());
-        let Evaluation { state, .. } = evaluate_state(&db, &base_monitor, org_a.id).await.unwrap();
+        let Evaluation { state, .. } =
+            evaluate_state(&db, &test_resolver(), &base_monitor, org_a.id)
+                .await
+                .unwrap();
         assert_eq!(
             state, "unknown",
             "a monitor's query_id pointing at another org's query must evaluate as unknown, \
@@ -984,13 +1154,83 @@ mod org_scoping_tests {
             org_id: org_b.id,
             ..base_monitor
         };
-        let Evaluation { state, .. } = evaluate_state(&db, &same_org_monitor, org_b.id)
-            .await
-            .unwrap();
+        let Evaluation { state, .. } =
+            evaluate_state(&db, &test_resolver(), &same_org_monitor, org_b.id)
+                .await
+                .unwrap();
         assert_eq!(
             state, "triggered",
             "same-org read must see the real query_result and evaluate the threshold"
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_state_reads_externalized_result() {
+        let Some(db) = test_db().await else { return };
+        let org = seed_org(&db, &format!("org-ext-evalmonitor-{}", Uuid::new_v4())).await;
+        let query = seed_query_with_result(&db, org.id, serde_json::json!(100.0)).await;
+        let store =
+            std::sync::Arc::new(arcodash_core::test_support::blob::MemoryBlobStore::default());
+        let resolver = resolver_over(store.clone());
+        externalize_result(&db, &resolver, query.latest_query_data_id.unwrap(), true).await;
+        assert_eq!(store.keys().len(), 1);
+
+        let monitor = mem_monitor(org.id, query.id, over_50());
+        let eval = evaluate_state(&db, &resolver, &monitor, org.id)
+            .await
+            .unwrap();
+        assert_eq!(eval.state, "triggered");
+        assert_eq!(eval.query_result_id, query.latest_query_data_id);
+
+        let calm = mem_monitor(
+            org.id,
+            query.id,
+            serde_json::json!({ "column": "value", "op": ">", "value": 500.0 }),
+        );
+        let eval = evaluate_state(&db, &resolver, &calm, org.id).await.unwrap();
+        assert_eq!(eval.state, "ok");
+    }
+
+    #[tokio::test]
+    async fn evaluate_state_missing_object_is_unknown() {
+        let Some(db) = test_db().await else { return };
+        let org = seed_org(&db, &format!("org-gone-evalmonitor-{}", Uuid::new_v4())).await;
+        let query = seed_query_with_result(&db, org.id, serde_json::json!(100.0)).await;
+        let resolver = test_resolver();
+        externalize_result(&db, &resolver, query.latest_query_data_id.unwrap(), false).await;
+
+        let monitor = mem_monitor(org.id, query.id, over_50());
+        let eval = evaluate_state(&db, &resolver, &monitor, org.id)
+            .await
+            .unwrap();
+        assert_eq!(eval.state, "unknown");
+    }
+
+    #[tokio::test]
+    async fn evaluate_state_unreachable_storage_is_unevaluable() {
+        let Some(db) = test_db().await else { return };
+        let org = seed_org(&db, &format!("org-down-evalmonitor-{}", Uuid::new_v4())).await;
+        let query = seed_query_with_result(&db, org.id, serde_json::json!(100.0)).await;
+        externalize_result(
+            &db,
+            &test_resolver(),
+            query.latest_query_data_id.unwrap(),
+            false,
+        )
+        .await;
+        let failing = arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            std::sync::Arc::new(arcodash_core::test_support::blob::FailingBlobStore::default()),
+            "org-root",
+        );
+
+        let monitor = mem_monitor(org.id, query.id, over_50());
+        let eval = evaluate_state(&db, &failing, &monitor, org.id)
+            .await
+            .unwrap();
+        assert_eq!(eval.state, "unevaluable");
+        assert_eq!(eval.reason.as_deref(), Some(STORAGE_UNREACHABLE_REASON));
+        assert_eq!(failing.failures(), 1);
     }
 
     #[test]
@@ -1016,7 +1256,9 @@ mod org_scoping_tests {
         let query = seed_query_with_result(&db, org.id, serde_json::json!("100.5")).await;
 
         let monitor = mem_monitor(org.id, query.id, over_50());
-        let Evaluation { state, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, .. } = evaluate_state(&db, &test_resolver(), &monitor, org.id)
+            .await
+            .unwrap();
         assert_eq!(
             state, "triggered",
             "a JSON-string-encoded numeric cell must still be compared against the threshold"
@@ -1036,7 +1278,10 @@ mod org_scoping_tests {
 
         let options = serde_json::json!({ "column": "revenue", "value": 50.0, "op": ">" });
         let monitor = mem_monitor(org.id, query.id, options);
-        let Evaluation { state, reason, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, reason, .. } =
+            evaluate_state(&db, &test_resolver(), &monitor, org.id)
+                .await
+                .unwrap();
         assert_eq!(state, "unevaluable");
         let reason = reason.expect("unevaluable state must carry a reason");
         assert!(
@@ -1063,7 +1308,10 @@ mod org_scoping_tests {
         .await;
 
         let monitor = mem_monitor(org.id, query.id, over_50());
-        let Evaluation { state, reason, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, reason, .. } =
+            evaluate_state(&db, &test_resolver(), &monitor, org.id)
+                .await
+                .unwrap();
         assert_eq!(state, "unevaluable");
         assert!(reason.is_some());
     }
@@ -1474,7 +1722,9 @@ mod published_result_tests {
         set_latest_query_data(&db, q.id, draft.id).await;
 
         let monitor = mem_monitor(org.id, q.id, over_50());
-        let Evaluation { state, .. } = evaluate_state(&db, &monitor, org.id).await.unwrap();
+        let Evaluation { state, .. } = evaluate_state(&db, &test_resolver(), &monitor, org.id)
+            .await
+            .unwrap();
         assert_eq!(
             state, "triggered",
             "must evaluate the published result (value=100 > 50), not the draft's own newer \
@@ -1941,22 +2191,39 @@ mod freshness_protocol_tests {
         assert_eq!(run.condition_met, Some(true));
     }
 
-    async fn stored_explanation(db: &sea_orm::DatabaseConnection, run_id: i64) -> Option<String> {
-        query_row(
-            db,
-            "SELECT explanation FROM monitor_observations WHERE run_id = $1",
+    async fn stored_explanation(ctx: &ExecuteQueryContext, run_id: i64) -> Option<String> {
+        let row = query_row(
+            &ctx.db,
+            "SELECT id, org_id, monitor_id, observed_at, explanation FROM monitor_observations \
+             WHERE run_id = $1",
             [run_id.into()],
         )
+        .await;
+        let legacy: Option<String> = row.try_get("", "explanation").unwrap();
+        assert!(legacy.is_none(), "explanations are not written to the row");
+        let storage = ctx
+            .storage
+            .resolve(&ctx.db, row.try_get("", "org_id").unwrap())
+            .await
+            .unwrap();
+        let at: chrono::DateTime<Utc> = row.try_get("", "observed_at").unwrap();
+        observation_store::load_observations(
+            &storage,
+            row.try_get("", "monitor_id").unwrap(),
+            at,
+            at,
+        )
         .await
-        .try_get("", "explanation")
         .unwrap()
+        .remove(&row.try_get::<i64>("", "id").unwrap())
+        .and_then(|v| v.explanation)
     }
 
     /// Records three prior `ok` observations (10, 20, 30) so explanations have history.
-    async fn seed_history(db: &sea_orm::DatabaseConnection, org_id: i64, mon_id: i64) {
+    async fn seed_history(ctx: &ExecuteQueryContext, org_id: i64, mon_id: i64) {
         for v in [10.0, 20.0, 30.0] {
             let eval = Evaluation::new("ok", None, None, Some(v), None);
-            record_observation(db, org_id, mon_id, None, &eval).await;
+            record_observation(ctx, org_id, mon_id, None, &eval).await;
         }
     }
 
@@ -1986,12 +2253,12 @@ mod freshness_protocol_tests {
         let mon = reload(&db, mon.id).await;
         subscribe(&db, org_id, mon.id).await;
         let ctx = test_ctx(db.clone(), redis.clone());
-        seed_history(&db, org_id, mon.id).await;
+        seed_history(&ctx, org_id, mon.id).await;
         let run_id = seed_live_run(&db, org_id, mon.id).await;
         evaluate_and_finalize(&ctx, org_id, &mon, run_id, Some((qr_id, 0)))
             .await
             .unwrap();
-        let stored = stored_explanation(&db, run_id).await;
+        let stored = stored_explanation(&ctx, run_id).await;
         let queued = find_and_remove_notification_for_monitor(
             &redis,
             &queue::QueueName::Default.queue_key(),
@@ -2085,14 +2352,14 @@ mod freshness_protocol_tests {
         let mon = reload(&db, mon.id).await;
         subscribe(&db, org_id, mon.id).await;
         let ctx = test_ctx(db.clone(), redis.clone());
-        seed_history(&db, org_id, mon.id).await;
+        seed_history(&ctx, org_id, mon.id).await;
         let mut stored = Vec::new();
         for _ in 0..2 {
             let run_id = seed_live_run(&db, org_id, mon.id).await;
             evaluate_and_finalize(&ctx, org_id, &mon, run_id, Some((qr_id, 0)))
                 .await
                 .unwrap();
-            stored.push(stored_explanation(&db, run_id).await);
+            stored.push(stored_explanation(&ctx, run_id).await);
         }
         let queued = find_and_remove_notification_for_monitor(
             &redis,
@@ -2156,10 +2423,7 @@ mod freshness_protocol_tests {
             .await
             .unwrap();
         let rows = observation_rows(&db, mon.id).await;
-        assert_eq!(
-            rows,
-            vec![(Some(100.0), "triggered".to_string(), Some(run1))]
-        );
+        assert_eq!(rows, vec![(None, "triggered".to_string(), Some(run1))]);
 
         let mon = monitor::Model {
             options: serde_json::json!({"column": "value", "op": ">", "value": 500.0}),
@@ -2171,7 +2435,7 @@ mod freshness_protocol_tests {
             .unwrap();
         let rows = observation_rows(&db, mon.id).await;
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1], (Some(100.0), "ok".to_string(), Some(run2)));
+        assert_eq!(rows[1], (None, "ok".to_string(), Some(run2)));
     }
 
     async fn set_result_row(db: &sea_orm::DatabaseConnection, qr_id: i64, value: f64) {
@@ -2237,6 +2501,130 @@ mod freshness_protocol_tests {
         );
     }
 
+    /// Inserts an `ok` observation `mins_ago` minutes back, with `inline` in the legacy column.
+    async fn seed_observation_row(
+        db: &sea_orm::DatabaseConnection,
+        org_id: i64,
+        mon_id: i64,
+        mins_ago: i64,
+        inline: Option<f64>,
+    ) -> (i64, chrono::DateTime<Utc>) {
+        let row = query_row(
+            db,
+            "INSERT INTO monitor_observations (org_id, monitor_id, observed_at, value, state) \
+             VALUES ($1, $2, now() - ($3 || ' minutes')::interval, $4, 'ok') \
+             RETURNING id, observed_at",
+            [
+                org_id.into(),
+                mon_id.into(),
+                mins_ago.to_string().into(),
+                inline.into(),
+            ],
+        )
+        .await;
+        (
+            row.try_get("", "id").unwrap(),
+            row.try_get("", "observed_at").unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn evaluate_monitor_writes_null_value_column_and_object() {
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 123.5, over_50()).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        eval_once(&db, &ctx, org_id, mon.id, qr_id).await;
+        let rows = observation_rows(&db, mon.id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, None);
+        let id: i64 = query_row(
+            &db,
+            "SELECT id FROM monitor_observations WHERE monitor_id = $1",
+            [mon.id.into()],
+        )
+        .await
+        .try_get("", "id")
+        .unwrap();
+        let storage = ctx.storage.resolve(&db, org_id).await.unwrap();
+        let stored = observation_store::load_observations(
+            &storage,
+            mon.id,
+            Utc::now() - chrono::Duration::days(1),
+            Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored[&id].value, Some(123.5));
+    }
+
+    #[tokio::test]
+    async fn baseline_reads_history_from_storage() {
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, baseline()).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        let storage = ctx.storage.resolve(&db, org_id).await.unwrap();
+        for i in 0..8 {
+            let (id, observed_at) = seed_observation_row(&db, org_id, mon.id, 10 + i, None).await;
+            let values = observation_store::ObservationValues {
+                id,
+                observed_at,
+                value: Some(100.0 + (i % 2) as f64),
+                explanation: None,
+            };
+            observation_store::append_observation(&db, &storage, mon.id, &values, None)
+                .await
+                .unwrap();
+        }
+        set_result_row(&db, qr_id, 400.0).await;
+        assert_eq!(
+            eval_once(&db, &ctx, org_id, mon.id, qr_id).await,
+            "triggered"
+        );
+    }
+
+    #[tokio::test]
+    async fn baseline_storage_failure_fails_evaluation_without_transition() {
+        let Some((db, _redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, baseline()).await;
+        for i in 0..8 {
+            seed_observation_row(&db, org_id, mon.id, 10 + i, None).await;
+        }
+        set_result_row(&db, qr_id, 100.0).await;
+        let before = observation_rows(&db, mon.id).await.len();
+        let failing = arcodash_core::test_support::blob::StaticResolver::with_store(
+            arcodash_core::org_storage::StorageMode::ArcoDash,
+            Arc::new(arcodash_core::test_support::blob::FailingBlobStore::default()),
+            "org-root",
+        );
+        let m = reload(&db, mon.id).await;
+        assert!(evaluate_state(&db, &failing, &m, org_id).await.is_err());
+        assert_eq!(observation_rows(&db, mon.id).await.len(), before);
+        assert_eq!(reload(&db, mon.id).await.state, m.state);
+    }
+
+    #[tokio::test]
+    async fn legacy_observation_values_still_read() {
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, baseline()).await;
+        let ctx = test_ctx(db.clone(), redis.clone());
+        for i in 0..8 {
+            seed_observation_row(&db, org_id, mon.id, 10 + i, Some(100.0 + (i % 2) as f64)).await;
+        }
+        set_result_row(&db, qr_id, 400.0).await;
+        assert_eq!(
+            eval_once(&db, &ctx, org_id, mon.id, qr_id).await,
+            "triggered"
+        );
+    }
+
     async fn baseline_first_check(opts: serde_json::Value) -> Option<String> {
         let (db, redis) = setup().await?;
         let (org_id, mon, qr_id) = seed_published_monitor(&db, Utc::now(), 100.0, opts).await;
@@ -2283,11 +2671,14 @@ mod freshness_protocol_tests {
 
     #[tokio::test]
     async fn unknown_writes_no_observation() {
-        let Some(db) = test_db().await else { return };
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let ctx = test_ctx(db.clone(), redis);
         let (org_id, mon, _) = seed_published_monitor(&db, Utc::now(), 100.0, over_50()).await;
         let eval = Evaluation::new("unknown", None, None, None, None);
         assert_eq!(
-            record_observation(&db, org_id, mon.id, None, &eval).await,
+            record_observation(&ctx, org_id, mon.id, None, &eval).await,
             None
         );
         assert!(observation_rows(&db, mon.id).await.is_empty());
@@ -2322,25 +2713,58 @@ mod freshness_protocol_tests {
 
     #[tokio::test]
     async fn observations_pruned_to_500_newest_kept() {
-        let Some(db) = test_db().await else { return };
+        let Some((db, redis)) = setup().await else {
+            return;
+        };
+        let ctx = test_ctx(db.clone(), redis);
         let (org_id, mon, _) = seed_published_monitor(&db, Utc::now(), 100.0, over_50()).await;
         exec_sql(
             &db,
             "INSERT INTO monitor_observations (org_id, monitor_id, observed_at, value, state) \
-             SELECT $1, $2, now() - (g || ' seconds')::interval, g, 'ok' \
+             SELECT $1, $2, now() - (g || ' seconds')::interval, NULL, 'ok' \
              FROM generate_series(1, 505) g",
             [org_id.into(), mon.id.into()],
         )
         .await;
+        let storage = ctx.storage.resolve(&ctx.db, org_id).await.unwrap();
+        let seeded = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id, observed_at FROM monitor_observations WHERE monitor_id = $1",
+                [mon.id.into()],
+            ))
+            .await
+            .unwrap();
+        for r in seeded {
+            let values = observation_store::ObservationValues {
+                id: r.try_get("", "id").unwrap(),
+                observed_at: r
+                    .try_get::<chrono::DateTime<Utc>>("", "observed_at")
+                    .unwrap(),
+                value: Some(1.0),
+                explanation: None,
+            };
+            observation_store::append_observation(&db, &storage, mon.id, &values, None)
+                .await
+                .unwrap();
+        }
         let eval = Evaluation::new("triggered", None, None, Some(0.5), None);
-        record_observation(&db, org_id, mon.id, None, &eval)
+        record_observation(&ctx, org_id, mon.id, None, &eval)
             .await
             .unwrap();
         let rows = observation_rows(&db, mon.id).await;
         assert_eq!(rows.len(), 500);
-        assert!(rows.iter().any(|r| r.0 == Some(0.5)));
-        assert!(!rows.iter().any(|r| r.0 == Some(505.0)));
-        assert!(rows.iter().any(|r| r.0 == Some(1.0)));
+        assert!(rows.iter().any(|r| r.0.is_none() && r.1 == "triggered"));
+        let now = Utc::now();
+        let stored = observation_store::load_observations(
+            &storage,
+            mon.id,
+            now - chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 500);
     }
 }
 
@@ -2476,5 +2900,85 @@ mod entitlement_gate_tests {
             "a blocked run-backed evaluation must finalize skipped, not stay pending"
         );
         assert_eq!(reloaded.error.as_deref(), Some("blocked by test"));
+    }
+}
+
+#[cfg(test)]
+mod storage_error_tests {
+    //! A result that can't be read because the org's storage is unreachable evaluates as
+    //! `unevaluable` and notifies; a storage switch defers the run instead.
+    use super::fixtures::*;
+    use super::*;
+    use crate::scheduler::test_support::*;
+    use arcodash_core::test_support::blob::StaticResolver;
+
+    async fn seed_externalized(db: &sea_orm::DatabaseConnection) -> (i64, monitor::Model, i64) {
+        let (org_id, mon, qr_id) = seed_published_monitor(db, Utc::now(), 100.0, over_50()).await;
+        let mon = set_state(db, mon.id, "ok").await;
+        subscribe(db, org_id, mon.id).await;
+        externalize_result(db, &test_resolver(), qr_id, false).await;
+        let run_id = seed_run(db, org_id, "monitor", mon.id, None, None, "running", None).await;
+        (org_id, mon, run_id)
+    }
+
+    fn ctx_with(
+        db: &sea_orm::DatabaseConnection,
+        redis: &redis::aio::ConnectionManager,
+        resolver: Arc<StaticResolver>,
+    ) -> ExecuteQueryContext {
+        ExecuteQueryContext {
+            storage: resolver,
+            ..test_ctx(db.clone(), redis.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_monitor_goes_to_unevaluable_and_notifies() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        let (org_id, mon, run_id) = seed_externalized(&db).await;
+        let ctx = ctx_with(&db, &redis, Arc::new(test_resolver().unreachable()));
+
+        evaluate_and_finalize(&ctx, org_id, &mon, run_id, None)
+            .await
+            .unwrap();
+
+        let reloaded = reload(&db, mon.id).await;
+        assert_eq!(reloaded.state, "unevaluable");
+        assert_eq!(
+            reloaded.unevaluable_reason.as_deref(),
+            Some("Can't reach your storage bucket")
+        );
+        assert_eq!(delivery_count(&db, mon.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn switching_defers_monitor_check_without_failing_it() {
+        let Some((db, redis)) = setup().await else {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        };
+        for resolver in [test_resolver().switching(), test_resolver().paused()] {
+            let (org_id, mon, run_id) = seed_externalized(&db).await;
+            let ctx = ctx_with(&db, &redis, Arc::new(resolver));
+
+            let err = evaluate_and_finalize(&ctx, org_id, &mon, run_id, None)
+                .await
+                .unwrap_err();
+            assert!(is_storage_switching(&err));
+            defer_for_storage_switch(&ctx, run_id).await;
+
+            let r = run::Entity::find_by_id(run_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(r.status, "pending");
+            assert!(r.finished_at.is_none());
+            assert_eq!(reload(&db, mon.id).await.state, "ok");
+            assert_eq!(delivery_count(&db, mon.id).await, 0);
+        }
     }
 }

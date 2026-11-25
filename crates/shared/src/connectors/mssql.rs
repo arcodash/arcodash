@@ -80,7 +80,9 @@ fn build_config(opts: &MssqlOptions) -> Result<Config> {
         "optional" => EncryptionLevel::On,
         "required" => EncryptionLevel::Required,
         other => {
-            anyhow::bail!("invalid 'encrypt' option '{other}': expected off, optional, or required")
+            anyhow::bail!(
+                "invalid \"encrypt\" option '{other}': expected off, optional, or required"
+            )
         }
     };
     config.encryption(level);

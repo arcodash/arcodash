@@ -9,8 +9,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `arcodash-worker clear-inline-data [--confirm] [--batch N]`: re-verifies each inline copy against
+  object storage and clears it. A dry run by default; only verified rows are touched.
+- A background backfill copies data held inline in Postgres to object storage and verifies it
+  (referenced results, monitor observations, dashboard narratives, recent mail bodies, AI profile
+  values).
+- `RESULT_MAX_DECODED_BYTES` (default 64 MiB): cap on the uncompressed size of a stored query result, enforced on write and on read.
+- Stored query results carry a SHA-256 digest (`query_results.data_sha256`) that is verified before the object is decoded; a mismatch is refused. Objects written before the digest existed still load.
+- `RESULT_RETENTION_DAYS` (default 7): stored results unused for that long are deleted.
+- `STORAGE_BACKFILL_RETRY_SECS` (default 3600): wait before a backfill pass with skipped rows repeats.
 - Snowflake: encrypted private keys (`ENCRYPTED PRIVATE KEY`, AES or 3DES) with a new
   `private_key_passphrase` field.
+
+### Changed
+
+- Query results and other data produced by running queries (monitor observations, dashboard
+  narratives, mail bodies, AI profile sample values) are stored in the object store
+  (`UPLOAD_BUCKET`) instead of Postgres.
+- Upgrade: once the backfill has finished, run `docker compose run --rm worker clear-inline-data`
+  (a dry run that only counts), then `docker compose run --rm worker clear-inline-data --confirm`,
+  to free the inline copies. The dry run's `verified` counts show what `--confirm` would clear; run
+  `--confirm` once they match the rows you expect and `not_verified` and `no_copy` are 0. It
+  re-verifies each row against the object store, so running it early is safe.
+- API responses carry `Cache-Control: no-store` by default.
+- Error text stored or returned to clients has customer values scrubbed.
 
 ### Fixed
 

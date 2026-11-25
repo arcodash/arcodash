@@ -16,6 +16,7 @@ import { ApiError, api, apiErrorMessage } from "@/lib/api";
 import { usePollJob } from "@/lib/jobs";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { getViz, toVizData } from "@/components/visualizations/registry";
+import { ResultFootnote, hasResultFootnote } from "@/components/ResultFootnote";
 import { exploreState } from "@/lib/explore";
 import { usePermissions } from "@/lib/permissions";
 import { newMonitorHref } from "@/lib/monitorLinks";
@@ -447,6 +448,23 @@ export const WidgetCard = memo(function WidgetCard({
   const monitorHref =
     linkMonitors && monitorMeta?.monitorId != null ? `/monitors/${monitorMeta.monitorId}` : undefined;
   const showFooter = !editMode && !publicView && widget.visualization_id != null;
+  const footnote =
+    !editMode && widget.visualization_id != null && hasResultFootnote() ? (
+      <div
+        data-testid="widget-result-footnote"
+        className={
+          showFooter
+            ? "ml-auto min-w-0 truncate text-muted-foreground"
+            : "min-w-0 truncate px-3 pb-2 text-xs text-muted-foreground empty:hidden"
+        }
+      >
+        <ResultFootnote
+          retrievedAt={shownAt ?? widget.freshness?.retrieved_at}
+          placement="widget"
+          publicView={publicView}
+        />
+      </div>
+    ) : null;
   const chrome = CHROME[monitorMeta?.treatment ?? "neutral"];
   const query = widget.visualization?.query;
   const addMonitorHref = query
@@ -515,8 +533,10 @@ export const WidgetCard = memo(function WidgetCard({
           {query != null && (
             <TileCheckSlot summary={widget.check_summary} queryId={query.id} published={query.is_published} addMonitorHref={addMonitorHref} />
           )}
+          {footnote}
         </div>
       )}
+      {!showFooter && footnote}
     </div>
   );
 });

@@ -92,7 +92,12 @@ async fn sqlite_upload_read_only_enforced() {
     // runs here — matches `integration_upload_roundtrip.rs`'s CSV proof and the established
     // `integration_query_results_connector.rs` precedent).
     let store = ObjectStore::from_env().expect("object store from env");
-    let connector = SqliteConnector::new(app.db.clone(), store.clone());
+    let connector = SqliteConnector::new(
+        app.db.clone(),
+        std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            store.clone(),
+        )),
+    );
     let org_id = default_org_id(&app.db).await;
     let opts = serde_json::json!({ "upload_id": upload_id, "org_id": org_id });
 
@@ -151,5 +156,53 @@ async fn sqlite_upload_read_only_enforced() {
     assert!(
         foreign_err.to_string().contains("not found"),
         "must fail as not-found, not leak a different error: {foreign_err:#}"
+    );
+}
+
+#[tokio::test]
+async fn missing_sqlite_upload_reports_file_unavailable() {
+    use arcodash_core::entities::data_source_upload;
+    use sea_orm::EntityTrait;
+    let app = skip_if_none!(spawn_app().await);
+    app.cleanup().await;
+    let client = app.admin_client().await;
+    let form = reqwest::multipart::Form::new().text("type", "sqlite").part(
+        "file",
+        reqwest::multipart::Part::bytes(build_sqlite_bytes().await)
+            .file_name("gone.sqlite")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
+    let resp = client
+        .post(format!("{}/api/data_sources/uploads", app.address))
+        .multipart(form)
+        .send()
+        .await
+        .expect("upload request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let upload_id = body["upload_id"].as_str().unwrap().to_string();
+    let row = data_source_upload::Entity::find_by_id(uuid::Uuid::parse_str(&upload_id).unwrap())
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = ObjectStore::from_env().expect("object store from env");
+    store
+        .delete(&format!("orgs/{}/uploads/{}", row.org_id, row.object_key))
+        .await
+        .unwrap();
+
+    let connector = SqliteConnector::new(
+        app.db.clone(),
+        std::sync::Arc::new(arcodash_core::org_storage::DefaultStorageResolver::new(
+            store,
+        )),
+    );
+    let opts = serde_json::json!({ "upload_id": upload_id, "org_id": row.org_id });
+    let err = connector.run_query(&opts, "SELECT 1").await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("file unavailable, upload again"),
+        "{err:#}"
     );
 }

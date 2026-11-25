@@ -26,7 +26,7 @@ use arcodash_core::models::{
 use arcodash_core::queue::{self, enqueue_profile, JobStatus, Queue};
 use redis::aio::ConnectionManager;
 
-use crate::api::handlers::ai::context::{build_context, load_recent_queries, usable_profile};
+use crate::api::handlers::ai::context::{build_context, load_recent_queries, load_usable_profile};
 use crate::api::handlers::ai::{
     is_read_only_sql, provider_for, schema_for_ai, AiProvider, AiProviderKind, SqlGeneration,
 };
@@ -609,7 +609,7 @@ pub(crate) async fn prepare_ask(
         )));
     }
 
-    let profile = usable_profile(&ds);
+    let profile = load_usable_profile(state, user.org_id, &ds).await?;
     let recent = load_recent_queries(&db, user.org_id, user.id, ds.id).await?;
     let include_samples = include_sample_values(&org.settings);
     scope.detach(db).await?;
@@ -720,6 +720,7 @@ impl DbPreview {
             scoped.db(),
             self.state.queue.as_ref(),
             self.state.conveyor.as_deref(),
+            self.state.result_reader(),
             &self.state.redis,
             self.user.org_id,
             &self.user,
@@ -743,7 +744,14 @@ impl DbPreview {
             Ok(s) => s,
             Err(e) => return PreviewOutcome::Err(e.message),
         };
-        let res = result_service::get(scoped.db(), self.user.org_id, &self.user, result_id).await;
+        let res = result_service::get_with_data(
+            scoped.db(),
+            self.state.result_reader(),
+            self.user.org_id,
+            &self.user,
+            result_id,
+        )
+        .await;
         let _ = scoped.commit().await;
         match res {
             Ok(r) => parse_preview(r.data.as_ref()),

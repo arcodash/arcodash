@@ -9,6 +9,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+regex = { workspace = true }
 arcodash-conveyor = { path = "../conveyor" }
 tokio = { workspace = true }
 sea-orm = { workspace = true }
@@ -20,6 +21,8 @@ chrono = { workspace = true }
 chrono-tz = "0.10"
 uuid = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
+flate2 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

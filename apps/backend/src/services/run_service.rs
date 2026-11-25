@@ -133,6 +133,7 @@ pub(crate) fn slugify(name: &str, fallback: &str) -> String {
 /// retained" when the run had no result or it was GC'd.
 pub async fn run_result_csv(
     db: &impl ConnectionTrait,
+    results: crate::services::result_service::ResultReader<'_>,
     user: &user::Model,
     run: &run::Model,
 ) -> Result<(Vec<u8>, String), ApiError> {
@@ -141,7 +142,11 @@ pub async fn run_result_csv(
         .ok_or_else(|| ApiError::not_found("result no longer retained"))?;
     // Data-source-access-gated load: refuses a caller who has entity read but not data-source
     // reach.
-    let result = result_service::get(db, user.org_id, user, qr_id).await?;
+    let meta = result_service::get(db, user.org_id, user, qr_id).await?;
+    let result = results
+        .hydrate(db, meta)
+        .await?
+        .ok_or_else(|| ApiError::not_found("result no longer retained"))?;
     let data = result
         .data
         .as_ref()

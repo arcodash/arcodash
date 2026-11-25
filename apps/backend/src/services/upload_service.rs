@@ -1,5 +1,5 @@
 //! Content validation for a file-upload data source's bytes, run once at upload time — before
-//! anything is written to `ObjectStore` or gets a `data_source_uploads` row.
+//! anything is written to storage or gets a `data_source_uploads` row.
 //!
 //! Catches a malformed file (or an unrelated file wearing a `.csv`/`.sqlite` extension) up front
 //! rather than at first-query time.
