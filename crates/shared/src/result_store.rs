@@ -8,7 +8,7 @@ use bytes::Bytes;
 use flate2::{write::GzEncoder, Compression};
 use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{self, StreamExt};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement};
 
 use crate::entities::query_result;
 use crate::gzip::gunzip_bounded;
@@ -158,17 +158,47 @@ async fn resolve_reporting(
     result
 }
 
+/// Verifies `bytes` against the row's digest. A writer replaces the object before its new digest
+/// commits, so on a mismatch the digest is re-read once; if it still differs the object is treated
+/// as missing and the bytes are never decoded.
+async fn verified(
+    db: &impl ConnectionTrait,
+    id: i64,
+    bytes: &[u8],
+    expected: Option<&str>,
+) -> Result<bool, StorageError> {
+    if verify_digest(bytes, expected).is_ok() {
+        return Ok(true);
+    }
+    let fresh = query_result::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(anyhow::Error::from)?
+        .and_then(|m| m.data_sha256);
+    if fresh.is_some() && verify_digest(bytes, fresh.as_deref()).is_ok() {
+        return Ok(true);
+    }
+    tracing::warn!(
+        result_id = id,
+        "stored result failed its integrity check; treating as missing"
+    );
+    Ok(false)
+}
+
 async fn fetch_object(
+    db: &impl ConnectionTrait,
     resolver_db: &DatabaseConnection,
     resolver: &dyn OrgStorageResolver,
     storage: &OrgStorage,
-    org_id: i64,
+    qr: &query_result::Model,
     location: &str,
-    expected_sha256: Option<&str>,
 ) -> Result<Option<serde_json::Value>, StorageError> {
+    let org_id = qr.org_id;
     match storage.get(StorageArea::Results, location).await {
         Ok(bytes) => {
-            verify_digest(&bytes, expected_sha256).map_err(anyhow::Error::from)?;
+            if !verified(db, qr.id, &bytes, qr.data_sha256.as_deref()).await? {
+                return Ok(None);
+            }
             Ok(Some(decode_result(&bytes)?))
         }
         Err(StorageError::NotFound) => {
@@ -201,16 +231,7 @@ pub async fn load_result(
         inline.clone()
     } else if let Some(location) = &qr.data_location {
         let storage = resolve_reporting(resolver_db, resolver, qr.org_id).await?;
-        match fetch_object(
-            resolver_db,
-            resolver,
-            &storage,
-            qr.org_id,
-            location,
-            qr.data_sha256.as_deref(),
-        )
-        .await?
-        {
+        match fetch_object(db, resolver_db, resolver, &storage, qr, location).await? {
             Some(v) => v,
             None => return Ok(None),
         }
@@ -242,29 +263,24 @@ pub async fn load_results(
             if let Entry::Vacant(e) = storages.entry(qr.org_id) {
                 e.insert(resolve_reporting(resolver_db, resolver, qr.org_id).await?);
             }
-            pending.push((
-                qr.id,
-                qr.org_id,
-                location.as_str(),
-                qr.data_sha256.as_deref(),
-            ));
+            pending.push((qr, location.as_str()));
         }
     }
     let storages = &storages;
     let jobs: Vec<BoxFuture<'_, FetchOutcome>> = pending
         .into_iter()
-        .map(|(id, org_id, location, sha)| {
+        .map(|(qr, location)| {
             async move {
                 let r = fetch_object(
+                    db,
                     resolver_db,
                     resolver,
-                    &storages[&org_id],
-                    org_id,
+                    &storages[&qr.org_id],
+                    qr,
                     location,
-                    sha,
                 )
                 .await;
-                (id, r)
+                (qr.id, r)
             }
             .boxed()
         })
@@ -446,18 +462,50 @@ mod tests {
             .unwrap();
             let mut qr = seed(&db, None, Some(&loc), 0).await;
             qr.data_sha256 = Some(digest);
-            let err = load_result(&db, &db, &r, &qr).await.unwrap_err();
-            let StorageError::Other(e) = err else {
-                panic!("expected Other")
-            };
-            assert!(e.downcast_ref::<IntegrityMismatch>().is_some());
-            let msg = format!("{e:#}");
-            assert!(!msg.contains("999") && !msg.contains("111"), "{msg}");
-            let many = load_results(&db, &db, &r, std::slice::from_ref(&qr)).await;
-            assert!(many.is_err());
+            assert_eq!(load_result(&db, &db, &r, &qr).await.unwrap(), None);
+            let many = load_results(&db, &db, &r, std::slice::from_ref(&qr))
+                .await
+                .unwrap();
+            assert!(many.is_empty());
 
             qr.data_sha256 = None;
             assert_eq!(load_result(&db, &db, &r, &qr).await.unwrap(), Some(forged));
+        }
+
+        #[tokio::test]
+        async fn digest_committed_after_object_write_is_seen_on_retry() {
+            let Some(db) = test_db().await else { return };
+            let mem = Arc::new(MemoryBlobStore::default());
+            let r = resolver(mem.clone());
+            let loc = format!("1/{}.json.gz", uuid::Uuid::new_v4());
+            let data = serde_json::json!({"rows": [{"n": 2}]});
+            let bytes = encode_result(&data).unwrap();
+            mem.put(
+                &format!("orgs/1/results/{loc}"),
+                bytes.clone(),
+                "application/gzip",
+            )
+            .await
+            .unwrap();
+            let mut qr = seed(&db, None, Some(&loc), 0).await;
+            // The caller holds the stale row; the DB row already carries the new digest.
+            qr.data_sha256 = Some(sha256_hex(b"old"));
+            query_result::ActiveModel {
+                id: Set(qr.id),
+                data_sha256: Set(Some(sha256_hex(&bytes))),
+                ..Default::default()
+            }
+            .update(&db)
+            .await
+            .unwrap();
+            assert_eq!(
+                load_result(&db, &db, &r, &qr).await.unwrap(),
+                Some(data.clone())
+            );
+            let map = load_results(&db, &db, &r, std::slice::from_ref(&qr))
+                .await
+                .unwrap();
+            assert_eq!(map[&qr.id], data);
         }
 
         #[tokio::test]
