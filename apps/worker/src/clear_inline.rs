@@ -18,7 +18,7 @@ use arcodash_core::entities::dashboard_narrative;
 use arcodash_core::models::DataSourceAiProfile;
 use arcodash_core::observation_store::load_observations;
 use arcodash_core::org_storage::{OrgStorage, OrgStorageResolver, StorageArea};
-use arcodash_core::result_store::decode_result;
+use arcodash_core::result_store::{decode_result, verify_digest};
 
 use crate::storage_backfill::line_matches;
 
@@ -224,7 +224,7 @@ impl Run<'_> {
         let row = txn
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT data, data_location FROM query_results \
+                "SELECT data, data_location, data_sha256 FROM query_results \
                  WHERE id = $1 AND data IS NOT NULL AND data_location IS NOT NULL",
                 [id.into()],
             ))
@@ -234,10 +234,13 @@ impl Run<'_> {
         };
         let inline: serde_json::Value = row.try_get("", "data")?;
         let location: String = row.try_get("", "data_location")?;
+        let sha256: Option<String> = row.try_get("", "data_sha256")?;
         let stored = storage
             .get(StorageArea::Results, &location)
             .await
-            .map_or(None, |bytes| decode_result(&bytes).ok());
+            .ok()
+            .filter(|bytes| verify_digest(bytes, sha256.as_deref()).is_ok())
+            .and_then(|bytes| decode_result(&bytes).ok());
         if stored.as_ref() != Some(&inline) {
             return Ok((false, false));
         }

@@ -14,6 +14,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A background backfill copies data held inline in Postgres to object storage and verifies it
   (referenced results, monitor observations, dashboard narratives, recent mail bodies, AI profile
   values).
+- `RESULT_MAX_DECODED_BYTES` (default 64 MiB): cap on the uncompressed size of a stored query result, enforced on write and on read.
+- Stored query results carry a SHA-256 digest (`query_results.data_sha256`) that is verified before the object is decoded; a mismatch is refused. Objects written before the digest existed still load.
 - `RESULT_RETENTION_DAYS` (default 7): stored results unused for that long are deleted.
 - `STORAGE_BACKFILL_RETRY_SECS` (default 3600): wait before a backfill pass with skipped rows repeats.
 - Snowflake: encrypted private keys (`ENCRYPTED PRIVATE KEY`, AES or 3DES) with a new

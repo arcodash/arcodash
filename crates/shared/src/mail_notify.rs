@@ -56,6 +56,9 @@ pub async fn load_mail_body(
     load_body(storage, d.body_location.as_deref(), d.body_html.as_deref()).await
 }
 
+/// Mail providers cap messages near 10 MiB; bodies here are HTML only, so 4 MiB is generous.
+pub const MAX_MAIL_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
 /// [`load_mail_body`] over the two raw columns.
 ///
 /// # Errors
@@ -67,7 +70,9 @@ pub async fn load_body(
     inline: Option<&str>,
 ) -> Result<String, StorageError> {
     if let Some(rel) = location {
-        let bytes = storage.get(StorageArea::Emails, rel).await?;
+        let bytes = storage
+            .get_max(StorageArea::Emails, rel, MAX_MAIL_BODY_BYTES)
+            .await?;
         return String::from_utf8(bytes.to_vec()).map_err(|e| {
             StorageError::Other(anyhow::anyhow!("stored mail body is not UTF-8: {e}"))
         });
@@ -192,11 +197,12 @@ pub async fn enqueue_send_mail(
     let id = mail_delivery::insert_pending_mail(db, org_id, &to, &subject).await?;
     let rel = mail_body_key(id);
     let stored = storage
-        .put(
+        .put_max(
             StorageArea::Emails,
             &rel,
             body_html.clone().into_bytes().into(),
             "text/html; charset=utf-8",
+            MAX_MAIL_BODY_BYTES,
         )
         .await;
     if let Err(e) = stored {
@@ -588,5 +594,30 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(org_delivery_status(&db, org_id).await, "failed");
+    }
+
+    #[tokio::test]
+    async fn oversize_mail_body_object_is_refused() {
+        let (storage, _) = mem_storage(1);
+        let big = vec![b'a'; usize::try_from(MAX_MAIL_BODY_BYTES).unwrap() + 1];
+        storage
+            .put(StorageArea::Emails, "1.html", big.into(), "text/html")
+            .await
+            .unwrap();
+        let err = load_body(&storage, Some("1.html"), None).await.unwrap_err();
+        assert!(err.is_too_large());
+        storage
+            .put(
+                StorageArea::Emails,
+                "2.html",
+                "<p>ok</p>".into(),
+                "text/html",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            load_body(&storage, Some("2.html"), None).await.unwrap(),
+            "<p>ok</p>"
+        );
     }
 }

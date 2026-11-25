@@ -12,6 +12,7 @@ pub struct Model {
     pub data: Option<Json>,
     pub data_location: Option<String>,
     pub data_size_bytes: Option<i64>,
+    pub data_sha256: Option<String>,
     pub runtime: Option<f64>,
     pub retrieved_at: DateTimeWithTimeZone,
     pub last_used_at: DateTimeWithTimeZone,

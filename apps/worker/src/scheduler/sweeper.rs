@@ -3635,6 +3635,7 @@ mod tests {
             data: Set(None),
             data_location: Set(Some(location.clone())),
             data_size_bytes: Set(Some(3)),
+            data_sha256: Set(None),
             runtime: Set(Some(0.01)),
             retrieved_at: Set(when.into()),
             last_used_at: Set(when.into()),

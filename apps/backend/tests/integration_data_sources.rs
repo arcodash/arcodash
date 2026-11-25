@@ -1601,6 +1601,7 @@ async fn paused_data_source_refuses_new_executions_but_not_cached_reads() {
         data: Set(Some(serde_json::json!({"columns": [], "rows": []}))),
         data_location: Set(None),
         data_size_bytes: Set(None),
+        data_sha256: Set(None),
         runtime: Set(None),
         retrieved_at: Set(chrono::Utc::now().into()),
         last_used_at: Set(chrono::Utc::now().into()),

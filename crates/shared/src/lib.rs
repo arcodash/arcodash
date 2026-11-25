@@ -12,6 +12,7 @@ pub mod email_template;
 pub mod entities;
 pub mod entitlements;
 pub mod events;
+pub mod gzip;
 pub mod hash;
 pub mod mail_notify;
 pub mod mailer;

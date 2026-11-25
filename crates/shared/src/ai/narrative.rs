@@ -32,6 +32,9 @@ pub const MAX_COLS: usize = 8;
 pub const STR_MAX: usize = 40;
 pub const SUMMARY_MAX: usize = 300;
 pub const BODY_MAX: usize = 1500;
+/// A stored narrative is a summary, highlights, a body of at most `BODY_MAX` chars and a digest of
+/// at most `MAX_WIDGETS` x `MAX_ROWS` x `MAX_COLS` short cells (~100 KiB); 1 MiB leaves ample room.
+pub const MAX_NARRATIVE_BYTES: u64 = 1024 * 1024;
 pub const KEEP_PER_DASHBOARD: u64 = 30;
 pub const NARRATIVE_BUDGET: Duration = Duration::from_secs(30);
 
@@ -413,7 +416,10 @@ pub async fn load_narrative_content(
     let Some(rel) = &n.data_location else {
         return Ok(None);
     };
-    match storage.get(StorageArea::Narratives, rel).await {
+    match storage
+        .get_max(StorageArea::Narratives, rel, MAX_NARRATIVE_BYTES)
+        .await
+    {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
             StorageError::Other(anyhow::anyhow!("stored narrative is malformed: {e}"))
         }),
@@ -960,11 +966,12 @@ pub async fn store(
     let rel = format!("{dashboard_id}/{}.json", row.id);
     let bytes = serde_json::to_vec(&content).unwrap_or_default();
     if let Err(e) = storage
-        .put(
+        .put_max(
             StorageArea::Narratives,
             &rel,
             bytes.into(),
             "application/json",
+            MAX_NARRATIVE_BYTES,
         )
         .await
     {
@@ -2373,5 +2380,38 @@ mod tests {
     #[ignore = "live provider call; needs ANTHROPIC_API_KEY"]
     async fn live_narrative_anthropic() {
         live_narrative(AiProviderKind::Anthropic, "ANTHROPIC_API_KEY").await;
+    }
+
+    #[tokio::test]
+    async fn oversize_narrative_object_is_refused() {
+        let Some(db) = test_db().await else { return };
+        let f = fx(&db).await;
+        let (storage, _) = test_storage();
+        let (row, _) = store(
+            &db,
+            &storage,
+            f.org_id,
+            f.dash.id,
+            Some(f.user_id),
+            "manual",
+            &narr("a"),
+            &Digest::default(),
+            "m",
+        )
+        .await
+        .unwrap();
+        let rel = row.data_location.clone().unwrap();
+        let big = vec![b' '; usize::try_from(MAX_NARRATIVE_BYTES).unwrap() + 1];
+        storage
+            .put(
+                StorageArea::Narratives,
+                &rel,
+                big.into(),
+                "application/json",
+            )
+            .await
+            .unwrap();
+        let err = load_narrative_content(&storage, &row).await.unwrap_err();
+        assert!(err.is_too_large());
     }
 }

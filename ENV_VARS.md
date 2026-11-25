@@ -178,6 +178,7 @@ Uploaded CSV and SQLite files live in an object store that speaks the Google Clo
 | `UPLOAD_SWEEP_SECS` | `3600` | no | worker | Interval of the orphaned-upload sweep. Floored at 60. |
 | `RESULT_RETENTION_DAYS` | `7` | no | worker | Days a stored query result may go unread and unrefreshed before the retention sweep deletes it. Every read or refresh resets the clock. Floored at 1. |
 | `RESULT_SWEEP_SECS` | `3600` | no | worker | Interval of the expired-result sweep. Floored at 60. |
+| `RESULT_MAX_DECODED_BYTES` | `67108864` (64 MiB) | no | backend, worker | Largest uncompressed result JSON that is written to or read from object storage. A run whose result exceeds it fails with a clear error; a stored object that decompresses past it is refused. Read once at startup. |
 | `STORAGE_BACKFILL_SECS` | `60` | no | worker | Interval of the job that copies customer data still held inline in the database into object storage. Inline data is copied, never removed. Floored at 10. |
 | `STORAGE_BACKFILL_BATCH` | `200` | no | worker | Rows copied per area on each backfill tick. Floored at 1. |
 | `STORAGE_BACKFILL_RETRY_SECS` | `3600` | no | worker | Minimum wait before a backfill pass that skipped rows (storage unreachable, paused or a copy that did not verify) starts over. |

@@ -36,6 +36,7 @@ mod m20261009_000002_dashboard_narratives;
 mod m20261013_000001_dashboard_narrative_body;
 mod m20261112_000001_external_customer_data;
 mod m20261112_000001_query_verified;
+mod m20261124_000001_query_result_digest;
 pub mod track;
 
 pub async fn assert_track(db: &DatabaseConnection) -> Result<(), String> {
@@ -119,6 +120,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261013_000001_dashboard_narrative_body::Migration),
             Box::new(m20261112_000001_query_verified::Migration),
             Box::new(m20261112_000001_external_customer_data::Migration),
+            Box::new(m20261124_000001_query_result_digest::Migration),
         ]
     }
 }

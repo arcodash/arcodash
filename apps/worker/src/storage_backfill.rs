@@ -20,7 +20,7 @@ use arcodash_core::models::DataSourceAiProfile;
 
 use arcodash_core::observation_store::{load_observations, upsert_observation, ObservationValues};
 use arcodash_core::org_storage::{OrgStorage, StorageArea};
-use arcodash_core::result_store::{decode_result, save_result};
+use arcodash_core::result_store::{decode_result, save_result, verify_digest};
 
 use crate::handlers::execute_query::ExecuteQueryContext;
 
@@ -352,7 +352,10 @@ async fn copy_result(
         .await
         .context("re-read stored result")?;
     let size_matches = i64::try_from(bytes.len()).is_ok_and(|n| n == stored.size_bytes);
-    if !size_matches || decode_result(&bytes).ok().as_ref() != Some(&inline) {
+    if !size_matches
+        || verify_digest(&bytes, Some(&stored.sha256)).is_err()
+        || decode_result(&bytes).ok().as_ref() != Some(&inline)
+    {
         tracing::warn!(
             query_result_id = row.id,
             "storage backfill: stored object does not match the inline data, leaving the row"
@@ -363,12 +366,13 @@ async fn copy_result(
     let updated = txn
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "UPDATE query_results SET data_location = $2, data_size_bytes = $3 \
+            "UPDATE query_results SET data_location = $2, data_size_bytes = $3, data_sha256 = $4 \
              WHERE id = $1 AND data_location IS NULL",
             [
                 row.id.into(),
                 stored.location.into(),
                 stored.size_bytes.into(),
+                stored.sha256.into(),
             ],
         ))
         .await?;
@@ -975,6 +979,18 @@ pub(crate) mod tests {
         let storage = f.ctx.storage.resolve(&f.ctx.db, f.org_id).await.unwrap();
         let bytes = storage.get(StorageArea::Results, &loc).await.unwrap();
         assert_eq!(decode_result(&bytes).unwrap(), data);
+        let digest = query_row(
+            &f.ctx.db,
+            "SELECT data_sha256 FROM query_results WHERE id = $1",
+            [referenced.into()],
+        )
+        .await
+        .try_get::<Option<String>>("", "data_sha256")
+        .unwrap();
+        assert_eq!(
+            digest.as_deref(),
+            Some(arcodash_core::result_store::sha256_hex(&bytes).as_str())
+        );
 
         let (loc, data) = pointer(&f.ctx.db, orphan).await;
         assert!(loc.is_none(), "unreferenced result stays pointer-less");

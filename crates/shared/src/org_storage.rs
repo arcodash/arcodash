@@ -55,6 +55,20 @@ pub enum StorageError {
     Other(#[from] anyhow::Error),
 }
 
+/// An object whose size exceeds the bound its reader or writer enforces.
+#[derive(Debug, thiserror::Error)]
+#[error("object exceeds {limit} bytes")]
+pub struct ObjectTooLarge {
+    pub limit: u64,
+}
+
+impl StorageError {
+    #[must_use]
+    pub fn is_too_large(&self) -> bool {
+        matches!(self, Self::Other(e) if e.is::<ObjectTooLarge>())
+    }
+}
+
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     async fn put(&self, key: &str, bytes: Bytes, content_type: &str) -> Result<(), StorageError>;
@@ -182,6 +196,44 @@ impl OrgStorage {
     /// `NotFound` when the object does not exist; otherwise the store's error.
     pub async fn get(&self, area: StorageArea, rel: &str) -> Result<Bytes, StorageError> {
         self.store.get(&self.key(area, rel)).await
+    }
+
+    /// Like `get`, but an object over `max` bytes is refused (an `Other` error for which
+    /// [`StorageError::is_too_large`] holds) without being fully buffered where the store allows.
+    ///
+    /// # Errors
+    ///
+    /// As `get`, plus the oversize refusal.
+    pub async fn get_max(
+        &self,
+        area: StorageArea,
+        rel: &str,
+        max: u64,
+    ) -> Result<Bytes, StorageError> {
+        let bytes = self.store.get_max(&self.key(area, rel), max).await?;
+        if bytes.len() as u64 > max {
+            return Err(StorageError::Other(ObjectTooLarge { limit: max }.into()));
+        }
+        Ok(bytes)
+    }
+
+    /// Like `put`, but refuses `bytes` over `max` so a reader bounded by `max` can always read it.
+    ///
+    /// # Errors
+    ///
+    /// As `put`, plus the oversize refusal.
+    pub async fn put_max(
+        &self,
+        area: StorageArea,
+        rel: &str,
+        bytes: Bytes,
+        content_type: &str,
+        max: u64,
+    ) -> Result<(), StorageError> {
+        if bytes.len() as u64 > max {
+            return Err(StorageError::Other(ObjectTooLarge { limit: max }.into()));
+        }
+        self.put(area, rel, bytes, content_type).await
     }
 
     /// # Errors

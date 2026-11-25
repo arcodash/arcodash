@@ -88,7 +88,7 @@ async fn migration_adds_storage_columns() {
         Migrator::up(&db, None).await.expect("up");
         assert_up_state(&db).await;
 
-        Migrator::down(&db, Some(1)).await.expect("down");
+        Migrator::down(&db, Some(2)).await.expect("down");
         for (table, col) in ADDED_COLUMNS {
             assert!(
                 column(&db, table, col).await.is_none(),
@@ -114,7 +114,7 @@ async fn migration_adds_storage_columns() {
 async fn last_used_at_backfills_from_retrieved_at() {
     with_throwaway_db("external_data_bf", |db| async move {
         let total = u32::try_from(Migrator::migrations().len()).unwrap();
-        Migrator::up(&db, Some(total - 1))
+        Migrator::up(&db, Some(total - 2))
             .await
             .expect("up to previous");
         assert!(column(&db, "query_results", "last_used_at").await.is_none());

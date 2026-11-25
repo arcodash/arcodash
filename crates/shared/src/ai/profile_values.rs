@@ -10,6 +10,9 @@ use crate::entities::data_source;
 use crate::models::DataSourceAiProfile;
 use crate::org_storage::{OrgStorage, StorageArea, StorageError};
 
+/// A few sampled values plus min/max per column over a bounded profile (hundreds of KiB); 4 MiB.
+pub const MAX_PROFILE_VALUES_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Sampled values of one column.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnValues {
@@ -98,11 +101,12 @@ pub async fn save_profile_values(
     let rel = values_rel_key(data_source_id);
     let body = serde_json::to_vec(values).map_err(|e| StorageError::Other(e.into()))?;
     storage
-        .put(
+        .put_max(
             StorageArea::AiProfiles,
             &rel,
             Bytes::from(body),
             "application/json",
+            MAX_PROFILE_VALUES_BYTES,
         )
         .await?;
     Ok(rel)
@@ -127,7 +131,10 @@ pub async fn load_ai_profile(
     let Some(location) = &ds.ai_profile_values_location else {
         return Ok(Some(profile));
     };
-    match storage.get(StorageArea::AiProfiles, location).await {
+    match storage
+        .get_max(StorageArea::AiProfiles, location, MAX_PROFILE_VALUES_BYTES)
+        .await
+    {
         Ok(bytes) => {
             if let Ok(values) = serde_json::from_slice::<ProfileValues>(&bytes) {
                 merge_values(&mut profile, &values);
@@ -140,6 +147,12 @@ pub async fn load_ai_profile(
         }
         Err(StorageError::NotFound) => {
             tracing::warn!(data_source_id = ds.id, "profile values object missing");
+        }
+        Err(e) if e.is_too_large() => {
+            tracing::warn!(
+                data_source_id = ds.id,
+                "stored profile values over the size bound"
+            );
         }
         Err(e) => return Err(e),
     }
@@ -301,5 +314,40 @@ mod tests {
         assert!(load_ai_profile(&s, &ds(Some(&stripped), Some("7.json")))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn oversize_values_object_degrades_to_no_samples() {
+        let s = storage(Arc::new(MemoryBlobStore::default()));
+        let (stripped, values) = split_profile(&profile());
+        let mut big = serde_json::to_vec(&values).unwrap();
+        big.resize(usize::try_from(MAX_PROFILE_VALUES_BYTES).unwrap() + 1, b' ');
+        s.put(
+            StorageArea::AiProfiles,
+            "7.json",
+            big.into(),
+            "application/json",
+        )
+        .await
+        .unwrap();
+        let loaded = load_ai_profile(&s, &ds(Some(&stripped), Some("7.json")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, stripped);
+    }
+
+    #[tokio::test]
+    async fn oversize_values_are_not_written() {
+        let s = storage(Arc::new(MemoryBlobStore::default()));
+        let mut values = ProfileValues::default();
+        values.0.entry("t".into()).or_default().insert(
+            "c".into(),
+            ColumnValues {
+                samples: vec!["x".repeat(usize::try_from(MAX_PROFILE_VALUES_BYTES).unwrap())],
+                ..Default::default()
+            },
+        );
+        assert!(save_profile_values(&s, 7, &values).await.is_err());
     }
 }

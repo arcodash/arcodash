@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::org_storage::{OrgStorage, OrgStorageResolver, StorageArea, StorageError};
 
 const CONTENT_TYPE: &str = "application/x-ndjson";
+/// A 1-minute schedule makes ~44k lines a month at ~150 bytes (~6.6 MiB); explanations add headroom.
+pub const MAX_MONTH_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ObservationValues {
@@ -55,9 +57,16 @@ async fn read_month(
     storage: &OrgStorage,
     rel: &str,
 ) -> Result<Vec<ObservationValues>, StorageError> {
-    match storage.get(StorageArea::Monitors, rel).await {
+    match storage
+        .get_max(StorageArea::Monitors, rel, MAX_MONTH_BYTES)
+        .await
+    {
         Ok(bytes) => Ok(parse_lines(&bytes)),
         Err(StorageError::NotFound) => Ok(Vec::new()),
+        Err(e) if e.is_too_large() => {
+            tracing::warn!("observation_store: month object over the size bound; treated as empty");
+            Ok(Vec::new())
+        }
         Err(e) => Err(e),
     }
 }
@@ -85,13 +94,15 @@ async fn modify_month(
     .map_err(db_err)?;
     let mut items = read_month(storage, &rel).await?;
     f(&mut items);
+    let mut body = encode_lines(&items)?;
+    // Oldest lines roll off so the object stays readable under the reader's bound.
+    while body.len() as u64 > MAX_MONTH_BYTES && !items.is_empty() {
+        let drop = (items.len() / 10).max(1);
+        items.drain(..drop);
+        body = encode_lines(&items)?;
+    }
     storage
-        .put(
-            StorageArea::Monitors,
-            &rel,
-            encode_lines(&items)?,
-            CONTENT_TYPE,
-        )
+        .put(StorageArea::Monitors, &rel, body, CONTENT_TYPE)
         .await?;
     txn.commit().await.map_err(db_err)
 }
@@ -559,5 +570,56 @@ mod tests {
         let good = serde_json::to_string(&obs(1, ts(2026, 1, 1), 1.0)).unwrap();
         let data = format!("garbage\n{good}\n");
         assert_eq!(parse_lines(data.as_bytes()).len(), 1);
+    }
+
+    fn line_with_explanation(id: i64, bytes: usize) -> String {
+        let mut o = obs(id, ts(2026, 7, 1), 1.0);
+        o.explanation = Some("x".repeat(bytes));
+        format!("{}\n", serde_json::to_string(&o).unwrap())
+    }
+
+    #[tokio::test]
+    async fn oversize_month_reads_as_empty_and_does_not_block_loading() {
+        let (s, _) = storage();
+        let rel = observation_rel_key(910, ts(2026, 7, 1));
+        let mut big = line_with_explanation(1, 10).into_bytes();
+        big.resize(usize::try_from(MAX_MONTH_BYTES).unwrap() + 1, b'\n');
+        s.put(StorageArea::Monitors, &rel, big.into(), CONTENT_TYPE)
+            .await
+            .unwrap();
+        let got = load_observations(&s, 910, ts(2026, 7, 1), ts(2026, 7, 2))
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_rolls_oldest_lines_to_stay_readable() {
+        let Some(db) = db().await else { return };
+        let (s, mem) = storage();
+        let rel = observation_rel_key(911, ts(2026, 7, 1));
+        let seed: String = (1..=15)
+            .map(|i| line_with_explanation(i, 1 << 20))
+            .collect();
+        s.put(
+            StorageArea::Monitors,
+            &rel,
+            seed.into_bytes().into(),
+            CONTENT_TYPE,
+        )
+        .await
+        .unwrap();
+        let mut v = obs(99, ts(2026, 7, 2), 1.0);
+        v.explanation = Some("y".repeat(2 << 20));
+        append_observation(&db, &s, 911, &v, None).await.unwrap();
+        let key = format!(
+            "orgs/1/monitors/911/observations/{:04}-{:02}.jsonl",
+            2026, 7
+        );
+        let lines = month_lines(&mem, &key).await;
+        assert!(lines.iter().any(|l| l.id == 99));
+        assert!(lines.len() < 16);
+        let size = s.get(StorageArea::Monitors, &rel).await.unwrap().len() as u64;
+        assert!(size <= MAX_MONTH_BYTES);
     }
 }

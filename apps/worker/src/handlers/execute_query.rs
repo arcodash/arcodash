@@ -662,6 +662,7 @@ async fn run_query(
             active.data = Set(None);
             active.data_location = Set(Some(stored.location));
             active.data_size_bytes = Set(Some(stored.size_bytes));
+            active.data_sha256 = Set(Some(stored.sha256));
             active.runtime = Set(Some(result.runtime_seconds));
             active.retrieved_at = Set(retrieved_at.into());
             active.last_used_at = Set(retrieved_at.into());
@@ -677,6 +678,7 @@ async fn run_query(
                 data: Set(None),
                 data_location: Set(Some(stored.location)),
                 data_size_bytes: Set(Some(stored.size_bytes)),
+                data_sha256: Set(Some(stored.sha256)),
                 runtime: Set(Some(result.runtime_seconds)),
                 retrieved_at: Set(retrieved_at.into()),
                 last_used_at: Set(retrieved_at.into()),
@@ -1861,6 +1863,18 @@ mod auto_limit_truncation_tests {
         assert!(saved.data.is_none());
         let loc = saved.data_location.clone().expect("data_location set");
         assert!(saved.data_size_bytes.unwrap() > 0);
+        let object = ctx
+            .storage
+            .resolve(&ctx.db, saved.org_id)
+            .await
+            .unwrap()
+            .get(arcodash_core::org_storage::StorageArea::Results, &loc)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.data_sha256.as_deref(),
+            Some(arcodash_core::result_store::sha256_hex(&object).as_str())
+        );
         assert_eq!(saved.last_used_at, saved.retrieved_at);
         assert_eq!(mem.keys(), [format!("orgs/test/results/{loc}")]);
         let data = stored_result(&ctx, &saved).await;
@@ -1917,6 +1931,7 @@ mod auto_limit_truncation_tests {
             data: Set(Some(serde_json::json!({ "columns": [], "rows": [] }))),
             data_location: Set(None),
             data_size_bytes: Set(None),
+            data_sha256: Set(None),
             runtime: Set(Some(0.0)),
             retrieved_at: Set(old),
             last_used_at: Set(old),
@@ -1971,6 +1986,7 @@ mod auto_limit_truncation_tests {
             data: Set(None),
             data_location: Set(Some("newer.json.gz".to_string())),
             data_size_bytes: Set(Some(1)),
+            data_sha256: Set(None),
             runtime: Set(Some(0.0)),
             retrieved_at: Set(future),
             last_used_at: Set(future),
@@ -3260,6 +3276,7 @@ mod write_guard_tests {
             data: Set(Some(serde_json::json!({"rows": [{"n": 999}]}))),
             data_location: Set(None),
             data_size_bytes: Set(None),
+            data_sha256: Set(None),
             runtime: Set(Some(0.0)),
             retrieved_at: Set(future_retrieved_at),
             last_used_at: Set(future_retrieved_at),

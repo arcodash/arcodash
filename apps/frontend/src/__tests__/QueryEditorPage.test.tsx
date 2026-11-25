@@ -2483,9 +2483,11 @@ describe("QueryEditorPage tags + description", () => {
 });
 
 describe("QueryEditorPage result footnote slot", () => {
-  const RETRIEVED_AT = new Date(Date.now() - 9 * 60_000).toISOString();
+  // Set per test: computed at collect time it goes stale when collection runs long under load.
+  let RETRIEVED_AT = "";
 
   beforeEach(() => {
+    RETRIEVED_AT = new Date(Date.now() - 9 * 60_000).toISOString();
     server.use(
       http.get(`${BASE}/api/data_sources`, () => HttpResponse.json({ data_sources: [DS], can_create: true })),
       http.get(`${BASE}/api/data_sources/1/schema`, () => HttpResponse.json({ schema: [] })),

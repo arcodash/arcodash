@@ -57,6 +57,16 @@ impl crate::org_storage::BlobStore for ObjectStore {
             .ok_or(crate::org_storage::StorageError::NotFound)
     }
 
+    async fn get_max(
+        &self,
+        key: &str,
+        max: u64,
+    ) -> Result<Bytes, crate::org_storage::StorageError> {
+        self.get_opt_max(key, max)
+            .await?
+            .ok_or(crate::org_storage::StorageError::NotFound)
+    }
+
     async fn delete(&self, key: &str) -> Result<(), crate::org_storage::StorageError> {
         Self::delete(self, key).await?;
         Ok(())
@@ -283,6 +293,11 @@ impl ObjectStore {
 
     /// `None` when the object does not exist.
     async fn get_opt(&self, key: &str) -> Result<Option<Bytes>> {
+        self.get_opt_max(key, u64::MAX).await
+    }
+
+    /// Fails with `ObjectTooLarge` as soon as the declared or streamed size passes `max`.
+    async fn get_opt_max(&self, key: &str, max: u64) -> Result<Option<Bytes>> {
         tracing::debug!(object_key = key, "storage get");
         let url = format!("{}?alt=media", self.object_url(key));
         let resp = self
@@ -297,10 +312,20 @@ impl ObjectStore {
         let resp = resp
             .error_for_status()
             .context("GCS object download returned an error status")?;
-        let bytes = resp
-            .bytes()
-            .await
-            .context("failed to read GCS object download body")?;
+        let too_large = || crate::org_storage::ObjectTooLarge { limit: max };
+        if resp.content_length().is_some_and(|n| n > max) {
+            return Err(too_large().into());
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            let chunk = chunk.context("failed to read GCS object download body")?;
+            if (buf.len() + chunk.len()) as u64 > max {
+                return Err(too_large().into());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let bytes = Bytes::from(buf);
         tracing::debug!(
             object_key = key,
             bytes = bytes.len(),
