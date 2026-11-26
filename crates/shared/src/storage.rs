@@ -149,6 +149,9 @@ fn next_page_step(
     }
 }
 
+/// Upload attempts on 429/5xx (backoff 0.5s, 1s, 2s, 4s).
+const PUT_ATTEMPTS: u32 = 5;
+
 impl ObjectStore {
     /// Builds its own `reqwest::Client`. Reads `UPLOAD_BUCKET` (required) and
     /// `STORAGE_EMULATOR_HOST` (emulator mode when non-empty).
@@ -270,19 +273,40 @@ impl ObjectStore {
             percent_encode(&self.bucket),
             percent_encode(key)
         );
-        let req = self
-            .http
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, content_type)
-            .body(bytes);
-        self.authed(req)
-            .await?
-            .send()
-            .await
-            .context("GCS object upload request failed")?
-            .error_for_status()
-            .context("GCS object upload returned an error status")?;
-        Ok(())
+        // GCS allows about one write per second to the same object and answers 429 (or a 5xx)
+        // past that; back off and retry as Google recommends.
+        let mut delay = std::time::Duration::from_millis(500);
+        let mut attempt = 1;
+        loop {
+            let req = self
+                .http
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .body(bytes.clone());
+            let sent = self.authed(req).await?.send().await;
+            let last = attempt == PUT_ATTEMPTS;
+            match sent {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                        || status.is_server_error();
+                    if !retryable || last {
+                        resp.error_for_status()
+                            .context("GCS object upload returned an error status")?;
+                        return Ok(());
+                    }
+                    tracing::warn!(object_key = key, %status, attempt, "storage put: retrying");
+                }
+                Err(e) if !last && (e.is_timeout() || e.is_connect()) => {
+                    tracing::warn!(object_key = key, error = %e, attempt, "storage put: retrying");
+                }
+                Err(e) => return Err(e).context("GCS object upload request failed"),
+            }
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+            attempt += 1;
+        }
     }
 
     pub async fn get(&self, key: &str) -> Result<Bytes> {
@@ -563,6 +587,45 @@ fn build_http_client() -> Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn put_retries_rate_limited_upload() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let store = ObjectStore::for_emulator(&server.uri(), "b").unwrap();
+        store
+            .put("k", Bytes::from_static(b"x"), "application/octet-stream")
+            .await
+            .expect("succeeds after two 429s");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn put_does_not_retry_client_errors() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let store = ObjectStore::for_emulator(&server.uri(), "b").unwrap();
+        assert!(store
+            .put("k", Bytes::from_static(b"x"), "application/octet-stream")
+            .await
+            .is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
     #[test]
     fn sanitize_filename_strips_path_traversal() {

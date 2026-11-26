@@ -168,13 +168,17 @@ pub async fn list(
     let pending: Vec<Option<String>> = if data_sources.is_empty() {
         Vec::new()
     } else {
-        let mut cmd = redis::cmd("MGET");
+        // Pipelined GETs, not MGET: a clustered Valkey refuses multi-key commands across slots.
+        let mut pipe = redis::pipe();
         for ds in &data_sources {
-            cmd.arg(arcodash_core::models::ai_profile_pending_key(ds.id));
+            pipe.get(arcodash_core::models::ai_profile_pending_key(ds.id));
         }
-        cmd.query_async(&mut state.redis.clone())
+        pipe.query_async(&mut state.redis.clone())
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "ai profile pending flags unavailable");
+                Vec::new()
+            })
     };
 
     let mut data_sources_resp: Vec<DataSourceResponse> = Vec::with_capacity(data_sources.len());

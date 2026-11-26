@@ -213,6 +213,19 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
                 &lock_id,
                 LEADER_LOCK_KEY_STORAGE_BACKFILL,
                 |ctx| async move {
+                    // The scheduler starts a run every interval even if the last is still going.
+                    static RUNNING: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    struct Release;
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            RUNNING.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    if RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        return;
+                    }
+                    let _release = Release;
                     match crate::storage_backfill::backfill_batch(&ctx, storage_backfill_batch())
                         .await
                     {
@@ -227,7 +240,7 @@ async fn run_aux_ticks(ctx: Arc<ExecuteQueryContext>, mut shutdown: watch::Recei
                             );
                         }
                         Ok(_) => {}
-                        Err(e) => tracing::error!(error = %e, "storage backfill failed"),
+                        Err(e) => tracing::error!(error = %format_args!("{e:#}"), "storage backfill failed"),
                     }
                 },
             ),
@@ -401,7 +414,12 @@ pub async fn release_digest_send_guard(
         digest_send_guard_key(user_id, local_date),
         digest_send_guard_key(user_id, local_date - chrono::Duration::days(1)),
     ];
-    let _: Result<i64, _> = redis.clone().del(&keys).await;
+    // One key per DEL: a clustered Valkey refuses multi-key commands across slots.
+    for key in &keys {
+        if let Err(e) = redis.clone().del::<_, i64>(key).await {
+            tracing::warn!(error = %e, user_id, "release digest send guard failed");
+        }
+    }
 }
 
 /// Shared seeding helpers for `deadline`'s and `sweeper`'s integration tests; real Postgres + Redis

@@ -141,18 +141,53 @@ pub async fn upsert_observation(
     v: &ObservationValues,
 ) -> Result<(), StorageError> {
     modify_month(db, storage, monitor_id, v.observed_at, |items| {
-        if let Some(item) = items.iter_mut().find(|i| i.id == v.id) {
-            if v.value.is_some() {
-                item.value = v.value;
-            }
-            if v.explanation.is_some() {
-                item.explanation.clone_from(&v.explanation);
-            }
-        } else {
-            items.push(v.clone());
-        }
+        merge_line(items, v);
     })
     .await
+}
+
+/// [`upsert_observation`] for many lines: one read-modify-write per month file, not per line,
+/// so a large backfill stays under the object store's per-object write rate.
+///
+/// # Errors
+///
+/// Database or storage failure.
+pub async fn upsert_observations(
+    db: &DatabaseConnection,
+    storage: &OrgStorage,
+    monitor_id: i64,
+    values: &[ObservationValues],
+) -> Result<(), StorageError> {
+    let mut by_month: std::collections::BTreeMap<(i32, u32), Vec<&ObservationValues>> =
+        std::collections::BTreeMap::new();
+    for v in values {
+        by_month
+            .entry((v.observed_at.year(), v.observed_at.month()))
+            .or_default()
+            .push(v);
+    }
+    for group in by_month.values() {
+        modify_month(db, storage, monitor_id, group[0].observed_at, |items| {
+            for v in group {
+                merge_line(items, v);
+            }
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+fn merge_line(items: &mut Vec<ObservationValues>, v: &ObservationValues) {
+    if let Some(item) = items.iter_mut().find(|i| i.id == v.id) {
+        if v.value.is_some() {
+            item.value = v.value;
+        }
+        if v.explanation.is_some() {
+            item.explanation.clone_from(&v.explanation);
+        }
+    } else {
+        items.push(v.clone());
+    }
 }
 
 /// Every month file overlapping `[from, to]`; a missing file is a gap, not an error.
