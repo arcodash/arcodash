@@ -25,4 +25,4 @@ jobs:
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'https://github.com/arcodash/arcodash/blob/main/CLA.md'
           branch: 'cla-signatures'
-          allowlist: 'dependabot[bot],github-actions[bot]'
+          allowlist: 'refaelos,dependabot[bot],github-actions[bot]'
