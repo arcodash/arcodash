@@ -333,7 +333,24 @@ fn run_on_sqlite(
     query: &str,
     cancelled: &AtomicBool,
 ) -> Result<QueryExecutionResult> {
-    for dataset in &datasets {
+    // A cancel interrupts whichever statement is running, which then fails with SQLite's own
+    // "interrupted" error; report it as the cancellation it is.
+    populate_and_query(&conn, &datasets, query, cancelled).map_err(|e| {
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::anyhow!(CANCELLED_MSG)
+        } else {
+            e
+        }
+    })
+}
+
+fn populate_and_query(
+    conn: &rusqlite::Connection,
+    datasets: &[ResultData],
+    query: &str,
+    cancelled: &AtomicBool,
+) -> Result<QueryExecutionResult> {
+    for dataset in datasets {
         if cancelled.load(Ordering::Relaxed) {
             anyhow::bail!(CANCELLED_MSG);
         }
@@ -379,7 +396,7 @@ fn run_on_sqlite(
         anyhow::bail!(CANCELLED_MSG);
     }
     let started = Instant::now();
-    let mut stmt = prepare_single(&conn, query).context("failed to prepare user query")?;
+    let mut stmt = prepare_single(conn, query).context("failed to prepare user query")?;
 
     let col_names: Vec<String> = stmt
         .column_names()
