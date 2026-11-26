@@ -1,4 +1,4 @@
-import "@testing-library/jest-dom";
+import "@testing-library/jest-dom/vitest";
 import { configure } from "@testing-library/react";
 import { beforeAll, afterEach, afterAll } from "vitest";
 import { server } from "./msw-server";
@@ -29,7 +29,7 @@ if (!window.ResizeObserver) {
 // Default 1s async-util budget flakes when the machine is CPU-starved.
 configure({ asyncUtilTimeout: 5000 });
 
-beforeAll(() => server.listen({ onUnhandledRequest: "warn" }));
+beforeAll(() => server.listen({ onUnhandledFrame: "warn" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

@@ -6,14 +6,21 @@ import { http, HttpResponse } from "msw";
 import { server } from "./msw-server";
 import { AuthProvider } from "@/lib/auth";
 
-vi.mock("@/extensions", () => ({
-  extensions: [
-    {
-      navItems: [],
-      routes: [{ path: "/test-extension-route", element: <div>extension page</div> }],
-    },
-  ],
-}));
+// Async factory + createElement: vitest 5 hoists vi.mock above imports, so the factory can't use JSX
+// (its jsx-runtime import wouldn't be initialized yet).
+vi.mock("@/extensions", async () => {
+  const { createElement } = await import("react");
+  return {
+    extensions: [
+      {
+        navItems: [],
+        routes: [
+          { path: "/test-extension-route", element: createElement("div", null, "extension page") },
+        ],
+      },
+    ],
+  };
+});
 
 const BASE = "http://localhost:8080";
 
