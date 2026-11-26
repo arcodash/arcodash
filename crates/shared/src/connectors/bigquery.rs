@@ -643,12 +643,12 @@ mod tests {
     }
     use jsonwebtoken::{decode, Algorithm as JwtAlgorithm, DecodingKey, Validation};
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use rsa::{PrivateKey, PublicKey};
 
-    fn test_service_account() -> (ServiceAccountKey, RsaPublicKey) {
-        let mut rng = rand::thread_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
-        let public_key = RsaPublicKey::from(&private_key);
+    fn test_service_account() -> (ServiceAccountKey, PublicKey) {
+        let mut rng = rand::rng();
+        let private_key = PrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let public_key = PublicKey::from(&private_key);
         let pem = private_key
             .to_pkcs8_pem(LineEnding::LF)
             .expect("encode test private key");
@@ -669,7 +669,7 @@ mod tests {
     /// Verifies `jwt` against `public_key` with `aud` pinned to [`TOKEN_URL`].
     fn decode_claims(
         jwt: &str,
-        public_key: &RsaPublicKey,
+        public_key: &PublicKey,
     ) -> jsonwebtoken::errors::Result<DecodedClaims> {
         let public_pem = public_key
             .to_public_key_pem(LineEnding::LF)
