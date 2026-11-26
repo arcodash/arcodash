@@ -10,7 +10,7 @@
     "test": "pnpm --filter @arcodash/frontend test"
   },
   "devDependencies": {
-    "@playwright/test": "^1.65.0",
+    "@playwright/test": "^1.65.1",
     "pg": "^8.23.1",
     "@types/pg": "^8.23.1"
   }
