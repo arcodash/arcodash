@@ -370,17 +370,23 @@ export function ChartRenderer({ data, options, title }: VizRendererProps) {
             <ChartLabel
               position="center"
               content={({ viewBox }) => {
-                // Recharts 3 hands a Label inside Pie the plot-area viewBox; its centre is the pie
-                // centre (default cx/cy).
-                const { x = 0, y = 0, width = 0, height = 0 } = (viewBox ?? {}) as {
-                  x?: number; y?: number; width?: number; height?: number;
+                // Recharts >=3.11 hands a Label inside Pie the polar viewBox (cx, cy, outerRadius);
+                // earlier 3.x gave the plot-area box. Accept both; the centre is the pie centre.
+                const vb = (viewBox ?? {}) as {
+                  x?: number; y?: number; width?: number; height?: number; cx?: number; cy?: number; outerRadius?: number;
                 };
+                const polar = typeof vb.cx === "number" && typeof vb.cy === "number";
+                const cx = polar ? Number(vb.cx) : (vb.x ?? 0) + (vb.width ?? 0) / 2;
+                const cy = polar ? Number(vb.cy) : (vb.y ?? 0) + (vb.height ?? 0) / 2;
+                // The pie's outerRadius is a fixed share of half the plot's short side; recover that side.
+                const plotMin = polar
+                  ? (2 * Number(vb.outerRadius ?? 0)) / (showSliceLabels ? 0.7 : 0.8)
+                  : Math.min(vb.width ?? 0, vb.height ?? 0);
                 // Hole is ~half the radius; scale the figure with it and drop it when there's no room.
-                const size = Math.min(20, Math.min(width, height) * 0.09);
+                const size = Math.min(20, plotMin * 0.09);
                 if (size < 10) return null;
-                const cx = x + width / 2;
                 return (
-                  <text x={cx} y={y + height / 2} textAnchor="middle">
+                  <text x={cx} y={cy} textAnchor="middle">
                     <tspan x={cx} dy="-0.1em" fontSize={size} fontWeight={600} fill={INK}>{formatPieTotal(pieTotal)}</tspan>
                     <tspan x={cx} dy="1.4em" fontSize={Math.min(12, size * 0.65)} fill={INK_MUTED}>Total</tspan>
                   </text>
