@@ -1943,7 +1943,7 @@ describe("MonitorPage column-type filtering", () => {
     renderPage();
     await screen.findByDisplayValue("Too many signups");
 
-    await userEvent.click(screen.getByTestId("monitor-column-select"));
+    await userEvent.click(await screen.findByTestId("monitor-column-select"));
     const listbox = await screen.findByRole("listbox");
     expect(within(listbox).getByText("net_revenue")).toBeInTheDocument();
     expect(within(listbox).getByText("signup_count")).toBeInTheDocument();
