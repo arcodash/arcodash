@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs8::EncodePublicKey;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey, PublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -69,7 +69,7 @@ fn clean_pem_string(pem: &str) -> String {
     pem.replace("\\n", "\n").trim().to_string()
 }
 
-fn parse_rsa_private_key(pem: &str, passphrase: Option<&str>) -> Result<RsaPrivateKey> {
+fn parse_rsa_private_key(pem: &str, passphrase: Option<&str>) -> Result<PrivateKey> {
     use pkcs8::DecodePrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
 
@@ -81,7 +81,7 @@ fn parse_rsa_private_key(pem: &str, passphrase: Option<&str>) -> Result<RsaPriva
             )
         })?;
         // pkcs8's error doesn't say why (wrong passphrase vs unsupported cipher), so name both.
-        return RsaPrivateKey::from_pkcs8_encrypted_pem(pem, passphrase).map_err(|_| {
+        return PrivateKey::from_pkcs8_encrypted_pem(pem, passphrase).map_err(|_| {
             anyhow::anyhow!(
                 "failed to decrypt Snowflake private_key: wrong private_key_passphrase or \
                  unsupported encryption (supported: PBES2 with AES-CBC or 3DES)"
@@ -95,8 +95,8 @@ fn parse_rsa_private_key(pem: &str, passphrase: Option<&str>) -> Result<RsaPriva
              paste the resulting ENCRYPTED PRIVATE KEY"
         );
     }
-    RsaPrivateKey::from_pkcs8_pem(pem)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
+    PrivateKey::from_pkcs8_pem(pem)
+        .or_else(|_| PrivateKey::from_pkcs1_pem(pem))
         .context(
             "invalid Snowflake private_key (expected a PEM-encoded PKCS#8 or PKCS#1 RSA \
              private key)",
@@ -105,8 +105,8 @@ fn parse_rsa_private_key(pem: &str, passphrase: Option<&str>) -> Result<RsaPriva
 
 /// SHA256 fingerprint of the DER-encoded (SPKI) public key matching `private_key_pem`, in the
 /// `SHA256:<base64>` form Snowflake uses in the JWT `iss` claim.
-fn public_key_fingerprint(private_key: &RsaPrivateKey) -> Result<String> {
-    let public_key = RsaPublicKey::from(private_key);
+fn public_key_fingerprint(private_key: &PrivateKey) -> Result<String> {
+    let public_key = PublicKey::from(private_key);
     let der = public_key
         .to_public_key_der()
         .context("failed to DER-encode Snowflake public key for fingerprinting")?;
@@ -613,10 +613,10 @@ mod tests {
     use jsonwebtoken::{decode, Algorithm as JwtAlgorithm, DecodingKey, Validation};
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 
-    fn test_key_pem() -> (String, RsaPublicKey) {
-        let mut rng = rand::thread_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
-        let public_key = RsaPublicKey::from(&private_key);
+    fn test_key_pem() -> (String, PublicKey) {
+        let mut rng = rand::rng();
+        let private_key = PrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let public_key = PublicKey::from(&private_key);
         let pem = private_key
             .to_pkcs8_pem(LineEnding::LF)
             .expect("encode test private key");
@@ -667,7 +667,7 @@ mod tests {
         let (pem, _) = test_key_pem();
         let private_key = parse_rsa_private_key(&pem, None).unwrap();
         let encrypted_pem = private_key
-            .to_pkcs8_encrypted_pem(&mut rand::thread_rng(), "s3cret", LineEnding::LF)
+            .to_pkcs8_encrypted_pem("s3cret", LineEnding::LF)
             .expect("encrypt test private key");
         assert!(encrypted_pem.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
 

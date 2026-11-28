@@ -79,14 +79,14 @@ tiberius = { version = "0.13", default-features = false, features = ["rustls", "
 tokio-util = { version = "0.7.20", features = ["compat"] }
 # Cloud warehouse connectors: BigQuery/Snowflake auth and queries go over REST via `reqwest` (keeps
 # the dependency tree light), so no BigQuery/Snowflake SDK crate is used. `rsa` is already pulled
-# in by jsonwebtoken's `rust_crypto` feature (same 0.9 line); it is used directly for Snowflake
+# in by jsonwebtoken's `rust_crypto` feature (same line); it is used directly for Snowflake
 # key-pair auth, which needs the DER-encoded public key (to SHA256-fingerprint) that jsonwebtoken
 # does not expose.
-rsa = "0.9"
-# Same pkcs8 0.10 line `rsa` 0.9 uses; listed only to turn on encrypted-PKCS#8 decoding for
+rsa = "0.10"
+# Same pkcs8 0.11 line `rsa` 0.10 uses; listed only to turn on encrypted-PKCS#8 decoding for
 # Snowflake's "ENCRYPTED PRIVATE KEY" PEMs. `3des` + `sha1-insecure` cover Snowflake's documented
 # `openssl pkcs8 -topk8 -v2 des3` output (LibreSSL/older OpenSSL default to an HMAC-SHA1 PRF).
-pkcs8 = { version = "0.10", features = ["3des", "sha1-insecure"] }
+pkcs8 = { version = "0.11", features = ["3des", "sha1-insecure"] }
 # Athena uses the official SDK: the StartQueryExecution / GetQueryExecution / GetQueryResults
 # orchestration is fiddly to hand-roll over raw REST + SigV4. Static creds + region come from
 # `aws_sdk_athena::config` directly, so `aws-config` is not needed.
